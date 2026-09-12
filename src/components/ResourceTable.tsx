@@ -17,7 +17,7 @@ import {
   FramehdrResourceBinding, PanfxResourceBinding, MukakuResourceBinding, MukakuMovie,
 } from '@/types/index';
 import {
-  updateResourceField, updateResourceCover, recordChange, deleteResource,
+  updateResourceField, updateResourceCover, recordChange, deleteResource, insertResource,
   fetchResourceBindings, updatePanLink, COOKIE_EXPIRED_CODE, PINGLIAN_LINK_NOT_FOUND_CODE,
   fetchXnResourceBindings, syncResourceToXn, XN_COOKIE_EXPIRED_CODE,
   fetchYaResourceBindings, syncResourceToYa, YA_EXPIRED_CODE,
@@ -915,19 +915,19 @@ function ResourceTable({
     );
   }
 
-  // 快捷绑定完成后的回填保存逻辑
-  async function handleQuickBoundAndFilled(
+  // 快捷绑定：更新当前行资源（完整名称、链接、封面）
+  async function handleUpdateCurrent(
     resourceId: string,
     filledName: string,
     filledLink: string,
-    selectedMovie?: MukakuMovie | null
+    coverUrl?: string | null
   ) {
     const resource = resources.find((r) => r.id === resourceId);
     if (!resource) return;
 
     let updatedResource: Resource = { ...resource };
 
-    // 1. 回填资源名称
+    // 1. 完整回填资源名称
     if (filledName && filledName !== resource.name) {
       await updateResourceField(resourceId, 'name', filledName);
       await recordChange({
@@ -942,7 +942,7 @@ function ResourceTable({
     }
 
     // 2. 回填资源链接
-    if (filledLink && filledLink !== resource.link) {
+    if (filledLink !== undefined && filledLink !== resource.link) {
       await updateResourceField(resourceId, 'link', filledLink);
       await recordChange({
         resource_id: resourceId,
@@ -952,14 +952,16 @@ function ResourceTable({
         old_value: resource.link,
         new_value: filledLink,
       });
-      updatedResource = { ...updatedResource, link: filledLink };
+      const newLinks = filledLink ? [{ url: filledLink, pan_name: '' }] : [];
+      await updateResourceField(resourceId, 'links', newLinks);
+      updatedResource = { ...updatedResource, link: filledLink, links: newLinks };
     }
 
-    // 3. 若片源带封面海报且当前未设置封面，自动更新封面
-    if (selectedMovie?.pic && !resource.cover_url) {
+    // 3. 若提供封面海报且当前未设置封面，自动更新封面
+    if (coverUrl && !resource.cover_url) {
       try {
-        await updateResourceCover(resourceId, selectedMovie.pic);
-        updatedResource = { ...updatedResource, cover_url: selectedMovie.pic };
+        await updateResourceCover(resourceId, coverUrl);
+        updatedResource = { ...updatedResource, cover_url: coverUrl };
       } catch (err) {
         console.warn('自动设置封面失败', err);
       }
@@ -972,6 +974,53 @@ function ResourceTable({
 
     // 5. 若已绑定外部站点，触发增量同步
     syncToSite(updatedResource);
+  }
+
+  // 快捷绑定：多云盘链接队列回填（完成一条再执行下一条，各行资源名称完全一致）
+  async function handleQueueAppend(
+    baseResource: Resource,
+    filledName: string,
+    linksQueue: Array<{ url: string; pan_name?: string }>
+  ) {
+    if (linksQueue.length === 0) return;
+
+    const baseIndex = resources.findIndex((r) => r.id === baseResource.id);
+    const baseOrder = baseResource.sort_order ?? 0;
+
+    let currentResources = [...resources];
+
+    for (let i = 0; i < linksQueue.length; i++) {
+      const item = linksQueue[i];
+      if (!item.url) continue;
+
+      // 串行插入新资源：资源名称完全一致，集数一致，填入独立网盘链接
+      const inserted = await insertResource({
+        name: filledName,
+        episode_count: baseResource.episode_count ?? 0,
+        link: item.url,
+        links: [{ url: item.url, pan_name: item.pan_name ?? '' }],
+        sort_order: baseOrder + i + 1,
+        cover_url: baseResource.cover_url ?? null,
+      });
+
+      if (inserted) {
+        await recordChange({
+          resource_id: inserted.id,
+          resource_name: filledName,
+          field_name: 'name',
+          field_label: '多云盘队列录入',
+          old_value: '',
+          new_value: `${filledName} (${item.pan_name || '网盘'})`,
+        });
+
+        // 紧贴当前行下方追加
+        const insertPos = baseIndex >= 0 ? baseIndex + 1 + i : currentResources.length;
+        currentResources.splice(insertPos, 0, inserted);
+        onResourceAdded(inserted);
+      }
+    }
+
+    onResourcesChange(currentResources);
   }
 
   return (
@@ -1325,7 +1374,8 @@ function ResourceTable({
         resource={quickBindTarget}
         open={quickBindOpen}
         onOpenChange={setQuickBindOpen}
-        onBoundAndFilled={handleQuickBoundAndFilled}
+        onUpdateCurrent={handleUpdateCurrent}
+        onQueueAppend={handleQueueAppend}
       />
     </div>
   );

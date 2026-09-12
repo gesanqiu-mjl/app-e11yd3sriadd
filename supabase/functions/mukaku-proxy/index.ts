@@ -270,19 +270,21 @@ Deno.serve(async (req) => {
     }
 
     // ---------- 5. 读取该用户绑定的 token ----------
-    const { data: session, error: sessionError } = await supabase
+    const { data: session } = await supabase
       .from("mukaku_tokens")
       .select("access_token, username, status, token_expires_at, last_check_at")
       .eq("user_id", user.id)
       .maybeSingle();
 
-    if (sessionError || !session) {
+    // 仅针对管理个人发布及写操作强制要求绑定；搜索片源与详情支持公开凭据调用
+    const requiresBinding = !["search", "videoDetail"].includes(action ?? "");
+    if (requiresBinding && !session?.access_token) {
       return json(
         { error: "未绑定 web3.mukaku.com 账号，请先在设置页登录绑定", code: "MUKAKU_NOT_BOUND" },
         400
       );
     }
-    const tk: string = session.access_token;
+    const tk: string | null = session?.access_token ?? null;
 
     // 统一收集 query 透传参数（action 除外）
     const passthrough: Record<string, string> = {};
@@ -300,6 +302,9 @@ Deno.serve(async (req) => {
 
     switch (action) {
       case "status": {
+        if (!tk) {
+          return json({ success: true, data: { valid: false, status: "unbound" } });
+        }
         result = await callApi("/getUserWpList", {
           params: { page: 1 },
           token: tk,
@@ -312,10 +317,10 @@ Deno.serve(async (req) => {
         return json({
           success: true,
           data: {
-            username: session.username,
+            username: session?.username,
             valid: true,
             status: "active",
-            token_expires_at: session.token_expires_at,
+            token_expires_at: session?.token_expires_at,
           },
         });
       }
@@ -334,12 +339,46 @@ Deno.serve(async (req) => {
       }
 
       case "search": {
-        const sb = String(passthrough.sb ?? body.sb ?? "").trim();
-        if (!sb) return json({ error: "请输入搜索关键词" }, 400);
+        const rawSb = String(passthrough.sb ?? body.sb ?? "").trim();
+        if (!rawSb) return json({ error: "请输入搜索关键词" }, 400);
+
+        // 辅助判断结果列表长度
+        const extractList = (r: ApiResult): unknown[] => {
+          if (!r || r.code !== 200) return [];
+          const d = r.data as Record<string, unknown> | null;
+          if (Array.isArray(d)) return d;
+          if (Array.isArray(d?.data)) return d.data;
+          if (Array.isArray(d?.list)) return d.list;
+          return [];
+        };
+
+        // 1. 先尝试原始关键词
         result = await callApi("/getVideoList", {
-          params: { sb, page: 1, limit: 24 },
+          params: { sb: rawSb, page: 1, limit: 24 },
           token: tk,
         });
+
+        // 2. 如果未命中，且关键词包含书名号、括号年份等，自动去噪重试
+        let hitList = extractList(result);
+        if (hitList.length === 0) {
+          const cleanedSb = rawSb
+            .replace(/[《》【】\[\]]/g, " ")
+            .replace(/[\(（]\s*(19|20)\d{2}\s*[\)）]/g, " ")
+            .replace(/[\(（][^\)）]*[\)）]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+          if (cleanedSb && cleanedSb !== rawSb) {
+            const retryRes = await callApi("/getVideoList", {
+              params: { sb: cleanedSb, page: 1, limit: 24 },
+              token: tk,
+            });
+            const retryList = extractList(retryRes);
+            if (retryList.length > 0) {
+              result = retryRes;
+            }
+          }
+        }
         break;
       }
 

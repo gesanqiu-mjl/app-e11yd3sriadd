@@ -1616,12 +1616,30 @@ export async function searchMukakuMovies(keyword: string): Promise<import('@/typ
   const kw = keyword.trim();
   if (!kw) return [];
   const res = await callMukakuProxy<{
-    data?: import('@/types/index').MukakuMovie[] | { list?: import('@/types/index').MukakuMovie[] };
+    data?:
+      | import('@/types/index').MukakuMovie[]
+      | { data?: Array<Record<string, unknown>>; list?: Array<Record<string, unknown>> };
   }>('search', { sb: kw });
 
-  if (Array.isArray(res.data)) return res.data;
-  if (Array.isArray(res.data?.list)) return res.data.list;
-  return [];
+  let rawList: Array<Record<string, unknown>> = [];
+  if (Array.isArray(res.data)) {
+    rawList = res.data as unknown as Array<Record<string, unknown>>;
+  } else if (Array.isArray((res.data as any)?.data)) {
+    rawList = (res.data as any).data;
+  } else if (Array.isArray((res.data as any)?.list)) {
+    rawList = (res.data as any).list;
+  }
+
+  return rawList.map((item) => ({
+    id: item.id ? Number(item.id) : undefined,
+    doub_id: (item.doub_id ?? item.idcode ?? '') as string | number,
+    title: String(item.title || item.seed_name || ''),
+    pic: (item.image || item.pic || item.cover || '') as string,
+    year: (item.years || item.year || '') as string | number,
+    rate: (item.doub_score || item.rate || '') as string | number,
+    actors: (item.performer || item.actors || '') as string,
+    type: (item.class || item.type || '') as string,
+  }));
 }
 
 /** 通过豆瓣 ID 获取不太灵站点影片站内主键 (movies_id) */
