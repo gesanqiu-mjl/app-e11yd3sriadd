@@ -20,10 +20,10 @@ import {
   updateResourceField, updateResourceCover, recordChange, deleteResource, insertResource,
   fetchResourceBindings, updatePanLink, COOKIE_EXPIRED_CODE, PINGLIAN_LINK_NOT_FOUND_CODE,
   fetchXnResourceBindings, syncResourceToXn, XN_COOKIE_EXPIRED_CODE,
-  fetchYaResourceBindings, syncResourceToYa, YA_EXPIRED_CODE,
+  fetchYaResourceBindings, syncResourceToYa, YA_EXPIRED_CODE, bindResourceToYa,
   fetchFramehdrResourceBindings, syncResourceToFramehdr, FRAMEHDR_COOKIE_EXPIRED_CODE,
   fetchPanfxResourceBindings, syncResourceToPanfx, PANFX_COOKIE_EXPIRED_CODE,
-  fetchMukakuResourceBindings, syncResourceToMukaku, MUKAKU_TOKEN_EXPIRED_CODE,
+  fetchMukakuResourceBindings, syncResourceToMukaku, MUKAKU_TOKEN_EXPIRED_CODE, bindResourceToMukaku,
   checkLinks, setResourceFinished, updateResourceSortOrders,
 } from '@/services/api';
 import { uploadCover, deleteCover } from '@/lib/uploadCover';
@@ -40,7 +40,7 @@ import ResourceFormDialog from './ResourceFormDialog';
 import BatchImportDialog from './BatchImportDialog';
 import BindDialog from './BindDialog';
 import ManageLinksDialog from './ManageLinksDialog';
-import QuickBindDialog from './QuickBindDialog';
+import QuickBindDialog, { type SiteBindingPayload } from './QuickBindDialog';
 
 interface EditState {
   rowId: string;
@@ -915,12 +915,13 @@ function ResourceTable({
     );
   }
 
-  // 快捷绑定：更新当前行资源（完整名称、链接、封面）
+  // 快捷绑定：更新当前行资源（完整名称、链接、封面，并同步持久化站点发布绑定）
   async function handleUpdateCurrent(
     resourceId: string,
     filledName: string,
     filledLink: string,
-    coverUrl?: string | null
+    coverUrl?: string | null,
+    siteBinding?: SiteBindingPayload
   ) {
     const resource = resources.find((r) => r.id === resourceId);
     if (!resource) return;
@@ -967,20 +968,61 @@ function ResourceTable({
       }
     }
 
-    // 4. 更新前端状态并触发记录通知
+    // 4. 若自动发布到了站点，持久化站点绑定映射
+    if (siteBinding) {
+      try {
+        if (siteBinding.site === 'mukaku' && siteBinding.movies_id && siteBinding.link_id) {
+          await bindResourceToMukaku(resourceId, {
+            id: siteBinding.link_id,
+            movies_id: siteBinding.movies_id,
+            seed_name: filledName,
+            vod_name: siteBinding.vod_name || filledName,
+            pan_type: siteBinding.pan_type,
+            code: siteBinding.code,
+          });
+          const mukakuList = await fetchMukakuResourceBindings();
+          const mukakuMap: Record<string, MukakuResourceBinding[]> = {};
+          mukakuList.forEach((b) => { (mukakuMap[b.resource_id] ??= []).push(b); });
+          setMukakuBindings(mukakuMap);
+        } else if (siteBinding.site === 'ya' && siteBinding.video_id && siteBinding.link_id) {
+          await bindResourceToYa(resourceId, {
+            id: siteBinding.link_id,
+            video_id: siteBinding.video_id,
+            video_title: siteBinding.vod_name || filledName,
+            name: siteBinding.vod_name || filledName,
+            drive_label: siteBinding.pan_type || '网盘',
+            url: filledLink,
+            extract_code: siteBinding.code || '',
+          });
+          const yaList = await fetchYaResourceBindings();
+          const yaMap: Record<string, YaResourceBinding[]> = {};
+          yaList.forEach((b) => { (yaMap[b.resource_id] ??= []).push(b); });
+          setYaBindings(yaMap);
+        }
+      } catch (bindErr) {
+        console.warn('保存站点绑定映射失败', bindErr);
+      }
+    }
+
+    // 5. 更新前端状态并触发记录通知
     const nextResources = resources.map((r) => (r.id === resourceId ? updatedResource : r));
     onResourcesChange(nextResources);
     onResourceUpdated(updatedResource, '快捷绑定');
 
-    // 5. 若已绑定外部站点，触发增量同步
+    // 6. 若已绑定外部站点，触发增量同步
     syncToSite(updatedResource);
   }
 
-  // 快捷绑定：多云盘链接队列回填（完成一条再执行下一条，各行资源名称完全一致）
+  // 快捷绑定：多云盘链接队列回填（完成一条再执行下一条，各行资源名称完全一致并同步发布到站点）
   async function handleQueueAppend(
     baseResource: Resource,
     filledName: string,
-    linksQueue: Array<{ url: string; pan_name?: string }>
+    linksQueue: Array<{
+      url: string;
+      pan_name?: string;
+      extract_code?: string;
+      siteBinding?: SiteBindingPayload;
+    }>
   ) {
     if (linksQueue.length === 0) return;
 
@@ -1004,6 +1046,33 @@ function ResourceTable({
       });
 
       if (inserted) {
+        if (item.siteBinding) {
+          try {
+            if (item.siteBinding.site === 'mukaku' && item.siteBinding.movies_id && item.siteBinding.link_id) {
+              await bindResourceToMukaku(inserted.id, {
+                id: item.siteBinding.link_id,
+                movies_id: item.siteBinding.movies_id,
+                seed_name: filledName,
+                vod_name: item.siteBinding.vod_name || filledName,
+                pan_type: item.siteBinding.pan_type,
+                code: item.siteBinding.code,
+              });
+            } else if (item.siteBinding.site === 'ya' && item.siteBinding.video_id && item.siteBinding.link_id) {
+              await bindResourceToYa(inserted.id, {
+                id: item.siteBinding.link_id,
+                video_id: item.siteBinding.video_id,
+                video_title: item.siteBinding.vod_name || filledName,
+                name: item.siteBinding.vod_name || filledName,
+                drive_label: item.siteBinding.pan_type || '网盘',
+                url: item.url,
+                extract_code: item.siteBinding.code || '',
+              });
+            }
+          } catch (bindErr) {
+            console.warn('队列插入资源持久化绑定失败', bindErr);
+          }
+        }
+
         await recordChange({
           resource_id: inserted.id,
           resource_name: filledName,
