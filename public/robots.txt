@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Allow: /collect
+Disallow: /admin
+Disallow: /admin/
+Disallow: /login
+Disallow: /register
+Disallow: /sync
+
+Sitemap: https://app-e11yd3sriadd.miaoda.online/sitemap.xml

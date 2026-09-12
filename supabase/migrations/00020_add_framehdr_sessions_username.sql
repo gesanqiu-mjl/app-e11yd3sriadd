@@ -1,0 +1,1 @@
+alter table public.framehdr_sessions add column if not exists username text;
