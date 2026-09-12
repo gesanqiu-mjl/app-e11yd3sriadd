@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Trash2, Plus, Check, X, CloudIcon, Layers, Search, ImagePlus, Loader2, Link2, Link, RefreshCw, ShieldCheck, CircleCheck, RefreshCcw, AlertTriangle, GripVertical } from 'lucide-react';
+import { Trash2, Plus, Check, X, CloudIcon, Layers, Search, ImagePlus, Loader2, Link2, Link, RefreshCw, ShieldCheck, CircleCheck, RefreshCcw, AlertTriangle, GripVertical, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -14,7 +14,7 @@ import {
 import { toast } from 'sonner';
 import {
   Resource, FIELD_LABELS, ResourceBinding, XnResourceBinding, YaResourceBinding,
-  FramehdrResourceBinding, PanfxResourceBinding, MukakuResourceBinding,
+  FramehdrResourceBinding, PanfxResourceBinding, MukakuResourceBinding, MukakuMovie,
 } from '@/types/index';
 import {
   updateResourceField, updateResourceCover, recordChange, deleteResource,
@@ -40,6 +40,7 @@ import ResourceFormDialog from './ResourceFormDialog';
 import BatchImportDialog from './BatchImportDialog';
 import BindDialog from './BindDialog';
 import ManageLinksDialog from './ManageLinksDialog';
+import QuickBindDialog from './QuickBindDialog';
 
 interface EditState {
   rowId: string;
@@ -163,6 +164,8 @@ function ResourceTable({
   const [mukakuBindings, setMukakuBindings] = useState<Record<string, MukakuResourceBinding[]>>({});
   const [bindTarget, setBindTarget] = useState<Resource | null>(null);
   const [bindOpen, setBindOpen] = useState(false);
+  const [quickBindTarget, setQuickBindTarget] = useState<Resource | null>(null);
+  const [quickBindOpen, setQuickBindOpen] = useState(false);
   const [syncingId, setSyncingId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -819,6 +822,22 @@ function ResourceTable({
               </span>
             )}
           </div>
+          {/* 快捷绑定按钮 */}
+          <Button
+            variant="outline"
+            size="sm"
+            title="快捷绑定：搜索站点片库并自动回填名称与链接"
+            onClick={(e) => {
+              e.stopPropagation();
+              setQuickBindTarget(resource);
+              setQuickBindOpen(true);
+            }}
+            className="h-6 px-1.5 text-[11px] gap-1 shrink-0 text-primary border-primary/30 hover:bg-primary/10 hover:border-primary transition-colors"
+          >
+            <Sparkles className="h-3 w-3" />
+            <span className="hidden sm:inline">快捷绑定</span>
+          </Button>
+
           {/* 手机端：链接管理按钮（桌面端有独立链接列） */}
           <Button
             variant="ghost"
@@ -894,6 +913,65 @@ function ResourceTable({
           : <span className="text-muted-foreground/40 text-xs italic">—</span>}
       </div>
     );
+  }
+
+  // 快捷绑定完成后的回填保存逻辑
+  async function handleQuickBoundAndFilled(
+    resourceId: string,
+    filledName: string,
+    filledLink: string,
+    selectedMovie?: MukakuMovie | null
+  ) {
+    const resource = resources.find((r) => r.id === resourceId);
+    if (!resource) return;
+
+    let updatedResource: Resource = { ...resource };
+
+    // 1. 回填资源名称
+    if (filledName && filledName !== resource.name) {
+      await updateResourceField(resourceId, 'name', filledName);
+      await recordChange({
+        resource_id: resourceId,
+        resource_name: filledName,
+        field_name: 'name',
+        field_label: FIELD_LABELS.name ?? 'name',
+        old_value: resource.name,
+        new_value: filledName,
+      });
+      updatedResource = { ...updatedResource, name: filledName };
+    }
+
+    // 2. 回填资源链接
+    if (filledLink && filledLink !== resource.link) {
+      await updateResourceField(resourceId, 'link', filledLink);
+      await recordChange({
+        resource_id: resourceId,
+        resource_name: updatedResource.name,
+        field_name: 'link',
+        field_label: FIELD_LABELS.link ?? 'link',
+        old_value: resource.link,
+        new_value: filledLink,
+      });
+      updatedResource = { ...updatedResource, link: filledLink };
+    }
+
+    // 3. 若片源带封面海报且当前未设置封面，自动更新封面
+    if (selectedMovie?.pic && !resource.cover_url) {
+      try {
+        await updateResourceCover(resourceId, selectedMovie.pic);
+        updatedResource = { ...updatedResource, cover_url: selectedMovie.pic };
+      } catch (err) {
+        console.warn('自动设置封面失败', err);
+      }
+    }
+
+    // 4. 更新前端状态并触发记录通知
+    const nextResources = resources.map((r) => (r.id === resourceId ? updatedResource : r));
+    onResourcesChange(nextResources);
+    onResourceUpdated(updatedResource, '快捷绑定');
+
+    // 5. 若已绑定外部站点，触发增量同步
+    syncToSite(updatedResource);
   }
 
   return (
@@ -1241,6 +1319,13 @@ function ResourceTable({
           onResourcesChange(resources.map((r) => r.id === updated.id ? updated : r));
           onResourceUpdated(updated, '链接');
         }}
+      />
+
+      <QuickBindDialog
+        resource={quickBindTarget}
+        open={quickBindOpen}
+        onOpenChange={setQuickBindOpen}
+        onBoundAndFilled={handleQuickBoundAndFilled}
       />
     </div>
   );
