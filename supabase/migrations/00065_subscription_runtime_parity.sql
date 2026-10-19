@@ -13,7 +13,16 @@
 --   ⑤ cron 对齐：subscription-run-1min（?action=runAll + 5s 超时）、
 --      resource-sync-worker-1min（?action=drain）、subscription-cleanup-finished(*/5)、
 --      special-account-inactivity(0 20 * * *)
--- 说明：地址与密钥为自建部署值（kong:8000 + 本机密钥），**不要**应用到托管项目。
+-- 说明：地址为自建部署值（kong:8000），**不要**应用到托管项目。
+-- 密钥：**不要写死在本迁移里**。改为存放在 public.app_runtime_secrets 表
+--       （RLS 保护 + 已撤销 anon/authenticated 权限），下方 cron 任务在每次执行时
+--       实时读取，因此后补填值也能立即生效。
+--       部署新库后必须先填值，否则 cron 调用会因缺少密钥头被函数拒绝(401)：
+--         insert into public.app_runtime_secrets(name, value) values
+--           ('SUBSCRIPTION_SECRET', '<你的 SUBSCRIPTION_SECRET>'),
+--           ('INTERNAL_SECRET',     '<你的 INTERNAL_SECRET>')
+--         on conflict (name) do update
+--           set value = excluded.value, updated_at = now();
 -- 注意：需以函数/表属主（supabase_admin）身份执行；自建环境请用 pg-meta 通道，
 --       容器内 psql 的 postgres 用户会因属主不同报 must be owner。
 -- ============================================================
@@ -498,13 +507,24 @@ $function$;
 alter table public.subscriptions alter column cred_fail_count set default 0;
 alter table public.subscriptions alter column cred_fail_count set not null;
 
+-- ── 运行时密钥表 ────────────────────────────────────────────────
+-- 存放边缘函数与 cron 之间的共享密钥，取代写死在迁移/源码里的明文。
+-- RLS + 撤销 anon/authenticated：只有 SQL 侧（cron / 属主）能读写。
+create table if not exists public.app_runtime_secrets (
+  name       text primary key,
+  value      text        not null,
+  updated_at timestamptz not null default now()
+);
+alter table public.app_runtime_secrets enable row level security;
+revoke all on public.app_runtime_secrets from anon, authenticated;
+
 -- 与托管版一致：恢复 pg_net 5s 客户端超时（远程 55s 实验无收益，且托管版就是 5000）
 select cron.schedule('subscription-run-1min', '* * * * *', $cmd$
   select net.http_post(
     url := 'http://kong:8000/functions/v1/subscription-run?action=runAll',
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
-      'x-subscription-secret', 'd56660fbb4ed8ba66bd69fa4570a18e9419e55a9874daded'
+      'x-subscription-secret', (select value from public.app_runtime_secrets where name = 'SUBSCRIPTION_SECRET')
     ),
     body := '{}'::jsonb,
     timeout_milliseconds := 5000
@@ -523,7 +543,7 @@ select cron.schedule('resource-sync-worker-1min', '* * * * *', $cmd$
     url := 'http://kong:8000/functions/v1/resource-sync-worker?action=drain',
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
-      'x-internal-secret', 'e3cefc3e50fb446e05daba45277daa705540d21c6c7ada52'
+      'x-internal-secret', (select value from public.app_runtime_secrets where name = 'INTERNAL_SECRET')
     ),
     body := '{}'::jsonb,
     timeout_milliseconds := 5000
