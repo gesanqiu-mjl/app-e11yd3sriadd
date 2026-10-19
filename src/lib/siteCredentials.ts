@@ -49,14 +49,17 @@ export function siteHost(url: string): string {
   return url.replace(/^https?:\/\//i, '').replace(/^www\./i, '');
 }
 
-/** 能自动重登的站点（有账号密码登录通道，且登录不需要图形验证码） */
-export const AUTO_RELOGIN_SITES: SiteKey[] = ['ya', 'jying', 'hdhaven', 'framehdr'];
+/**
+ * 能自动重登的站点（有账号密码登录通道，且登录不需要图形验证码）。
+ * 栖影已改走官方 OAuth：access_token 长期有效，失效只能重新授权，没有「自动重登」概念。
+ */
+export const AUTO_RELOGIN_SITES: SiteKey[] = ['ya', 'jying', 'framehdr'];
 
 /** 各站点「会话失效」错误码（与各 proxy / api.ts 常量保持一致） */
 export const SITE_EXPIRED_CODES: Record<SiteKey, string[]> = {
   ya: ['YA_EXPIRED', 'YA_NOT_BOUND'],
   jying: ['JYING_COOKIE_EXPIRED', 'JYING_NOT_BOUND'],
-  hdhaven: ['HDHAVEN_COOKIE_EXPIRED', 'HDHAVEN_NOT_BOUND', 'HDHAVEN_TOTP_REQUIRED'],
+  hdhaven: ['HDHAVEN_TOKEN_EXPIRED', 'HDHAVEN_NOT_BOUND'],
   framehdr: ['COOKIE_EXPIRED'],
   mukaku: ['MUKAKU_TOKEN_EXPIRED', 'MUKAKU_NOT_BOUND'],
   pinglian: ['PINGLIAN_COOKIE_EXPIRED'],

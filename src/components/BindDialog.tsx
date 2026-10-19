@@ -20,7 +20,6 @@ import {
   loadJyingShares, bindResourceToJying, unbindResourceFromJying, JYING_EXPIRED_CODE,
   loadHdhavenShares, bindResourceToHdhaven, unbindResourceFromHdhaven, HDHAVEN_EXPIRED_CODE,
 } from '@/services/api';
-import { useHdhavenChallenge } from '@/components/HdhavenChallengeDialog';
 import type {
   Resource, PinglianLink, ResourceBinding, XnShare, XnResourceBinding,
   YaLink, YaResourceBinding, FramehdrLink, FramehdrResourceBinding,
@@ -247,25 +246,22 @@ function HdhavenPane({
   const [bindingSlug, setBindingSlug] = useState<string | null>(null);
   const [unbindingSlug, setUnbindingSlug] = useState<string | null>(null);
 
-  // 站点风控（图形验证码）闭环：命中时弹窗人工识别，验证通过后自动重放原请求
-  const { withChallenge, challengeDialog } = useHdhavenChallenge();
-
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
     try {
       // 栖影列表接口无分页/筛选参数，一次取全量，筛选在前端做
-      setShares(await withChallenge(() => loadHdhavenShares()));
+      setShares(await loadHdhavenShares());
     } catch (e) {
       const err = e as Error & { code?: string };
       setShares([]);
       setLoadError(
         err.code === HDHAVEN_EXPIRED_CODE
-          ? '栖影登录已过期，请先到「站点同步」页重新登录'
+          ? '栖影授权已失效，请到「站点同步」页重新授权'
           : err.message || '加载栖影分享记录失败'
       );
     } finally { setLoading(false); }
-  }, [withChallenge]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -414,9 +410,6 @@ function HdhavenPane({
         <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
         <span>此处只列出你账号在栖影<strong>已发布</strong>的分享记录，绑定后资源更新时会自动替换该记录的链接（普通用户改动后资源会重新进入审核）。栖影暂未开放「新建分享」接口，新增分享请先在栖影站点发布。</span>
       </div>
-
-      {/* 风控图形验证码弹窗（命中站点限流时自动弹出） */}
-      {challengeDialog}
     </div>
   );
 }

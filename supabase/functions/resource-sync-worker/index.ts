@@ -72,7 +72,8 @@ const EXPIRED_CODES: Record<SiteKey, string[]> = {
   panfx: ["COOKIE_EXPIRED"],
   mukaku: ["MUKAKU_TOKEN_EXPIRED", "10103", "10104"],
   jying: ["JYING_COOKIE_EXPIRED"],
-  hdhaven: ["HDHAVEN_COOKIE_EXPIRED"],
+  // 栖影：改用官方 OpenAPI OAuth 后失效码为 TOKEN_EXPIRED，未授权为 NOT_BOUND
+  hdhaven: ["HDHAVEN_TOKEN_EXPIRED", "HDHAVEN_NOT_BOUND"],
   // 1号站点：令牌失效/未绑定（打开 API 的 401 INVALID_TOKEN）
   st1: ["ST1_TOKEN_EXPIRED", "ST1_NOT_BOUND"],
 };

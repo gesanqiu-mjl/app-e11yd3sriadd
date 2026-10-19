@@ -3202,19 +3202,24 @@ export async function syncResourceToJying(params: {
 
 // ============ 栖影 HDHaven 站点同步（hdhaven.com） ============
 
-export const HDHAVEN_EXPIRED_CODE = 'HDHAVEN_COOKIE_EXPIRED';
+/** access_token 失效：用户在站点 OPENAPI 页面撤销授权、重新授权或账号不可用，需重新授权 */
+export const HDHAVEN_EXPIRED_CODE = 'HDHAVEN_TOKEN_EXPIRED';
 export const HDHAVEN_NOT_BOUND_CODE = 'HDHAVEN_NOT_BOUND';
-/** 账号开启两步验证，登录需要 6 位动态码 */
-export const HDHAVEN_TOTP_REQUIRED_CODE = 'HDHAVEN_TOTP_REQUIRED';
-/** 命中站点风控图形验证码门（请求过频），需人工完成验证后重试 */
-export const HDHAVEN_CHALLENGE_REQUIRED_CODE = 'HDHAVEN_CHALLENGE_REQUIRED';
+/**
+ * 命中账号额度或每分钟限流。
+ * 站点按等级/会员给每日次数（Lv.1 200 次 … Lv.7 2000 次，年卡 5000 次，永久不限，
+ * 等级与会员取高者，北京时间零点重置），每分钟 60 次；
+ * 签到与 GET /me 不计入每日次数 —— 所以日常巡检不烧额度，批量发布才需要注意。
+ */
+export const HDHAVEN_RATE_LIMITED_CODE = 'HDHAVEN_RATE_LIMITED';
 
 type HdhavenShare = import('@/types/index').HdhavenShareItem;
 type HdhavenTmdb = import('@/types/index').HdhavenTmdbItem;
 
 /**
  * 统一调用栖影代理 Edge Function。
- * 栖影是 httpOnly 会话 Cookie 鉴权，凭据只存在服务端，前端只拿结果。
+ * 栖影走官方 OpenAPI：用户在浏览器授权一次后，access_token 由服务端持有并加密落库，
+ * 前端永远拿不到 token，也不直连站点。
  */
 async function callHdhavenProxy<T = unknown>(
   action: string,
@@ -3261,7 +3266,7 @@ export async function getHdhavenBinding(): Promise<import('@/types/index').Hdhav
   if (!userData?.user) return null;
   const { data, error } = await supabase
     .from('hdhaven_sessions')
-    .select('status, username, user_number, last_check_at, remark, updated_at')
+    .select('status, username, user_number, scope, authorized_at, last_check_at, remark, updated_at')
     .eq('user_id', userData.user.id)
     .maybeSingle();
   if (error) throw error;
@@ -3281,43 +3286,51 @@ export async function revalidateHdhavenSession(): Promise<import('@/types/index'
   return getHdhavenBinding();
 }
 
-/** 账号密码登录并绑定栖影（服务端模拟登录并保存 httpOnly 会话，密码不落库） */
-export async function loginHdhaven(
-  username: string,
-  password: string,
-  totpCode?: string
-): Promise<void> {
-  await callHdhavenProxy(
-    'login',
-    {
-      username: username.trim(),
-      password,
-      ...(totpCode?.trim() ? { totp_code: totpCode.trim() } : {}),
-    },
-    { timeoutMs: 60000 }
-  );
-  // 云端留档（加密）：会话失效后可自动重新登录；开启两步验证的账号会提示手动处理
-  await saveSiteCredential({ site: 'hdhaven', username: username.trim(), password });
+/**
+ * 开始栖影 OAuth 授权：向本站代理索取授权页地址（含 state 与 PKCE challenge）。
+ * state 与 code_verifier 都存在服务端，前端只负责把用户跳到站点授权页。
+ */
+export async function startHdhavenOAuth(): Promise<string> {
+  const r = await callHdhavenProxy<{ data?: { authorize_url?: string } }>('oauth_start', {});
+  const authorizeUrl = String(r.data?.authorize_url ?? '');
+  if (!authorizeUrl) throw new Error('生成栖影授权地址失败，请稍后重试');
+  return authorizeUrl;
 }
 
 /**
- * 用浏览器会话 Cookie 绑定栖影。
- * 站点 2026-10 起在登录接口加了 Cloudflare Turnstile 人机验证，服务端账号密码登录已不可行；
- * 其余接口不校验人机验证、只认会话 Cookie，因此改为「浏览器登录一次 → 粘贴 Cookie」。
+ * 用回调拿到的授权码换 token。
+ * 由服务端完成 PKCE 校验并加密落库；授权码一次性且 10 分钟内有效，重复提交会被拒绝。
  */
-export async function bindHdhavenCookie(cookie: string): Promise<void> {
-  await callHdhavenProxy('bindCookie', { cookie: cookie.trim() }, { timeoutMs: 60000 });
+export async function finishHdhavenOAuth(params: { code: string; state: string }): Promise<void> {
+  await callHdhavenProxy(
+    'oauth_callback',
+    { code: params.code.trim(), state: params.state.trim() },
+    { timeoutMs: 60000 }
+  );
 }
 
-/** 解绑栖影 */
+/** 查询栖影账号额度余量（每分钟 60 次；每日按等级/会员，签到与 /me 不计入） */
+export async function loadHdhavenQuota(): Promise<unknown> {
+  const r = await callHdhavenProxy<{ data?: unknown }>('quota', undefined, { timeoutMs: 30000 });
+  return r.data ?? null;
+}
+
+/** 栖影每日签到（文档说明签到不计入每日调用次数） */
+export async function checkinHdhaven(): Promise<unknown> {
+  const r = await callHdhavenProxy<{ data?: unknown; message?: string }>(
+    'checkin',
+    {},
+    { timeoutMs: 30000 }
+  );
+  return r.data ?? r.message ?? null;
+}
+
+/**
+ * 解绑栖影：走代理清理，除 token 外也会清掉未完成的授权中间态。
+ * 站点侧的撤销授权需用户自行到 OPENAPI 页面操作。
+ */
 export async function unbindHdhaven(): Promise<void> {
-  const { data: userData } = await supabase.auth.getUser();
-  if (!userData?.user) throw new Error('请先登录');
-  const { error } = await supabase
-    .from('hdhaven_sessions')
-    .delete()
-    .eq('user_id', userData.user.id);
-  if (error) throw error;
+  await callHdhavenProxy('logout', {});
 }
 
 /** 我的分享记录（站点无分页/筛选，一次返回全量） */
@@ -3466,28 +3479,6 @@ export async function syncResourceToHdhaven(params: {
     title: params.title,
     meta: params.meta,
   });
-}
-
-// ---------- 风控图形验证码（接口文档 §5） ----------
-
-/**
- * 取栖影风控图形验证码（命中 SCRAPE_CHALLENGE_REQUIRED 后调用）。
- * 图片已由服务端带会话取回并内联为 data URL，前端可直接渲染。
- */
-export async function fetchHdhavenChallenge(): Promise<import('@/types/index').HdhavenChallenge> {
-  const data = await callHdhavenProxy<{ data?: import('@/types/index').HdhavenChallenge }>(
-    'challenge',
-    {},
-    { timeoutMs: 30000 }
-  );
-  const challenge = data.data;
-  if (!challenge?.id || !challenge?.image) throw new Error('获取栖影验证码失败，请稍后重试');
-  return challenge;
-}
-
-/** 提交风控验证码（图片中的 5 位字符）；验证通过后由调用方重放原请求 */
-export async function submitHdhavenChallenge(id: string, answer: string): Promise<void> {
-  await callHdhavenProxy('verify', { id, answer }, { timeoutMs: 30000 });
 }
 
 // ---------- 新建分享（投稿） ----------

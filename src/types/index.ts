@@ -563,16 +563,7 @@ export interface HdhavenBinding {
   updated_at: string | null;
 }
 
-/**
- * 栖影风控图形验证码（5 位字符，需人工识别，不支持自动绕过）。
- * image 由服务端带会话取回并内联为 data URL。
- */
-export interface HdhavenChallenge {
-  id: string;
-  image: string;
-}
-
-/** 栖影「我的分享」条目（GET /api/users/me/shares，站点无分页） */
+/** 栖影「我的分享」条目（OpenAPI GET /shares，自动翻页聚合） */
 export interface HdhavenShareItem {
   slug: string;                       // 分享条目标识（update 用）
   tmdb_id: string | null;

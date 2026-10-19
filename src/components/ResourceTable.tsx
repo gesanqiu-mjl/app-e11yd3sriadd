@@ -29,7 +29,7 @@ import {
   fetchJyingResourceBindings, syncResourceToJying, JYING_EXPIRED_CODE, bindResourceToJying,
   fetchHdhavenResourceBindings, bindResourceToHdhavenBySlug, syncResourceToHdhaven,
   HDHAVEN_EXPIRED_CODE,
-  HDHAVEN_CHALLENGE_REQUIRED_CODE,
+  HDHAVEN_RATE_LIMITED_CODE,
   checkLinks, setResourceFinished, updateResourceSortOrders,
   fetchResources, fetchResourceSyncQueue, clearResourceSyncQueue,
 } from '@/services/api';
@@ -475,10 +475,11 @@ function ResourceTable({
             throw err;
           }
           if (
-            err.code === PINGLIAN_LINK_NOT_FOUND_CODE ||
-            // 栖影有请求频率风控：命中图形验证码门时重试无意义且会加剧风控
-            err.code === HDHAVEN_CHALLENGE_REQUIRED_CODE
-          ) {
+          err.code === PINGLIAN_LINK_NOT_FOUND_CODE ||
+          // 栖影授权失效 / 额度用尽：重试无意义，直接上抛让用户去处理
+          err.code === HDHAVEN_EXPIRED_CODE ||
+          err.code === HDHAVEN_RATE_LIMITED_CODE
+        ) {
             throw err;
           }
           lastErr = e;
@@ -786,9 +787,9 @@ function ResourceTable({
       } catch (e) {
         const err = e as Error & { code?: string };
         const reason = err.code === HDHAVEN_EXPIRED_CODE
-          ? '登录已过期，请到「站点同步」页重新登录'
-          : err.code === HDHAVEN_CHALLENGE_REQUIRED_CODE
-            ? '触发站点图形验证码风控，请先到 hdhaven.com 完成验证后重试'
+          ? '授权已失效，请到「站点同步」页重新授权'
+          : err.code === HDHAVEN_RATE_LIMITED_CODE
+            ? '栖影调用次数已达上限（每分钟 60 次 / 每日按账号等级），请稍后再试'
             : (err.message || '未知错误');
         failedSites.push({ site: `栖影·${hdLabel}`, reason });
       }

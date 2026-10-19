@@ -81,13 +81,16 @@ const SITES: Record<SiteKey, SiteSpec> = {
     fn: "hdhaven-proxy",
     sessionTable: "hdhaven_sessions",
     probe: { action: "status" },
-    // 站点 2026-10 起登录接口加了 Cloudflare Turnstile 人机验证（实测不带验证直接 400
-    // 「请先完成人机验证」），账号密码自动重登已不可行 → 改人工「粘贴 Cookie」绑定
-    login: "login",
-    captcha: true,
+    // 2026-10 起改用站点官方 OpenAPI OAuth：用户在浏览器点一次授权，
+    // access_token 长期有效，不需要账号密码、也没有会话过期重登的概念
+    //（旧的 Cookie + Turnstile + 图形验证码那套已从 hdhaven-proxy 中整体移除）。
+    // 失效只发生在用户在 OPENAPI 页面撤销授权、重新授权或账号不可用，
+    // 此时无法自动恢复，必须重新走一次授权流程。
+    login: null,
+    captcha: false,
     manualReason:
-      "栖影登录已加人机验证（Cloudflare Turnstile），无法自动重登：请在「站点同步」页用「粘贴 Cookie」重新绑定",
-    codes: ["HDHAVEN_COOKIE_EXPIRED", "HDHAVEN_NOT_BOUND", "HDHAVEN_TOTP_REQUIRED"],
+      "栖影授权已失效（用户撤销授权或账号不可用），请到「站点同步 → 栖影 HDHaven」重新授权",
+    codes: ["HDHAVEN_TOKEN_EXPIRED", "HDHAVEN_NOT_BOUND", "HDHAVEN_RATE_LIMITED"],
   },
   framehdr: {
     label: "帧影",
@@ -336,7 +339,9 @@ Deno.serve(async (req) => {
         site,
         label: spec.label,
         status: "manual",
-        reason: "该站点仅支持 Cookie 登录，请重新获取 Cookie 后更新绑定",
+        // 无账号密码登录的站点（Cookie 型 / OAuth 型）各自的处置文案不同，优先取站点自定义说明
+        reason:
+          spec.manualReason ?? "该站点不支持自动重登，请重新获取凭据后更新绑定",
       };
     }
 

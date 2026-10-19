@@ -24,8 +24,8 @@ import {
   fetchResources,
   getMukakuMovieDetail,
   FRAMEHDR_COOKIE_EXPIRED_CODE,
-  HDHAVEN_CHALLENGE_REQUIRED_CODE,
   HDHAVEN_EXPIRED_CODE,
+  HDHAVEN_RATE_LIMITED_CODE,
   insertResources,
   JYING_EXPIRED_CODE,
   MUKAKU_TOKEN_EXPIRED_CODE,
@@ -73,7 +73,7 @@ const EXPIRED_CODES: Partial<Record<BatchPostSite, { code: string; message: stri
   framehdr: { code: FRAMEHDR_COOKIE_EXPIRED_CODE, message: '帧影登录已过期，请重新登录' },
   mukaku: { code: MUKAKU_TOKEN_EXPIRED_CODE, message: '不太灵登录已过期，请重新登录' },
   jying: { code: JYING_EXPIRED_CODE, message: '聚影登录已过期，请重新登录' },
-  hdhaven: { code: HDHAVEN_EXPIRED_CODE, message: '栖影登录已过期，请重新登录' },
+  hdhaven: { code: HDHAVEN_EXPIRED_CODE, message: '栖影授权已失效，请到站点同步页重新授权' },
 };
 
 function friendlyError(site: BatchPostSite, e: unknown): string {
@@ -81,8 +81,8 @@ function friendlyError(site: BatchPostSite, e: unknown): string {
   if (err?.code && err.code === EXPIRED_CODES[site]?.code) {
     return EXPIRED_CODES[site]!.message;
   }
-  if (err?.code === HDHAVEN_CHALLENGE_REQUIRED_CODE) {
-    return '栖影触发了图形验证码校验，请先在栖影站点页手动通过一次验证';
+  if (err?.code === HDHAVEN_RATE_LIMITED_CODE) {
+    return err.message || '栖影调用次数已达上限（每分钟 60 次 / 每日按账号等级），请稍后再试';
   }
   if (err?.code === RESOURCE_QUOTA_EXCEEDED_CODE) {
     return err.message || '资源库已超出配额，无法入库';

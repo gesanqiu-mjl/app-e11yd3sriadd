@@ -56,7 +56,6 @@ import {
   getHdhavenBinding,
   createHdhavenShare,
 } from '@/services/api';
-import { useHdhavenChallenge } from '@/components/HdhavenChallengeDialog';
 import type { Resource, MukakuMovie, YaLink, PinglianLink, JyingMovie, HdhavenTmdbItem } from '@/types/index';
 import type { PinglianLibraryItem, XnSearchItem, FramehdrSearchItem } from '@/services/api';
 import { detectPanName } from '@/lib/panUtils';
@@ -240,9 +239,6 @@ export default function QuickBindDialog({
     jyingBound: boolean;
     hdhavenBound: boolean;
   }>({ mukakuBound: false, yaBound: false, jyingBound: false, hdhavenBound: false });
-
-  // 栖影风控（图形验证码）闭环：发布/同步命中站点限流时弹窗人工识别后自动重试
-  const { withChallenge, challengeDialog } = useHdhavenChallenge();
 
   // 队列回填与发布执行状态
   const [queueProgress, setQueueProgress] = useState<{
@@ -773,20 +769,18 @@ export default function QuickBindDialog({
             // 成功后用返回 slug 落地绑定，之后本地改链即自动同步
             const mediaType = selectedHdhaven.media_type
               || (selectedHdhaven.first_air_date ? 'tv' : 'movie');
-            const created = await withChallenge(() =>
-              createHdhavenShare({
-                tmdbId: String(selectedHdhaven.id),
-                mediaType,
-                url: firstLink.url,
-                title: finalName,
-                accessCode: firstLink.extract_code,
-                // 按资源名称自动匹配站点投稿属性：分辨率 / 来源(SDR、HDR、DV) / 字幕 / 集数范围
-                meta: parseHdhavenMetaFromName(finalName, {
-                  isTv: mediaType === 'tv',
-                  episodeCount: resource?.episode_count ?? null,
-                }),
-              })
-            );
+            const created = await createHdhavenShare({
+              tmdbId: String(selectedHdhaven.id),
+              mediaType,
+              url: firstLink.url,
+              title: finalName,
+              accessCode: firstLink.extract_code,
+              // 按资源名称自动匹配站点投稿属性：分辨率 / 来源(SDR、HDR、DV) / 字幕 / 集数范围
+              meta: parseHdhavenMetaFromName(finalName, {
+                isTv: mediaType === 'tv',
+                episodeCount: resource?.episode_count ?? null,
+              }),
+            });
             if (created.slug) {
               firstBinding = {
                 site: 'hdhaven',
@@ -941,19 +935,17 @@ export default function QuickBindDialog({
               try {
                 const mediaType = selectedHdhaven.media_type
                   || (selectedHdhaven.first_air_date ? 'tv' : 'movie');
-                const created = await withChallenge(() =>
-                  createHdhavenShare({
-                    tmdbId: String(selectedHdhaven.id),
-                    mediaType,
-                    url: item.url,
-                    title: finalName,
-                    accessCode: item.extract_code,
-                    meta: parseHdhavenMetaFromName(finalName, {
-                      isTv: mediaType === 'tv',
-                      episodeCount: resource?.episode_count ?? null,
-                    }),
-                  })
-                );
+                const created = await createHdhavenShare({
+                  tmdbId: String(selectedHdhaven.id),
+                  mediaType,
+                  url: item.url,
+                  title: finalName,
+                  accessCode: item.extract_code,
+                  meta: parseHdhavenMetaFromName(finalName, {
+                    isTv: mediaType === 'tv',
+                    episodeCount: resource?.episode_count ?? null,
+                  }),
+                });
                 if (created.slug) {
                   subBinding = {
                     site: 'hdhaven',
@@ -1765,8 +1757,6 @@ export default function QuickBindDialog({
             </div>
           </div>
         </div>
-        {/* 风控图形验证码弹窗（命中站点限流时自动弹出） */}
-        {challengeDialog}
       </DialogContent>
     </Dialog>
   );

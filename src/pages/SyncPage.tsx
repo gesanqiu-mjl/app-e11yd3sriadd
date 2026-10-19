@@ -39,9 +39,10 @@ import {
   MUKAKU_TOKEN_EXPIRED_CODE,
   getJyingBinding, loginJying, unbindJying, loadJyingShares,
   updateJyingShareLink, JYING_EXPIRED_CODE, revalidateJyingSession,
-  getHdhavenBinding, loginHdhaven, bindHdhavenCookie, unbindHdhaven, loadHdhavenShares, getHdhavenShareDetail,
+  getHdhavenBinding, unbindHdhaven, loadHdhavenShares, getHdhavenShareDetail,
   updateHdhavenShareLink, revalidateHdhavenSession,
-  HDHAVEN_EXPIRED_CODE, HDHAVEN_TOTP_REQUIRED_CODE,
+  startHdhavenOAuth, finishHdhavenOAuth, loadHdhavenQuota, checkinHdhaven,
+  HDHAVEN_EXPIRED_CODE, HDHAVEN_RATE_LIMITED_CODE,
   // 1号站点（开放 API 令牌型 + 站点账号登录）
   getSt1Binding, bindSt1Credential, unbindSt1, checkSt1,
   st1Categories, setSt1DefaultCategory, ST1_TOKEN_EXPIRED_CODE,
@@ -50,7 +51,6 @@ import {
   pinglianShareTargets, getPinglianGroupPref, savePinglianGroupPref,
   type PinglianShareGroup,
 } from '@/services/api';
-import { useHdhavenChallenge } from '@/components/HdhavenChallengeDialog';
 import BatchPostButton from '@/components/BatchPostButton';
 import { PAN_TYPE_LABELS } from '@/lib/panUtils';
 import { SITE_URLS, SITE_LABELS, siteHost, type SiteKey } from '@/lib/siteCredentials';
@@ -3457,12 +3457,6 @@ function hdhavenPanLabel(panType?: string | null) {
 function HdhavenTab() {
   const [binding, setBinding] = useState<HdhavenBinding | null>(null);
   const [bindingLoading, setBindingLoading] = useState(true);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [totp, setTotp] = useState('');
-  const [needTotp, setNeedTotp] = useState(false);
-  // 站点登录已加人机验证（Cloudflare Turnstile）→ 支持粘贴浏览器会话 Cookie 绑定
-  const [cookieDraft, setCookieDraft] = useState('');
   const [binding_, setBinding_] = useState(false);
   const [shares, setShares] = useState<HdhavenShareItem[]>([]);
   const [listLoading, setListLoading] = useState(false);
@@ -3471,9 +3465,7 @@ function HdhavenTab() {
   const [editUrl, setEditUrl] = useState('');
   const [editLoading, setEditLoading] = useState(false);
   const [editSaving, setEditSaving] = useState(false);
-
-  // 站点风控（图形验证码）闭环：命中时弹窗人工识别，验证通过后自动重放原请求
-  const { withChallenge, challengeDialog } = useHdhavenChallenge();
+  const [quotaText, setQuotaText] = useState<string>('');
 
   const isBound = binding?.status === 'active';
   const isExpired = binding?.status === 'expired';
@@ -3501,15 +3493,17 @@ function HdhavenTab() {
 
   const loadShares = useCallback(async () => {
     setListLoading(true);
-    try { setShares(await withChallenge(() => loadHdhavenShares())); }
+    try { setShares(await loadHdhavenShares()); }
     catch (e) {
       const err = e as Error & { code?: string };
       if (err.code === HDHAVEN_EXPIRED_CODE) {
-        toast.error(err.message || '栖影登录已过期，请重新登录栖影账号');
+        toast.error(err.message || '栖影授权已失效，请重新授权');
         setBinding((b) => (b ? { ...b, status: 'expired' } : b));
+      } else if (err.code === HDHAVEN_RATE_LIMITED_CODE) {
+        toast.error(err.message || '栖影调用次数已达上限，请稍后再试');
       } else { toast.error(err.message || '加载我的分享失败'); }
     } finally { setListLoading(false); }
-  }, [withChallenge]);
+  }, []);
 
   useEffect(() => { loadBinding(); }, [loadBinding]);
   useEffect(() => {
@@ -3517,43 +3511,92 @@ function HdhavenTab() {
     else setShares([]);
   }, [binding?.status, loadShares]);
 
-  async function handleBind() {
-    if (!username.trim() || !password) { toast.error('请输入栖影账号和密码'); return; }
+  /**
+   * 发起官方 OAuth 授权：跳到栖影授权页，用户点确认后带 code+state 跳回本页。
+   * state 与 PKCE verifier 都在服务端，前端不接触任何凭据。
+   */
+  async function handleAuthorize() {
     setBinding_(true);
     try {
-      await withChallenge(() => loginHdhaven(username.trim(), password, needTotp ? totp : undefined));
-      toast.success('栖影账号登录成功，资源更新时将自动同步');
-      setUsername(''); setPassword(''); setTotp(''); setNeedTotp(false);
-      await loadBinding();
+      const authorizeUrl = await startHdhavenOAuth();
+      window.location.href = authorizeUrl;
     } catch (e) {
-      const err = e as Error & { code?: string };
-      if (err.code === HDHAVEN_TOTP_REQUIRED_CODE) {
-        // 账号开启两步验证：展开动态码输入后重试
-        setNeedTotp(true);
-        toast.error(err.message || '该账号开启了两步验证，请输入 6 位动态码');
-      } else {
-        toast.error(err.message || '登录失败，请检查账号密码');
-      }
+      toast.error((e as Error).message || '发起授权失败，请稍后重试');
+      setBinding_(false);
     }
-    finally { setBinding_(false); }
   }
 
-  /**
-   * 粘贴浏览器会话 Cookie 绑定（站点登录已加 Cloudflare 人机验证，服务端登录不可行）。
-   * 服务端只用它校验一次会话有效性，之后所有请求都由代理带着这个 Cookie 发出。
-   */
-  async function handleBindCookie() {
-    if (!cookieDraft.trim()) { toast.error('请粘贴栖影的 Cookie'); return; }
+  /** 授权回调：站点把 code + state 送回本页，这里换 token（服务端完成 PKCE 校验）后清理地址栏 */
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const state = params.get('state');
+    const oauthError = params.get('error');
+    const clearParams = () => {
+      ['code', 'state', 'error', 'error_description'].forEach((k) => params.delete(k));
+      const qs = params.toString();
+      window.history.replaceState(
+        {},
+        '',
+        `${window.location.pathname}${qs ? `?${qs}` : ''}`
+      );
+    };
+
+    if (oauthError) {
+      toast.error(`栖影授权未完成：${params.get('error_description') || oauthError}`);
+      clearParams();
+      return;
+    }
+    if (!code || !state) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await finishHdhavenOAuth({ code, state });
+        if (!cancelled) toast.success('栖影授权成功，资源更新时将自动同步');
+      } catch (e) {
+        if (!cancelled) toast.error((e as Error).message || '授权失败，请重新发起授权');
+      } finally {
+        if (!cancelled) { clearParams(); loadBinding(); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [loadBinding]);
+
+  /** 查询额度余量（每分钟 60 次；每日按等级/会员，签到与 /me 不计入） */
+  const loadQuota = useCallback(async () => {
+    try {
+      const q = (await loadHdhavenQuota()) as Record<string, unknown> | null;
+      if (!q) return;
+      const pick = (...keys: string[]) => {
+        for (const k of keys) {
+          const v = q[k];
+          if (typeof v === 'number' || typeof v === 'string') return String(v);
+        }
+        return '';
+      };
+      const remain = pick('remaining', 'remain', 'left', 'available', 'quota');
+      const limit = pick('limit', 'total', 'quota', 'daily');
+      setQuotaText(remain && limit ? `今日剩余 ${remain} / ${limit} 次` : remain ? `今日剩余 ${remain} 次` : '');
+    } catch { /* 额度查询失败不影响主流程 */ }
+  }, []);
+
+  /** 每日签到（站点说明签到不计入每日调用次数） */
+  async function handleCheckin() {
     setBinding_(true);
     try {
-      await bindHdhavenCookie(cookieDraft);
-      toast.success('栖影 Cookie 校验通过，已绑定');
-      setCookieDraft('');
-      await loadBinding();
+      await checkinHdhaven();
+      toast.success('签到成功');
+      loadQuota();
     } catch (e) {
-      toast.error((e as Error).message || 'Cookie 校验失败，请重新复制');
+      toast.error((e as Error).message || '签到失败');
     } finally { setBinding_(false); }
   }
+
+  useEffect(() => {
+    if (binding?.status === 'active') loadQuota();
+    else setQuotaText('');
+  }, [binding?.status, loadQuota]);
 
   async function handleUnbind() {
     setBinding_(true);
@@ -3572,7 +3615,7 @@ function HdhavenTab() {
     setEditUrl(item.url ?? '');
     setEditLoading(true);
     try {
-      const detail = await withChallenge(() => getHdhavenShareDetail(item.slug));
+      const detail = await getHdhavenShareDetail(item.slug);
       if (detail?.url) setEditUrl(detail.url);
     } catch { /* 详情取不到时允许手动填写 */ }
     finally { setEditLoading(false); }
@@ -3583,17 +3626,17 @@ function HdhavenTab() {
     if (!editUrl.trim()) { toast.error('分享链接不能为空'); return; }
     setEditSaving(true);
     try {
-      await withChallenge(() =>
-        updateHdhavenShareLink({ slug: editTarget.slug, url: editUrl.trim() })
-      );
+      await updateHdhavenShareLink({ slug: editTarget.slug, url: editUrl.trim() });
       toast.success('分享链接已更新（栖影会重新审核该资源）');
       setEditTarget(null);
       await loadShares();
     } catch (e) {
       const err = e as Error & { code?: string };
       if (err.code === HDHAVEN_EXPIRED_CODE) {
-        toast.error(err.message || '栖影登录已过期，请重新登录');
+        toast.error(err.message || '栖影授权已失效，请重新授权');
         setBinding((b) => (b ? { ...b, status: 'expired' } : b));
+      } else if (err.code === HDHAVEN_RATE_LIMITED_CODE) {
+        toast.error(err.message || '栖影调用次数已达上限，请稍后再试');
       } else { toast.error(err.message || '更新失败'); }
     } finally { setEditSaving(false); }
   }
@@ -3623,60 +3666,29 @@ function HdhavenTab() {
           <div className="mb-4 p-3 rounded-lg bg-muted/60 text-xs text-muted-foreground">
             栖影账号「{binding?.username || '未知'}」
             {binding?.user_number ? `（UID ${binding.user_number}）` : ''}
-            正常（最近检测：{fmtDate(binding?.last_check_at)}）
+            授权正常（最近检测：{fmtDate(binding?.last_check_at)}）
+            {quotaText ? ` · ${quotaText}` : ''}
           </div>
         )}
         {isExpired && (
           <div className="mb-4 p-3 rounded-lg bg-destructive/10 text-xs text-destructive">
-            栖影会话已失效，请在浏览器重新登录后<strong>重新粘贴 Cookie</strong>（账号密码登录已因站点人机验证不可用）。
+            栖影授权已失效（你在站点 OPENAPI 页面撤销了授权，或账号不可用），请重新授权。
           </div>
         )}
 
         <div className="space-y-3">
-          <div className={`grid grid-cols-1 gap-3 ${needTotp ? 'md:grid-cols-3' : 'md:grid-cols-2'}`}>
-            <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">栖影账号</Label>
-              <Input
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="hdhaven.com 用户名"
-                autoComplete="username"
-                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">密码</Label>
-              <Input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleBind(); }}
-                placeholder="hdhaven.com 密码"
-                autoComplete="current-password"
-                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
-              />
-            </div>
-            {needTotp && (
-              <div className="space-y-1.5">
-                <Label className="text-sm text-foreground">两步验证码</Label>
-                <Input
-                  value={totp}
-                  onChange={(e) => setTotp(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleBind(); }}
-                  placeholder="6 位动态码"
-                  inputMode="numeric"
-                  maxLength={6}
-                  className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
-                />
-              </div>
-            )}
-          </div>
           <div className="flex items-center gap-2 flex-wrap">
-            <Button onClick={handleBind} disabled={binding_}
+            <Button onClick={handleAuthorize} disabled={binding_}
               className="h-9 bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
               {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-              {isBound || isExpired ? '重新登录' : '登录绑定'}
+              {isBound || isExpired ? '重新授权' : '授权绑定'}
             </Button>
+            {isBound && (
+              <Button variant="outline" onClick={handleCheckin} disabled={binding_}
+                className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
+                每日签到
+              </Button>
+            )}
             {(isBound || isExpired) && (
               <Button variant="outline" onClick={handleUnbind} disabled={binding_}
                 className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
@@ -3686,43 +3698,17 @@ function HdhavenTab() {
             <BatchPostButton site="hdhaven" disabled={binding_} />
           </div>
 
-          {/* 站点登录已加人机验证（Cloudflare Turnstile）→ 走「浏览器登录一次 + 粘贴会话 Cookie」 */}
-          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-2">
-            <div className="flex items-start gap-2">
-              <ShieldAlert className="h-3.5 w-3.5 shrink-0 mt-0.5 text-primary" />
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                栖影自 2026-10 起在<strong>登录接口</strong>要求完成<strong>人机验证</strong>（Cloudflare Turnstile），
-                服务端已无法自动登录；其余接口只认会话 Cookie。请改用
-                <strong>「浏览器登录一次 → 粘贴 Cookie」</strong>：① 用能打开站点的网络（境外 IP / 梯子）在浏览器登录 hdhaven.com，
-                人机验证你自己点一下；② F12 → Network → 点任意 hdhaven.com 请求 → 复制 Request Headers 里的
-                <code className="font-mono"> Cookie:</code> 整串（或 Application → Cookies 里复制）；
-                ③ 粘到下面提交。绑定后所有同步请求都由服务端代理发出，
-                <strong>与你的本机网络 / 大陆 IP 无关</strong>。
-              </p>
-            </div>
-            <Textarea
-              value={cookieDraft}
-              onChange={(e) => setCookieDraft(e.target.value)}
-              placeholder="粘贴 Cookie：name=value; name2=value2 …"
-              className="min-h-20 px-3 text-xs bg-input border-border focus-visible:ring-primary/40 font-mono"
-            />
-            <div className="flex items-center gap-2 flex-wrap">
-              <Button size="sm" onClick={handleBindCookie} disabled={binding_}
-                className="h-8 text-xs bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
-                {binding_ ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
-                校验并绑定 Cookie
-              </Button>
-            </div>
+          <div className="flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
+            <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+            <span>
+              栖影现已开放<strong>官方开放 API</strong>，绑定方式改为 OAuth 授权：点「授权绑定」会跳到栖影授权页，
+              确认授权即完成。本工具拿到的是<strong>长期有效的 access_token</strong>，加密存服务端 ——
+              <strong>不再需要账号密码、不需要粘贴 Cookie、也不会话过期</strong>。
+              注意账号每日有调用额度（Lv.1 200 次起，年卡 5000 次，永久不限，每分钟 60 次），
+              <strong>签到与账户信息查询不计入</strong>；批量发布前可先看剩余额度。
+              同步时按网盘类型匹配本地链接，仅替换已发布分享的链接；普通用户改动后资源会<strong>重新进入审核</strong>。
+            </span>
           </div>
-        </div>
-        <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
-          <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-          <span>
-            上面「账号密码登录」是历史路径：站点加了人机验证后提交会直接返回「请先完成人机验证」，
-            因此<strong>请优先用 Cookie 绑定</strong>。Cookie 仅用于服务端会话校验与请求，<strong>不落库明文密码</strong>。
-            同步时按网盘类型匹配本地链接，仅替换已发布分享的链接；普通用户改动后资源会<strong>重新进入审核</strong>。
-            站点有请求频率风控，同步请勿过于频繁。
-          </span>
         </div>
       </div>
 
@@ -3828,9 +3814,6 @@ function HdhavenTab() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      {/* 风控图形验证码弹窗（命中站点限流时自动弹出） */}
-      {challengeDialog}
     </div>
   );
 }
