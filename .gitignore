@@ -34,3 +34,8 @@ history/*.json
 /tasks
 .native-wind-cache
 .vite
+
+# 本地密钥配置：禁止入库（部署走 .deploy_tmp 脚本与服务器 .env）
+.env
+.env.*
+!.env.example
