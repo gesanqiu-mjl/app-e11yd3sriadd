@@ -41,6 +41,9 @@ vi.mock('@/services/api', () => {
     fetchYaResourceBindings: emptyList,
     fetchFramehdrResourceBindings: emptyList,
     fetchPanfxResourceBindings: emptyList,
+    fetchMukakuResourceBindings: emptyList,
+    fetchJyingResourceBindings: emptyList,
+    fetchHdhavenResourceBindings: emptyList,
     updateResourceField: () => Promise.resolve(null),
     updateResourceCover: () => Promise.resolve(null),
     recordChange: () => Promise.resolve(undefined),
@@ -78,6 +81,10 @@ vi.mock('@/services/api', () => {
     YA_EXPIRED_CODE: 'YA_EXPIRED',
     FRAMEHDR_COOKIE_EXPIRED_CODE: 'FRAMEHDR_COOKIE_EXPIRED',
     PANFX_COOKIE_EXPIRED_CODE: 'PANFX_COOKIE_EXPIRED',
+    MUKAKU_TOKEN_EXPIRED_CODE: 'MUKAKU_TOKEN_EXPIRED',
+    JYING_EXPIRED_CODE: 'JYING_COOKIE_EXPIRED',
+    HDHAVEN_EXPIRED_CODE: 'HDHAVEN_COOKIE_EXPIRED',
+    HDHAVEN_CHALLENGE_REQUIRED_CODE: 'HDHAVEN_CHALLENGE_REQUIRED',
   };
 });
 

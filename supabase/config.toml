@@ -1,5 +1,31 @@
+project_id = "ichmfsvdjfxkzduellsw"
+
 [auth.email]
 enable_confirmations = false
 
 [auth.phone]
 enable_confirmations = false
+
+# 开放接口：调用方用 API Key（X-API-Key）鉴权、不携带 Supabase JWT，
+# 必须关闭平台层 JWT 校验，改由函数内部校验密钥（部署时也需 --no-verify-jwt）
+[functions.resource-api]
+verify_jwt = false
+
+# 订阅转存：定时任务由 pg_cron 调用（不带 JWT，用 x-subscription-secret 校验），
+# 因此同样关闭平台层 JWT 校验；用户侧调用仍校验 JWT
+# 注：托管版 Edge Function 的 wall-clock 上限由计划决定（付费 400s / 免费 150s），
+#     该 timeout 字段在托管平台不会被管理 API 校验/生效，此处按真实上限标注。
+[functions.subscription-run]
+verify_jwt = false
+timeout = 400
+
+# 短链开放接口（functions/shortlink-api）：调用方用 API Key（X-API-Key: rk_…）或用户登录态，
+# 不需要平台层 JWT 校验；函数内部自行校验密钥 / 归属账号的「短链管理」权限。
+[functions.shortlink-api]
+verify_jwt = false
+
+# 中转短链跳转（functions/go）：被外部用户（匿名访客）打开，必须关闭平台层 JWT 校验。
+# 函数内部只做「按短码查目标 + 记一次点击 + 302 跳转」，不暴露任何用户数据。
+# 建议同时配置环境变量 SHORTLINK_SALT（IP 哈希盐，换盐会重置独立访客判定）。
+[functions.go]
+verify_jwt = false

@@ -122,6 +122,123 @@ export default function LoginConfigTab() {
         </div>
       </div>
 
+      {/* 侧边栏顶部展示位 */}
+      <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div>
+            <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">侧边栏顶部展示位</h4>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              登录后左侧功能菜单最上方显示的内容，填图片或视频地址即可（替代原来的品牌文字）
+            </p>
+          </div>
+          <div className="flex items-center gap-1">
+            {(['none', 'image', 'video'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => set('sidebar_media_type', t)}
+                className={`h-7 px-2.5 rounded-md text-xs border transition-colors ${
+                  draft.sidebar_media_type === t
+                    ? 'border-primary text-primary bg-primary/10 font-medium'
+                    : 'border-border text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {t === 'none' ? '不展示' : t === 'image' ? '图片' : '视频'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {draft.sidebar_media_type !== 'none' && (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs text-foreground">
+                  {draft.sidebar_media_type === 'video' ? '视频地址（mp4 / webm）' : '图片地址'}
+                </Label>
+                <Input
+                  value={draft.sidebar_media_url ?? ''}
+                  onChange={(e) => set('sidebar_media_url', e.target.value || null)}
+                  placeholder="https://... 或 /images/xxx.png"
+                  className="h-9 bg-input border-border text-xs"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs text-foreground">点击跳转链接（可选）</Label>
+                <Input
+                  value={draft.sidebar_media_link ?? ''}
+                  onChange={(e) => set('sidebar_media_link', e.target.value || null)}
+                  placeholder="留空则不可点击"
+                  className="h-9 bg-input border-border text-xs"
+                />
+              </div>
+            </div>
+
+            {draft.sidebar_media_url?.trim() && (
+              <div className="rounded-lg border border-border overflow-hidden bg-muted/40 p-3">
+                <div className="text-[11px] text-muted-foreground mb-2">效果预览（左侧菜单宽度约 256px）</div>
+                <div className="w-56 overflow-hidden rounded-xl ring-1 ring-border bg-card">
+                  {draft.sidebar_media_type === 'video' ? (
+                    <video
+                      src={draft.sidebar_media_url.trim()}
+                      className="aspect-video w-full object-cover"
+                      autoPlay
+                      muted
+                      loop
+                      playsInline
+                    />
+                  ) : (
+                    <img
+                      src={draft.sidebar_media_url.trim()}
+                      alt="展示位预览"
+                      className="aspect-video w-full object-cover"
+                    />
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* 资源管理页顶部展示位 */}
+      <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+        <div>
+          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">资源管理页顶部横幅</h4>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            登录后「资源管理」页面最上方展示的横幅图片（留空则不展示，管理员会看到引导入口）
+          </p>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs text-foreground">横幅图片地址</Label>
+            <Input
+              value={draft.home_banner_url ?? ''}
+              onChange={(e) => set('home_banner_url', e.target.value || null)}
+              placeholder="https://... 或 /images/banner.png"
+              className="h-9 bg-input border-border text-xs"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs text-foreground">点击跳转链接（可选）</Label>
+            <Input
+              value={draft.home_banner_link ?? ''}
+              onChange={(e) => set('home_banner_link', e.target.value || null)}
+              placeholder="留空则不可点击"
+              className="h-9 bg-input border-border text-xs"
+            />
+          </div>
+        </div>
+        {draft.home_banner_url?.trim() && (
+          <div className="rounded-lg border border-border overflow-hidden bg-muted/40 p-3">
+            <div className="text-[11px] text-muted-foreground mb-2">效果预览（内容区宽度，高度贴合）</div>
+            <div className="overflow-hidden rounded-xl ring-1 ring-border bg-card">
+              <img src={draft.home_banner_url.trim()} alt="横幅预览" className="h-24 w-full object-cover md:h-32" />
+            </div>
+          </div>
+        )}
+      </div>
+
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* 左列：实时小预览 */}
         <div className="space-y-4">
@@ -202,7 +319,7 @@ export default function LoginConfigTab() {
             <div className="space-y-1.5">
               <Label className="text-xs text-foreground">左上角标题文字</Label>
               <Input value={draft.left_title} onChange={(e) => set('left_title', e.target.value)}
-                className="h-8 text-xs bg-input border-border" placeholder="资源更新追踪" />
+                className="h-8 text-xs bg-input border-border" placeholder="网盘推广工具" />
             </div>
 
             {/* 大标题 */}
@@ -225,7 +342,7 @@ export default function LoginConfigTab() {
             <div className="space-y-1.5">
               <Label className="text-xs text-foreground">底部版权文字</Label>
               <Input value={draft.left_copyright} onChange={(e) => set('left_copyright', e.target.value)}
-                className="h-8 text-xs bg-input border-border" placeholder="© 2026 资源更新追踪系统" />
+                className="h-8 text-xs bg-input border-border" placeholder="© 2026 网盘推广工具" />
             </div>
 
             <Separator className="bg-border/60" />

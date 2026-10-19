@@ -25,6 +25,16 @@ export interface LoginConfig {
   tutorial_url: string | null;
   /** 邀请码/激活码获取说明（弹窗展示的多行文本） */
   invite_code_info: string | null;
+  /** 侧边栏顶部展示位：none 不展示 / image 图片 / video 视频 */
+  sidebar_media_type: 'none' | 'image' | 'video';
+  /** 展示位的图片或视频地址（留空即不展示） */
+  sidebar_media_url: string | null;
+  /** 可选：点击展示位跳转的链接 */
+  sidebar_media_link: string | null;
+  /** 资源管理页顶部横幅图片地址（留空即不展示） */
+  home_banner_url: string | null;
+  /** 可选：点击顶部横幅跳转的链接 */
+  home_banner_link: string | null;
   updated_at: string;
 }
 
@@ -33,27 +43,81 @@ export const LOGIN_CONFIG_DEFAULTS: Omit<LoginConfig, 'id' | 'updated_at'> = {
   left_use_bg_image: false,
   left_bg_image_url: null,
   left_logo_url: null,
-  left_title: '资源更新追踪',
+  left_title: '网盘推广工具',
   left_heading: '高效追踪每一部剧集的更新',
   left_description: '智能解析、批量导入、自动变更检测。修改即同步到已更新栏，一键复制即可分享。',
-  left_copyright: '© 2026 资源更新追踪系统',
+  left_copyright: '© 2026 网盘推广工具',
   right_title: '欢迎回来',
   right_subtitle: '登录以管理你的剧集资源',
   right_btn_text: '登录',
   tutorial_url: null,
   invite_code_info: null,
+  sidebar_media_type: 'none',
+  sidebar_media_url: null,
+  sidebar_media_link: null,
+  home_banner_url: null,
+  home_banner_link: null,
 };
+
+/**
+ * 首页图文教程（管理员维护，前台展示）。
+ * images 为图片公开地址数组，按数组顺序展示。
+ */
+export interface Tutorial {
+  id: string;
+  title: string;
+  /** 正文，按换行分段展示 */
+  content: string;
+  images: string[];
+  is_active: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface Profile {
   id: string;
   email: string | null;
   phone: string | null;
   username: string | null;
+  /** 头像地址（存于 avatars bucket；未设置则用用户名首字母占位） */
+  avatar_url?: string | null;
   role: UserRole;
   status: UserStatus;
   membership_expires_at: string | null;
+  /** 批量发帖权限到期时间：null=未开通，> now()=有效，<= now()=已过期（功能锁定） */
+  batch_post_expires_at?: string | null;
+  /** 订阅功能权限：是否拥有订阅转存功能（管理员默认可用）。false=未开通，须管理员在后台开启 */
+  subscriptions_enabled?: boolean | null;
+  /** 受限账号（特殊邀请码注册）：只能使用订阅功能，且只能订阅管理员维护的订阅源 */
+  subscription_only?: boolean | null;
+  /**
+   * 订阅数量上限（管理员按账号设置）：
+   * null / undefined 时按账号类型取默认——订阅专用 10 / 普通 80（订阅专用账号的 null 意为「不限」）
+   */
+  max_subscriptions?: number | null;
+  /** 资源条数上限（管理员按账号设置）；null / undefined = 默认 200，管理员账号不受限 */
+  max_resources?: number | null;
+  /**
+   * 功能权限：管理员在「用户管理」里按账号逐项开通/关闭。
+   * undefined / null 视为开启（兼容历史数据），只有显式 false 才是关闭；admin 角色始终可用。
+   */
+  can_resources?: boolean | null;
+  can_site_sync?: boolean | null;
+  can_shortlink?: boolean | null;
+  can_subscriptions?: boolean | null;
   created_at: string;
 }
+
+/** 可由管理员授权的功能项 */
+export type ProfileFeature = 'can_resources' | 'can_site_sync' | 'can_shortlink' | 'can_subscriptions';
+
+export const FEATURE_LABELS: Record<ProfileFeature, string> = {
+  can_resources: '资源管理',
+  can_site_sync: '站点同步',
+  can_shortlink: '短链管理',
+  can_subscriptions: '订阅转存',
+};
 
 export interface PanLink {
   url: string;
@@ -119,6 +183,71 @@ export interface InviteCode {
   created_at: string;
   is_revoked: boolean;
   membership_days: number;
+  /** 特殊邀请码：永久有效，注册出来的账号只能使用订阅功能（且只能订阅管理员维护的订阅源，最多 10 个） */
+  is_special?: boolean;
+}
+
+/**
+ * 管理员「资源管理」里**更新中**资源的网盘链接：受限账号的订阅源就从这里选。
+ * 同一个资源可能返回多行（光鸭 + 夸克 + 百度），由用户按自己绑定的网盘挑。
+ */
+export interface AdminResourceSource {
+  resource_id: string;
+  /** 资源名（含集数等信息，直接作为订阅名） */
+  name: string;
+  episode_count: number;
+  pan: 'guangya' | 'quark' | 'baidu' | 'xunlei' | 'uc' | 'p123';
+  url: string;
+  /** 链接有效性（链接检测结果）：valid / invalid / unknown */
+  link_status: string;
+  is_finished: boolean;
+  updated_at: string;
+}
+
+// 订阅源（管理员维护；受限账号只能从这里选订阅链接）
+export interface SubscriptionSource {
+  id: string;
+  name: string;
+  note: string | null;
+  source_url: string;
+  source_type: 'auto' | 'rss' | 'page' | 'pan_share';
+  source_passcode: string | null;
+  keyword: string | null;
+  pan: 'guangya' | 'quark' | 'baidu' | 'xunlei' | 'uc' | 'p123';
+  clean_mode: 'none' | 'episode';
+  interval_minutes: number;
+  is_active: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 新建/编辑订阅源时可提交的字段 */
+export type SubscriptionSourceInput = Omit<SubscriptionSource, 'id' | 'created_at' | 'updated_at'>;
+
+// 开放接口密钥（管理员在「API 管理」创建，供第三方程序调用 /functions/v1/resource-api）
+export interface ApiKey {
+  id: string;
+  /** 应用 / 用途名称 */
+  name: string;
+  /** 密钥明文（rk_ 开头），仅管理员可见 */
+  api_key: string;
+  remark: string | null;
+  is_active: boolean;
+  /** 到期时间，null 表示永久有效 */
+  expires_at: string | null;
+  /** 归属账号：开放接口默认只返回该账号名下的资源 */
+  owner_id: string;
+  /**
+   * 数据范围：owner=仅归属账号（默认）；
+   * all=全部账号 —— 「订阅入库通知」接口（/subscriptions）可跨账号查询，管理员用它做统一通知。
+   */
+  scope: 'owner' | 'all';
+  created_by: string | null;
+  created_at: string;
+  last_used_at: string | null;
+  call_count: number;
+  last_ip: string | null;
 }
 
 // 盘链账号绑定信息
@@ -128,6 +257,13 @@ export interface PinglianBinding {
   last_check_at: string | null;
   remark: string | null;
   updated_at: string | null;
+}
+
+/** 盘链图形验证码（GET /api/auth/captcha）：id 用于登录提交，image 为 base64 PNG，ttl 为有效期秒数 */
+export interface PinglianCaptcha {
+  id: string;
+  image: string;
+  ttl: number;
 }
 
 // 盘链发布记录（v4 接口字段）
@@ -240,6 +376,8 @@ export interface YaLink {
   video_id?: number;
   /** 所属视频分类（video.category） */
   video_category?: string | null;
+  /** 所属视频封面（video.cover_url，鸭影站点片源海报） */
+  video_cover?: string | null;
   updated_at?: string | null;
   created_at?: string | null;
 }
@@ -366,6 +504,123 @@ export interface MukakuResourceBinding {
   created_at: string;
 }
 
+// 聚影站点（www.jying.top）账号绑定信息
+export interface JyingBinding {
+  status: 'active' | 'expired';
+  username: string | null;
+  last_check_at: string | null;
+  remark: string | null;
+  updated_at: string | null;
+}
+
+/** 聚影「我的分享」条目（资源条目维度，来自 my_shares 扁平化结果） */
+export interface JyingShareItem {
+  id: number;                 // 聚影资源条目 ID（update 用的 link_id）
+  movie_id: number;           // 所属影片 ID
+  movie_title: string | null;
+  movie_cover: string | null;
+  release_year: number | null;
+  movie_type: string | null;
+  title: string | null;       // 资源标题
+  share_link: string | null;  // 站点上的真实分享链接
+  link_hidden_reason: string | null;
+  resource_type: string | null;          // quark / guangya ...
+  resource_type_display: string | null;  // 夸克网盘 / 光鸭网盘
+  can_edit: boolean;
+}
+
+/** 聚影全站片库检索结果（search_movies） */
+export interface JyingMovie {
+  id: number;
+  title: string;
+  description?: string | null;
+  cover?: string | null;
+  backdrop_url?: string | null;
+  release_year?: number | null;
+  movie_type?: string | null;
+  movie_type_display?: string | null;
+}
+
+// 资源与聚影分享条目的绑定关系（一个资源可绑定多条，每条对应一种网盘）
+export interface JyingResourceBinding {
+  id: string;
+  resource_id: string;
+  link_id: number;
+  movie_id: number | null;
+  link_title: string | null;
+  vod_name: string | null;
+  pan_label: string | null;
+  created_at: string;
+}
+
+// 栖影 HDHaven（hdhaven.com）账号绑定信息
+export interface HdhavenBinding {
+  status: 'active' | 'expired';
+  username: string | null;
+  user_number: number | null;
+  last_check_at: string | null;
+  remark: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * 栖影风控图形验证码（5 位字符，需人工识别，不支持自动绕过）。
+ * image 由服务端带会话取回并内联为 data URL。
+ */
+export interface HdhavenChallenge {
+  id: string;
+  image: string;
+}
+
+/** 栖影「我的分享」条目（GET /api/users/me/shares，站点无分页） */
+export interface HdhavenShareItem {
+  slug: string;                       // 分享条目标识（update 用）
+  tmdb_id: string | null;
+  media_type: string | null;          // movie / tv
+  title: string | null;               // 分享标题（通常含年份）
+  pan_type: string | null;            // 站点网盘类型：guangya / 115 / 123 / ed2k
+  share_size: string | null;
+  episode_range: string | null;
+  file_count: number | null;
+  remark: string | null;
+  hide_link: boolean | null;
+  validate_status: string | null;
+  review_status: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  media_title: string | null;
+  poster_path: string | null;
+  /** 分享链接与提取码：仅详情接口（/shares/{slug}）返回 */
+  url?: string | null;
+  access_code?: string | null;
+}
+
+/** 栖影片源检索结果（TMDB 原生结构） */
+export interface HdhavenTmdbItem {
+  id: number;
+  title?: string | null;              // 电影标题
+  name?: string | null;               // 剧集标题
+  media_type?: string | null;
+  release_date?: string | null;
+  first_air_date?: string | null;
+  poster_path?: string | null;
+  overview?: string | null;
+}
+
+// 资源与栖影分享条目的绑定关系（一个资源可绑定多条，每条对应一种网盘）
+export interface HdhavenResourceBinding {
+  id: string;
+  resource_id: string;
+  slug: string;
+  tmdb_id: string | null;
+  media_type: string | null;
+  link_title: string | null;
+  vod_name: string | null;
+  pan_type: string | null;
+  pan_label: string | null;
+  created_at: string;
+}
+
 export type DisplayFormat = 'all' | 'guangya' | 'quark';
 
 export const FIELD_LABELS: Record<string, string> = {
@@ -379,4 +634,28 @@ export interface NewResourceInput {
   episode_count: number;
   link: string;
   sort_order: number;
+}
+
+/** 「1号站点」绑定：开放 API 令牌型（用户在站点「开放API」标签生成 pat_ 令牌后填入） */
+export interface St1Binding {
+  /** 站点地址（不含 /api/open）；服务端配了 ST1_BASE_URL 时为空 */
+  base_url: string | null;
+  /** 令牌对应的站点用户名（GET /profile 得到，仅展示） */
+  username: string | null;
+  /** 默认发布分类 id（站点 /categories 的 id） */
+  default_category_id: string | null;
+  status: 'active' | 'expired';
+  last_error: string | null;
+  last_check_at: string | null;
+}
+
+/** 「1号站点」片源绑定：本地资源 ↔ 站点片源 */
+export interface St1ResourceBinding {
+  id: string;
+  resource_id: string;
+  remote_id: string;
+  remote_url: string | null;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
 }

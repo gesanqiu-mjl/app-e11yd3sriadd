@@ -41,23 +41,50 @@ import {
   yaAddResource,
   bindResourceToYa,
   yaGetAccountStatus,
-  searchPanLinks,
+  searchPinglianLibrary,
   addPanLink,
   bindResourceToLink,
+  searchXnVideos,
+  addXnShare,
+  searchFramehdrResources,
+  addFramehdrLink,
+  searchJyingMovies,
+  addJyingResource,
+  bindResourceToJying,
+  getJyingBinding,
+  searchHdhavenTmdb,
+  getHdhavenBinding,
+  createHdhavenShare,
 } from '@/services/api';
-import type { Resource, MukakuMovie, YaLink, PinglianLink } from '@/types/index';
+import { useHdhavenChallenge } from '@/components/HdhavenChallengeDialog';
+import type { Resource, MukakuMovie, YaLink, PinglianLink, JyingMovie, HdhavenTmdbItem } from '@/types/index';
+import type { PinglianLibraryItem, XnSearchItem, FramehdrSearchItem } from '@/services/api';
 import { detectPanName } from '@/lib/panUtils';
+import { SITE_URLS, siteHost } from '@/lib/siteCredentials';
+import { parseHdhavenMetaFromName } from '@/lib/hdhavenMeta';
 
-export type SiteSourceType = 'mukaku' | 'ya' | 'pinglian' | 'framehdr' | 'xn' | 'panfx';
+export type SiteSourceType = 'mukaku' | 'ya' | 'pinglian' | 'framehdr' | 'xn' | 'panfx' | 'jying' | 'hdhaven';
 
 export interface SiteBindingPayload {
   site: SiteSourceType;
-  link_id: number;
+  /** 站点侧记录 ID：mukaku / ya / pinglian 为数字；观影小牛改用 share_id */
+  link_id?: number;
   movies_id?: number;
   video_id?: number;
   vod_name?: string;
   pan_type?: string;
   code?: string;
+  /** 该条绑定对应的本地网盘链接：本地按 URL 识别网盘名，
+   *  避免用站点侧类型代码（如鸭影对光鸭返回的 others）导致同步时匹配失败 */
+  pan_url?: string;
+  /** 观影小牛：站点分享短码 ID */
+  share_id?: string;
+  /** 分享标题（盘链 / 观影小牛落库使用） */
+  link_title?: string;
+  /** 分享外链（观影小牛落库使用） */
+  share_url?: string;
+  /** 栖影：投稿片源的 movie / tv，同步时用于判断是否提交「集数范围」 */
+  media_type?: string;
 }
 
 export interface SelectedPanLinkItem {
@@ -67,30 +94,21 @@ export interface SelectedPanLinkItem {
   extract_code?: string;
   source_title?: string;
   checked: boolean;
+  /** 按站点独立记忆的勾选状态：{ [siteId]: boolean }；未记录的站点回退到 checked */
+  checkedSites?: Record<string, boolean>;
 }
 
 interface QuickBindDialogProps {
   resource: Resource | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  // 更新当前行资源
+  // 更新当前行资源（siteBindings：首条 + 队列各条的站点发布绑定，全部落地到当前行）
   onUpdateCurrent: (
     resourceId: string,
     filledName: string,
     filledLink: string,
     coverUrl?: string | null,
-    siteBinding?: SiteBindingPayload
-  ) => Promise<void>;
-  // 串行队列追加多网盘新行
-  onQueueAppend: (
-    baseResource: Resource,
-    filledName: string,
-    linksQueue: Array<{
-      url: string;
-      pan_name?: string;
-      extract_code?: string;
-      siteBinding?: SiteBindingPayload;
-    }>
+    siteBindings?: SiteBindingPayload[]
   ) => Promise<void>;
 }
 
@@ -102,11 +120,12 @@ const SITE_OPTIONS: Array<{
   supported: boolean;
 }> = [
   { id: 'mukaku', label: '不太灵片库', badge: '一键发布', desc: '站内全网片库检索，支持自动发布网盘资源并挂载', supported: true },
-  { id: 'ya', label: '鸭影臻藏', badge: '多云盘', desc: '检索站内片源及已收录网盘，支持自动添加网盘分享', supported: true },
   { id: 'pinglian', label: '盘链片库', badge: '网盘库', desc: '检索全站网盘分享库，支持同步发布到剧集', supported: true },
-  { id: 'framehdr', label: '帧HDR', badge: '豆瓣片库', desc: '基于帧影站内豆瓣源检索影片条目', supported: true },
-  { id: 'xn', label: '观影小牛', badge: '搜索提示', desc: '基于小牛站内搜索联想片源', supported: true },
+  { id: 'framehdr', label: '帧影', badge: '豆瓣片库', desc: '基于帧影站内豆瓣源检索影片条目', supported: true },
+  { id: 'xn', label: '观影片库', badge: '搜索提示', desc: '基于片库站内搜索联想片源', supported: true },
   { id: 'panfx', label: '123社区', badge: '仅发帖', desc: '暂未提供全网片源检索接口，仅支持帖子管理', supported: false },
+  { id: 'jying', label: '聚影', badge: '云端片库', desc: '检索聚影全站片库，支持在该影片下自动新增网盘分享', supported: true },
+  { id: 'hdhaven', label: '栖影', badge: 'TMDB 片库', desc: '基于 TMDB 检索片源，支持直接投稿发布网盘资源（提交后由站点审核）', supported: true },
 ];
 
 /** 智能清洗关键词（去掉括号年份、集数、画质等），用于搜索站点片库 */
@@ -159,12 +178,20 @@ function parseMultiLinesToLinks(text: string): SelectedPanLinkItem[] {
   return results;
 }
 
+/**
+ * 某条网盘链接对指定站点的勾选状态。
+ * 各站点互相独立：站点未单独设置过时回退到默认 checked，
+ * 这样用户可以「只把光鸭云盘发给帧影、把全部链接发给盘链」而互不影响。
+ */
+function isLinkCheckedForSite(item: SelectedPanLinkItem, site: SiteSourceType): boolean {
+  return item.checkedSites?.[site] ?? item.checked;
+}
+
 export default function QuickBindDialog({
   resource,
   open,
   onOpenChange,
   onUpdateCurrent,
-  onQueueAppend,
 }: QuickBindDialogProps) {
   const queryInputId = useId();
   const titleInputId = useId();
@@ -175,18 +202,30 @@ export default function QuickBindDialog({
   // 搜索结果列表
   const [mukakuMovies, setMukakuMovies] = useState<MukakuMovie[]>([]);
   const [yaLinks, setYaLinks] = useState<YaLink[]>([]);
-  const [pinglianLinks, setPinglianLinks] = useState<PinglianLink[]>([]);
+  const [pinglianLinks, setPinglianLinks] = useState<PinglianLibraryItem[]>([]);
+  const [xnVideos, setXnVideos] = useState<XnSearchItem[]>([]);
+  const [framehdrResults, setFramehdrResults] = useState<FramehdrSearchItem[]>([]);
+  const [jyingShares, setJyingShares] = useState<JyingMovie[]>([]);
+  const [hdhavenResults, setHdhavenResults] = useState<HdhavenTmdbItem[]>([]);
 
   // 选中的片源
   const [selectedMovie, setSelectedMovie] = useState<MukakuMovie | null>(null);
   const [selectedYa, setSelectedYa] = useState<YaLink | null>(null);
   const [selectedPinglian, setSelectedPinglian] = useState<PinglianLink | null>(null);
+  const [selectedXn, setSelectedXn] = useState<XnSearchItem | null>(null);
+  const [selectedFramehdr, setSelectedFramehdr] = useState<FramehdrSearchItem | null>(null);
+  const [selectedJying, setSelectedJying] = useState<JyingMovie | null>(null);
+  const [selectedHdhaven, setSelectedHdhaven] = useState<HdhavenTmdbItem | null>(null);
 
   // 回填设置与发布表单
   const [targetName, setTargetName] = useState('');
   const [selectedCover, setSelectedCover] = useState<string | null>(null);
   const [panLinks, setPanLinks] = useState<SelectedPanLinkItem[]>([]);
   const [publishToSite, setPublishToSite] = useState(true);
+  // 当前资源是否已有自己的网盘链接（打开弹窗时判定）
+  const [resourceHasOwnLink, setResourceHasOwnLink] = useState(false);
+  // 本次弹窗内各站点已发布的条数，用于「连续向多站点发布」时给出完成反馈
+  const [publishedSites, setPublishedSites] = useState<Record<string, number>>({});
 
   // 快速录入单条或多条网盘
   const [newSingleUrl, setNewSingleUrl] = useState('');
@@ -198,7 +237,12 @@ export default function QuickBindDialog({
   const [siteBindStatus, setSiteBindStatus] = useState<{
     mukakuBound: boolean;
     yaBound: boolean;
-  }>({ mukakuBound: false, yaBound: false });
+    jyingBound: boolean;
+    hdhavenBound: boolean;
+  }>({ mukakuBound: false, yaBound: false, jyingBound: false, hdhavenBound: false });
+
+  // 栖影风控（图形验证码）闭环：发布/同步命中站点限流时弹窗人工识别后自动重试
+  const { withChallenge, challengeDialog } = useHdhavenChallenge();
 
   // 队列回填与发布执行状态
   const [queueProgress, setQueueProgress] = useState<{
@@ -237,9 +281,12 @@ export default function QuickBindDialog({
         });
       }
       setPanLinks(existingLinks);
+      setResourceHasOwnLink(existingLinks.length > 0);
+      setPublishedSites({});
       setSelectedMovie(null);
       setSelectedYa(null);
       setSelectedPinglian(null);
+      setSelectedXn(null);
       setNewSingleUrl('');
       setNewSingleCode('');
       setPasteText('');
@@ -255,13 +302,17 @@ export default function QuickBindDialog({
 
   async function checkSiteBindings() {
     try {
-      const [mStatus, yStatus] = await Promise.allSettled([
+      const [mStatus, yStatus, jStatus, hStatus] = await Promise.allSettled([
         getMukakuStatus(),
         yaGetAccountStatus(),
+        getJyingBinding(),
+        getHdhavenBinding(),
       ]);
       setSiteBindStatus({
         mukakuBound: mStatus.status === 'fulfilled' && (mStatus.value?.valid === true || mStatus.value?.status === 'active'),
         yaBound: yStatus.status === 'fulfilled' && yStatus.value?.success === true,
+        jyingBound: jStatus.status === 'fulfilled' && jStatus.value?.status === 'active',
+        hdhavenBound: hStatus.status === 'fulfilled' && hStatus.value?.status === 'active',
       });
     } catch {
       // 容错忽略
@@ -274,6 +325,7 @@ export default function QuickBindDialog({
     setSelectedMovie(null);
     setSelectedYa(null);
     setSelectedPinglian(null);
+    setSelectedXn(null);
     if (keyword.trim()) {
       doSearch(keyword.trim(), site);
     }
@@ -295,21 +347,50 @@ export default function QuickBindDialog({
           toast.info(`未在不太灵片库搜到「${q}」，可尝试去除年份或缩短关键词`);
         }
       } else if (site === 'ya') {
-        const list = await searchYaVideos(q);
+        // includeNoLink：片源存在但本人尚未在其下发布过链接时也要列出，
+        // 否则「搜索片源 → 在该片源下发布资源」这条链路会全程搜不到任何结果
+        const list = await searchYaVideos(q, { includeNoLink: true });
         setYaLinks(list);
         if (list.length === 0) {
-          toast.info(`未在鸭影臻藏搜到「${q}」`);
+          toast.info(`未在鸭影臻藏搜到「${q}」，可尝试去掉年份或精简关键词`);
         }
       } else if (site === 'pinglian') {
-        const list = await searchPanLinks(q);
+        const list = await searchPinglianLibrary(q);
         setPinglianLinks(list);
         if (list.length === 0) {
-          toast.info(`未在盘链搜到「${q}」`);
+          toast.info(`未在盘链片库搜到「${q}」，可尝试去除年份或缩短关键词`);
+        }
+      } else if (site === 'xn') {
+        const list = await searchXnVideos(q);
+        setXnVideos(list);
+        if (list.length === 0) {
+          toast.info(`未在观影片库搜到「${q}」，可尝试去除年份或缩短关键词`);
+        }
+      } else if (site === 'framehdr') {
+        const list = await searchFramehdrResources(q);
+        setFramehdrResults(list);
+        if (list.length === 0) {
+          toast.info(`未在帧影片库搜到「${q}」，可尝试精简关键词`);
+        }
+      } else if (site === 'jying') {
+        // 聚影支持「搜全站片库 → 在该影片下新增分享」，检索走全站影片库
+        const list = await searchJyingMovies(q);
+        setJyingShares(list);
+        if (list.length === 0) {
+          toast.info(`未在聚影片库搜到「${q}」，可尝试去掉年份或精简关键词`);
+        }
+      } else if (site === 'hdhaven') {
+        // 栖影走 TMDB 片库检索（中文可直接搜），用于定位片源并回填名称/封面
+        const list = await searchHdhavenTmdb(q);
+        setHdhavenResults(list);
+        if (list.length === 0) {
+          toast.info(`未在栖影片库搜到「${q}」，可尝试去掉年份或精简关键词`);
         }
       } else if (site === 'panfx') {
         toast.info('123社区仅支持论坛帖子发布管理，暂无全局片库检索 API');
       } else {
-        toast.info(`${site} 站点暂支持作为同步目标，正在丰富片库检索通道`);
+        const label = SITE_OPTIONS.find((s) => s.id === site)?.label ?? site;
+        toast.info(`【${label}】暂支持作为同步目标，正在丰富片库检索通道`);
       }
     } catch (e: any) {
       console.error('搜索站点片源异常', e);
@@ -320,28 +401,26 @@ export default function QuickBindDialog({
   }
 
   // 选中某部不太灵影片
+  // 注意：不覆盖「资源标题」——该字段始终以资源名称为准；选中片源只更新选中态与封面
   async function handlePickMukakuMovie(movie: MukakuMovie) {
     setSelectedMovie(movie);
-    // 规范完整片名：保留主标题 + 上映年份（若有）
-    const fullNormName = movie.year && !movie.title.includes(String(movie.year))
-      ? `${movie.title} (${movie.year})`
-      : movie.title;
-    setTargetName(fullNormName);
 
     if (movie.pic) {
       setSelectedCover(movie.pic);
     }
 
-    toast.success(`已选定《${movie.title}》，已预填规范资源标题`);
+    toast.success(`已选定《${movie.title}》，资源标题保持为资源名称`);
   }
 
-  // 选中某部鸭影片源
+  // 选中某部鸭影片源（不覆盖「资源标题」，标题始终以资源名称为准）
   function handlePickYaVideo(item: YaLink) {
     setSelectedYa(item);
+    if (item.video_cover) setSelectedCover(item.video_cover);
     const title = item.video_title || item.name || '';
-    if (title) setTargetName(title);
 
-    if (item.url) {
+    // 资源已有自己的网盘链接时，站点片源仅作为发布目标，不再把站点链接塞进回填列表，
+    // 否则会形成「第 2 条链接」进而触发队列追加新行
+    if (item.url && !resourceHasOwnLink) {
       const validUrl = item.url;
       setPanLinks((prev) => {
         const exists = prev.some((l) => l.url === validUrl);
@@ -361,14 +440,14 @@ export default function QuickBindDialog({
     toast.success(`已选定鸭影《${title}》`);
   }
 
-  // 选中盘链某条记录
+  // 选中盘链片源（不覆盖「资源标题」，标题始终以资源名称为准）
   function handlePickPinglian(item: PinglianLink) {
     setSelectedPinglian(item);
     const title = item.video_title || item.title || '';
-    if (title) setTargetName(title);
     if (item.video_cover) setSelectedCover(item.video_cover);
 
-    if (item.url) {
+    // 同上：资源已有自己的网盘链接时，盘链条目仅作为发布目标（video_id）与封面来源
+    if (item.url && !resourceHasOwnLink) {
       setPanLinks((prev) => {
         const exists = prev.some((l) => l.url === item.url);
         if (exists) return prev;
@@ -385,6 +464,36 @@ export default function QuickBindDialog({
       });
     }
     toast.success(`已选定盘链条目《${title}》`);
+  }
+
+  // 选中观影小牛片源（不覆盖「资源标题」）
+  // 联想结果只含 dir + id，发布分享时作为 binds[][dir] / binds[][id] 使用
+  // 选中帧影片源（不覆盖「资源标题」，标题始终以资源名称为准）
+  function handlePickFramehdr(item: FramehdrSearchItem) {
+    setSelectedFramehdr(item);
+    if (item.cover) setSelectedCover(item.cover);
+    toast.success(`已选定帧影片源《${item.title}》`);
+  }
+
+  // 选中聚影片源（聚影支持在该影片下新增分享；不覆盖资源标题）
+  function handlePickJying(item: JyingMovie) {
+    setSelectedJying(item);
+    if (item.cover) setSelectedCover(item.cover);
+    toast.success(`已选定聚影片源《${item.title}》，发布时将在该影片下新增分享`);
+  }
+
+  // 选中栖影片源（TMDB 片库；不覆盖「资源标题」，标题始终以资源名称为准，
+  // 片源只用于提供投稿所需的 tmdb_id / media_type）
+  function handlePickHdhaven(item: HdhavenTmdbItem) {
+    setSelectedHdhaven(item);
+    if (item.poster_path) setSelectedCover(`https://image.tmdb.org/t/p/w500${item.poster_path}`);
+    toast.success(`已选定栖影片源《${item.title || item.name || ''}》`);
+  }
+
+  function handlePickXnVideo(item: XnSearchItem) {
+    setSelectedXn(item);
+    if (item.cover) setSelectedCover(item.cover);
+    toast.success(`已选定观影片库片源《${item.title}》`);
   }
 
   // 快速添加单条网盘链接（完全还原用户提供的弹窗元素：链接、粘贴识别、分享码）
@@ -431,10 +540,20 @@ export default function QuickBindDialog({
     toast.success(`已成功解析添加 ${items.length} 条网盘链接`);
   }
 
-  // 切换链接勾选状态
+  // 切换链接勾选状态（只影响当前选中的站点，其它站点保持各自的选择）
   function toggleLinkChecked(id: string) {
     setPanLinks((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, checked: !l.checked } : l))
+      prev.map((l) =>
+        l.id === id
+          ? {
+              ...l,
+              checkedSites: {
+                ...(l.checkedSites ?? {}),
+                [selectedSite]: !isLinkCheckedForSite(l, selectedSite),
+              },
+            }
+          : l
+      )
     );
   }
 
@@ -443,8 +562,10 @@ export default function QuickBindDialog({
     setPanLinks((prev) => prev.filter((l) => l.id !== id));
   }
 
-  // 勾选的有效链接列表
-  const activeCheckedLinks = panLinks.filter((l) => l.checked && l.url.trim());
+  // 当前站点下勾选的有效链接列表（各站点的勾选互相独立）
+  const activeCheckedLinks = panLinks.filter(
+    (l) => isLinkCheckedForSite(l, selectedSite) && l.url.trim()
+  );
 
   // 核心：点击确认并回填（同时自动发布到目标站点网盘资源库）
   async function handleConfirmAndPublish() {
@@ -467,6 +588,24 @@ export default function QuickBindDialog({
         shouldPublish = false;
       } else if (selectedSite === 'ya' && !siteBindStatus.yaBound) {
         toast.warning('检测到鸭影凭证已过期，将进行本地回填。若需自动发布至站点，请先前往「站点同步」页重新登录。');
+        shouldPublish = false;
+      } else if (selectedSite === 'ya' && !selectedYa) {
+        // 站点 add 接口的 p_title 必须是「站内片源名」，未选片源无法定位目标
+        toast.warning('请先在上方搜索并选择鸭影臻藏的【目标片源】，再点击发布');
+        shouldPublish = false;
+      } else if (selectedSite === 'jying' && !siteBindStatus.jyingBound) {
+        toast.warning('检测到尚未绑定聚影账号，将仅做本地回填。若需自动发布分享，请先前往「站点同步」页登录聚影。');
+        shouldPublish = false;
+      } else if (selectedSite === 'jying' && !selectedJying) {
+        // 聚影需先定位目标影片，未选片源无法在该影片下新增分享
+        toast.warning('请先在上方搜索并选择聚影的【目标片源】，再点击发布');
+        shouldPublish = false;
+      } else if (selectedSite === 'hdhaven' && !siteBindStatus.hdhavenBound) {
+        toast.warning('检测到尚未绑定栖影账号，将仅做本地回填。请先前往「站点同步」页登录栖影。');
+        shouldPublish = false;
+      } else if (selectedSite === 'hdhaven' && !selectedHdhaven) {
+        // 栖影投稿必须携带 tmdb_id / media_type，未选片源无法发布
+        toast.warning('请先在上方搜索并选择栖影的【目标片源】，再点击发布');
         shouldPublish = false;
       }
     }
@@ -528,9 +667,11 @@ export default function QuickBindDialog({
           }
         } else if (selectedSite === 'ya') {
           try {
+            // api_add_resource 的 p_title 必须是「站内片源名」，而不是资源名，
+            // 否则站点会报「片源不存在」；category 同样以选中的片源为准
             const yaRes = await yaAddResource({
-              title: finalName,
-              category: '电视剧',
+              title: selectedYa?.video_title || finalName,
+              category: selectedYa?.video_category || '电视剧',
               name: finalName,
               url: firstLink.url,
               extractCode: firstLink.extract_code,
@@ -542,6 +683,7 @@ export default function QuickBindDialog({
                 video_id: yaRes.video_id,
                 vod_name: selectedYa?.video_title || finalName,
                 pan_type: yaRes.drive_type,
+                pan_url: firstLink.url,
                 code: firstLink.extract_code,
               };
             }
@@ -551,37 +693,154 @@ export default function QuickBindDialog({
           }
         } else if (selectedSite === 'pinglian' && selectedPinglian?.video_id) {
           try {
-            await addPanLink({
+            const plRes = await addPanLink({
               link_title: finalName,
               link_url: firstLink.url,
               link_password: firstLink.extract_code,
               pan_type: detectPanName(firstLink.url),
               vod_id: Number(selectedPinglian.video_id),
             });
+            // 发布成功即落地「资源 × 盘链记录」绑定，使资源显示为已绑定
+            if (plRes?.linkId) {
+              firstBinding = {
+                site: 'pinglian',
+                link_id: plRes.linkId,
+                link_title: finalName,
+                vod_name: selectedPinglian.video_title || finalName,
+                pan_type: detectPanName(firstLink.url) || 'others',
+                code: firstLink.extract_code,
+              };
+            }
           } catch (plErr: any) {
             console.warn('发布到盘链失败', plErr);
+            toast.error(`发布至盘链失败: ${plErr?.message || '未知错误'}`);
+          }
+        } else if (selectedSite === 'framehdr' && selectedFramehdr) {
+          try {
+            // 帧影发布到指定片源：resource_id 为站点影片 ID，name 为网盘类型
+            const fhRes = await addFramehdrLink({
+              resourceId: selectedFramehdr.id,
+              url: firstLink.url,
+              name: detectPanName(firstLink.url) || '光鸭云盘',
+              password: firstLink.extract_code,
+              // 站点「资源介绍」字段填写资源名称
+              description: finalName,
+            });
+            if (fhRes?.link_id) {
+              firstBinding = {
+                site: 'framehdr',
+                link_id: fhRes.link_id,
+                vod_name: selectedFramehdr.title,
+                pan_type: detectPanName(firstLink.url) || undefined,
+                code: firstLink.extract_code,
+              };
+            } else {
+              toast.warning('已发布到帧影，但未能取回链接 ID，请手动绑定该资源');
+            }
+          } catch (fhErr: any) {
+            console.warn('发布到帧影失败', fhErr);
+            toast.error(`发布至帧影失败: ${fhErr?.message || '未知错误'}`);
+          }
+        } else if (selectedSite === 'jying' && selectedJying) {
+          try {
+            // 聚影：在选中影片下新增分享。网盘类型由站点按链接自动识别，
+            // 故直接用第 1 条勾选链接发布，成功后以返回的资源 ID 落地绑定
+            const addRes = await addJyingResource({
+              movieId: selectedJying.id,
+              shareLink: firstLink.url,
+              description: finalName,
+              extractionCode: firstLink.extract_code,
+            });
+            if (addRes.id) {
+              firstBinding = {
+                site: 'jying',
+                link_id: addRes.id,
+                vod_name: selectedJying.title,
+                link_title: finalName,
+                pan_url: firstLink.url,
+                code: firstLink.extract_code,
+              };
+            } else {
+              toast.warning('已发布到聚影，但未能取回资源 ID，请手动绑定该资源');
+            }
+          } catch (jyErr: any) {
+            console.warn('发布到聚影失败', jyErr);
+            toast.error(`发布至聚影失败: ${jyErr?.message || '未知错误'}`);
+          }
+        } else if (selectedSite === 'hdhaven' && selectedHdhaven) {
+          try {
+            // 栖影：向选中 TMDB 片源投稿（POST /api/resources，站点详情页「我来分享」同款）；
+            // 成功后用返回 slug 落地绑定，之后本地改链即自动同步
+            const mediaType = selectedHdhaven.media_type
+              || (selectedHdhaven.first_air_date ? 'tv' : 'movie');
+            const created = await withChallenge(() =>
+              createHdhavenShare({
+                tmdbId: String(selectedHdhaven.id),
+                mediaType,
+                url: firstLink.url,
+                title: finalName,
+                accessCode: firstLink.extract_code,
+                // 按资源名称自动匹配站点投稿属性：分辨率 / 来源(SDR、HDR、DV) / 字幕 / 集数范围
+                meta: parseHdhavenMetaFromName(finalName, {
+                  isTv: mediaType === 'tv',
+                  episodeCount: resource?.episode_count ?? null,
+                }),
+              })
+            );
+            if (created.slug) {
+              firstBinding = {
+                site: 'hdhaven',
+                media_type: mediaType,
+                share_id: created.slug,
+                link_title: created.title || finalName,
+                vod_name: selectedHdhaven.title || selectedHdhaven.name || finalName,
+                pan_type: created.panType || undefined,
+                pan_url: firstLink.url,
+                code: firstLink.extract_code,
+              };
+            } else {
+              toast.warning('已发布到栖影，但未能取回条目 ID，请到「绑定站点剧集 → 栖影」手动绑定');
+            }
+          } catch (hdErr: any) {
+            console.warn('发布到栖影失败', hdErr);
+            toast.error(`发布至栖影失败: ${hdErr?.message || '未知错误'}`);
+          }
+        } else if (selectedSite === 'xn' && selectedXn) {
+          try {
+            // 观影片库发布分享强制要求绑定至少 1 个资源，
+            // 用选中片源的 dir + id（来自 /res/search_suggest）组 binds
+            const xnRes = await addXnShare({
+              title: finalName,
+              panurl: firstLink.url,
+              panpw: firstLink.extract_code ?? '',
+              is: 1,
+              binds: [{ dir: selectedXn.dir, id: String(selectedXn.id) }],
+            });
+            // 发布成功即落地「资源 × 观影分享」绑定
+            if (xnRes?.shareId) {
+              firstBinding = {
+                site: 'xn',
+                share_id: xnRes.shareId,
+                link_title: finalName,
+                share_url: firstLink.url,
+                vod_name: selectedXn.title,
+                pan_type: detectPanName(firstLink.url) || undefined,
+                code: firstLink.extract_code,
+              };
+            } else {
+              toast.warning('已发布到观影片库，但未能取回分享 ID，请手动绑定该资源');
+            }
+          } catch (xnErr: any) {
+            console.warn('发布到观影片库失败', xnErr);
+            toast.error(`发布至观影片库失败: ${xnErr?.message || '未知错误'}`);
           }
         }
       }
 
-      // 更新当前行资源
-      await onUpdateCurrent(
-        resource.id,
-        finalName,
-        firstLink.url,
-        selectedCover,
-        firstBinding
-      );
-
-      // 3. 处理后续多链接队列（第 2 至第 N 条）：串行逐条在当前行下方追加新行并调用站点发布
+      // 3. 处理后续多链接队列（第 2 至第 N 条）：继续向站点发布，不新建资源行，
+      //    每条的发布结果同样绑定到当前这一行资源
+      const extraBindings: SiteBindingPayload[] = [];
       if (activeCheckedLinks.length > 1) {
-        const remainingLinksQueue: Array<{
-          url: string;
-          pan_name?: string;
-          extract_code?: string;
-          siteBinding?: SiteBindingPayload;
-        }> = [];
-
         for (let i = 1; i < activeCheckedLinks.length; i++) {
           const item = activeCheckedLinks[i];
           setQueueProgress({
@@ -590,7 +849,7 @@ export default function QuickBindDialog({
             total: activeCheckedLinks.length,
             statusText: shouldPublish
               ? `正在向站点发布第 ${i + 1}/${activeCheckedLinks.length} 条【${item.pan_name}】资源…`
-              : `正在追加第 ${i + 1}/${activeCheckedLinks.length} 行资源…`,
+              : `正在处理第 ${i + 1}/${activeCheckedLinks.length} 条网盘链接…`,
           });
 
           let subBinding: SiteBindingPayload | undefined;
@@ -619,8 +878,8 @@ export default function QuickBindDialog({
             } else if (selectedSite === 'ya') {
               try {
                 const yaRes = await yaAddResource({
-                  title: finalName,
-                  category: '电视剧',
+                  title: selectedYa?.video_title || finalName,
+                  category: selectedYa?.video_category || '电视剧',
                   name: finalName,
                   url: item.url,
                   extractCode: item.extract_code,
@@ -632,33 +891,131 @@ export default function QuickBindDialog({
                     video_id: yaRes.video_id,
                     vod_name: selectedYa?.video_title || finalName,
                     pan_type: yaRes.drive_type,
+                    pan_url: item.url,
                     code: item.extract_code,
                   };
                 }
               } catch (subErr) {
                 console.warn('队列发布鸭影失败', subErr);
               }
+            } else if (selectedSite === 'pinglian' && selectedPinglian?.video_id) {
+              // 盘链：队列第 2 条起同样要发布 —— 保持资源标题不变、仅更换网盘链接，
+              // 在同一片源下再建一条分享记录；否则只有首条会上站
+              try {
+                const plSub = await addPanLink({
+                  link_title: finalName,
+                  link_url: item.url,
+                  link_password: item.extract_code,
+                  pan_type: detectPanName(item.url),
+                  vod_id: Number(selectedPinglian.video_id),
+                });
+                if (plSub?.linkId) {
+                  subBinding = {
+                    site: 'pinglian',
+                    link_id: plSub.linkId,
+                    link_title: finalName,
+                    vod_name: selectedPinglian.video_title || finalName,
+                    pan_type: detectPanName(item.url) || 'others',
+                    code: item.extract_code,
+                  };
+                }
+              } catch (subErr: any) {
+                console.warn('队列发布盘链失败', subErr);
+                toast.error(`队列发布至盘链失败: ${subErr?.message || '未知错误'}`);
+              }
+            } else if (selectedSite === 'framehdr' && selectedFramehdr) {
+              // 帧影：队列第 2 条起同样发布到同一片源，资源名称不变、仅更换链接
+              try {
+                await addFramehdrLink({
+                  resourceId: selectedFramehdr.id,
+                  url: item.url,
+                  name: detectPanName(item.url) || '光鸭云盘',
+                  password: item.extract_code,
+                  description: finalName,
+                });
+              } catch (subErr) {
+                console.warn('队列发布帧影失败', subErr);
+              }
+            } else if (selectedSite === 'hdhaven' && selectedHdhaven) {
+              // 栖影：队列第 2 条起继续投稿到同一片源，各自生成一条分享条目
+              try {
+                const mediaType = selectedHdhaven.media_type
+                  || (selectedHdhaven.first_air_date ? 'tv' : 'movie');
+                const created = await withChallenge(() =>
+                  createHdhavenShare({
+                    tmdbId: String(selectedHdhaven.id),
+                    mediaType,
+                    url: item.url,
+                    title: finalName,
+                    accessCode: item.extract_code,
+                    meta: parseHdhavenMetaFromName(finalName, {
+                      isTv: mediaType === 'tv',
+                      episodeCount: resource?.episode_count ?? null,
+                    }),
+                  })
+                );
+                if (created.slug) {
+                  subBinding = {
+                    site: 'hdhaven',
+                    media_type: mediaType,
+                    share_id: created.slug,
+                    link_title: created.title || finalName,
+                    vod_name: selectedHdhaven.title || selectedHdhaven.name || finalName,
+                    pan_type: created.panType || undefined,
+                    pan_url: item.url,
+                    code: item.extract_code,
+                  };
+                }
+              } catch (subErr: any) {
+                console.warn('队列发布栖影失败', subErr);
+                toast.error(`队列发布至栖影失败: ${subErr?.message || '未知错误'}`);
+              }
+            } else if (selectedSite === 'xn' && selectedXn) {
+              try {
+                const xnSub = await addXnShare({
+                  title: finalName,
+                  panurl: item.url,
+                  panpw: item.extract_code ?? '',
+                  is: 1,
+                  binds: [{ dir: selectedXn.dir, id: String(selectedXn.id) }],
+                });
+                if (xnSub?.shareId) {
+                  subBinding = {
+                    site: 'xn',
+                    share_id: xnSub.shareId,
+                    link_title: finalName,
+                    share_url: item.url,
+                    vod_name: selectedXn.title,
+                    pan_type: detectPanName(item.url) || undefined,
+                    code: item.extract_code,
+                  };
+                }
+              } catch (subErr) {
+                console.warn('队列发布观影片库失败', subErr);
+              }
             }
           }
-
-          remainingLinksQueue.push({
-            url: item.url,
-            pan_name: item.pan_name,
-            extract_code: item.extract_code,
-            siteBinding: subBinding,
-          });
+          if (subBinding) extraBindings.push(subBinding);
         }
-
-        // 串行写入其余新行
-        await onQueueAppend(resource, finalName, remainingLinksQueue);
       }
 
-      toast.success(
-        activeCheckedLinks.length > 1
-          ? `多云盘队列录入完成！共完成 ${activeCheckedLinks.length} 条网盘资源规范回填${shouldPublish ? '并发布至站点影片下' : ''}`
-          : `规范回填完成！已更新《${finalName}》${shouldPublish ? '并自动发布至站点' : ''}`
+      // 4. 回填当前行资源：首条 + 队列各条的站点绑定一并落地到当前行
+      await onUpdateCurrent(
+        resource.id,
+        finalName,
+        firstLink.url,
+        selectedCover,
+        [firstBinding, ...extraBindings].filter((b): b is SiteBindingPayload => !!b)
       );
-      onOpenChange(false);
+
+      const siteLabel = SITE_OPTIONS.find((s) => s.id === selectedSite)?.label ?? selectedSite;
+      if (shouldPublish) {
+        setPublishedSites((prev) => ({ ...prev, [selectedSite]: activeCheckedLinks.length }));
+      }
+      toast.success(
+        `《${finalName}》已回填${shouldPublish ? `，并向【${siteLabel}】发布 ${activeCheckedLinks.length} 条网盘链接` : ''}。可继续切换站点发布`
+      );
+      // 不关闭弹窗：支持连续向多个站点发布，切换站点后各自的勾选状态互相独立
     } catch (e: any) {
       console.error('快捷绑定并发布失败', e);
       toast.error(e?.message || '操作失败，请重试');
@@ -708,9 +1065,18 @@ export default function QuickBindDialog({
                       : 'border-border/60 hover:border-border hover:bg-muted/40 text-muted-foreground'
                   }`}
                 >
-                  <span className="text-xs font-medium truncate">{site.label}</span>
+                  <span className="text-xs font-medium truncate flex items-center gap-1">
+                    {site.label}
+                    {publishedSites[site.id] > 0 && (
+                      <CheckCircle2 className="h-3 w-3 text-primary shrink-0" />
+                    )}
+                  </span>
                   <span className="text-[10px] text-muted-foreground/80 mt-1">
-                    {site.badge}
+                    {publishedSites[site.id] > 0 ? `已发布 ${publishedSites[site.id]} 条` : site.badge}
+                  </span>
+                  {/* 站点网址：用户要知道去哪个站绑定账号 / 看片源 */}
+                  <span className="text-[10px] font-mono text-muted-foreground/70 truncate">
+                    {SITE_URLS[site.id] ? siteHost(SITE_URLS[site.id]) : ''}
                   </span>
                 </button>
               ))}
@@ -841,25 +1207,333 @@ export default function QuickBindDialog({
                   <div className="py-6 text-center text-xs text-muted-foreground">未检索到鸭影片源</div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    {yaLinks.map((item) => (
-                      <div
-                        key={String(item.id)}
-                        onClick={() => handlePickYaVideo(item)}
-                        className={`p-2 rounded border cursor-pointer transition-all ${
-                          selectedYa?.id === item.id
-                            ? 'border-primary bg-primary/10 ring-1 ring-primary'
-                            : 'border-border bg-card hover:bg-muted/50'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between text-xs font-medium">
-                          <span className="truncate">{item.video_title || item.name}</span>
-                          <Badge variant="outline" className="text-[10px]">{item.drive_label || '网盘'}</Badge>
+                    {yaLinks.map((item) => {
+                      // 无链接条目代表「站内已收录该片源、本人尚未发布链接」，id 恒为 0，
+                      // 因此 key 与选中判断都必须带上 video_id，否则会重复且选中态串台
+                      const picked = !!selectedYa
+                        && selectedYa.id === item.id
+                        && selectedYa.video_id === item.video_id;
+                      return (
+                        <div
+                          key={item.id ? `link-${item.id}` : `video-${item.video_id}`}
+                          onClick={() => handlePickYaVideo(item)}
+                          className={`p-2 rounded border cursor-pointer transition-all ${
+                            picked
+                              ? 'border-primary bg-primary/10 ring-1 ring-primary'
+                              : 'border-border bg-card hover:bg-muted/50'
+                          }`}
+                        >
+                          <div className="w-12 h-16 rounded bg-muted flex items-center justify-center shrink-0 overflow-hidden relative">
+                            <Film className="h-5 w-5 text-muted-foreground/50" />
+                            {item.video_cover && (
+                              <img
+                                src={item.video_cover}
+                                alt={item.video_title || item.name || ''}
+                                loading="lazy"
+                                referrerPolicy="no-referrer"
+                                className="absolute inset-0 w-full h-full object-cover"
+                              />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2 text-xs font-medium">
+                              <span className="truncate">{item.video_title || item.name}</span>
+                              <Badge variant="outline" className="text-[10px] shrink-0">
+                                {item.id ? (item.drive_label || '网盘') : '站内已收录'}
+                              </Badge>
+                            </div>
+                            <div className="text-[11px] text-muted-foreground mt-1 truncate">
+                              {item.url
+                                ? <span className="font-mono">{item.url}</span>
+                                : '你尚未在该片源下发布链接 · 选中后可直接发布新资源'}
+                            </div>
+                          </div>
                         </div>
-                        <div className="text-[11px] text-muted-foreground mt-1 truncate font-mono">
-                          {item.url}
+                      );
+                    })}
+                  </div>
+                )
+              ) : selectedSite === 'pinglian' ? (
+                pinglianLinks.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">
+                    未检索到盘链片源。请先在设置页绑定盘链账号，并尝试精简关键词
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {pinglianLinks.map((item) => {
+                      const picked = selectedPinglian?.video_id === item.video_id;
+                      return (
+                        <div
+                          key={String(item.video_id)}
+                          onClick={() => handlePickPinglian(item)}
+                          className={`flex gap-2.5 p-2 rounded-md border cursor-pointer transition-all ${
+                            picked
+                              ? 'border-primary bg-primary/10 shadow-xs ring-1 ring-primary'
+                              : 'border-border bg-card hover:bg-muted/50'
+                          }`}
+                        >
+                          {item.video_cover ? (
+                            <img
+                              src={item.video_cover}
+                              alt={item.video_title || item.title}
+                              className="w-12 h-16 object-cover rounded shrink-0 bg-muted"
+                              onError={(e) => {
+                                (e.target as HTMLElement).style.display = 'none';
+                              }}
+                            />
+                          ) : (
+                            <div className="w-12 h-16 rounded bg-muted flex items-center justify-center shrink-0">
+                              <Film className="h-5 w-5 text-muted-foreground/50" />
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
+                            <div>
+                              <div className="flex items-center justify-between gap-1">
+                                <h4 className="font-medium text-xs truncate text-foreground">
+                                  {item.video_title || item.title}
+                                </h4>
+                                {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-1 text-[10px] text-muted-foreground flex-wrap">
+                                {item.video_year && (
+                                  <span className="flex items-center gap-0.5">
+                                    <Calendar className="h-2.5 w-2.5" />
+                                    {item.video_year}
+                                  </span>
+                                )}
+                                {item.video_type && (
+                                  <span className="truncate max-w-24">· {item.video_type}</span>
+                                )}
+                                {item.video_remarks && (
+                                  <span className="truncate max-w-20">· {item.video_remarks}</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40">
+                              <span>站点片源ID: {item.video_id}</span>
+                              <Badge variant="outline" className="text-[9px] px-1 py-0">
+                                点击选定
+                              </Badge>
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
+                  </div>
+                )
+              ) : selectedSite === 'framehdr' ? (
+                framehdrResults.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">
+                    未检索到帧影片库片源。请先在设置页绑定帧影账号，并尝试精简关键词
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {framehdrResults.map((item) => {
+                      const picked = selectedFramehdr?.id === item.id;
+                      return (
+                        <div
+                          key={item.id}
+                          onClick={() => handlePickFramehdr(item)}
+                          className={`flex gap-2.5 p-2 rounded-md border cursor-pointer transition-all ${
+                            picked
+                              ? 'border-primary bg-primary/10 shadow-xs ring-1 ring-primary'
+                              : 'border-border bg-card hover:bg-muted/50'
+                          }`}
+                        >
+                          <div className="w-12 h-16 rounded bg-muted flex items-center justify-center shrink-0 overflow-hidden relative">
+                            <Film className="h-5 w-5 text-muted-foreground/50" />
+                            {item.cover && (
+                              <img
+                                src={item.cover}
+                                alt={item.title}
+                                loading="lazy"
+                                referrerPolicy="no-referrer"
+                                className="absolute inset-0 w-full h-full object-cover"
+                                onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                              />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
+                            <div className="flex items-center justify-between gap-1">
+                              <h4 className="font-medium text-xs truncate text-foreground">
+                                {item.title}
+                              </h4>
+                              {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                            </div>
+                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40">
+                              <span>ID: {item.id}{item.year ? ` · ${item.year}` : ''}</span>
+                              <Badge variant="outline" className="text-[9px] px-1 py-0">
+                                点击选定
+                              </Badge>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
+              ) : selectedSite === 'jying' ? (
+                jyingShares.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">
+                    未检索到聚影片源。请先在「站点同步 → 聚影站点」绑定账号，并尝试精简关键词
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {jyingShares.map((item) => {
+                      const picked = selectedJying?.id === item.id;
+                      return (
+                        <div
+                          key={item.id}
+                          onClick={() => handlePickJying(item)}
+                          className={`cursor-pointer rounded-lg border p-2 flex gap-2 transition-colors ${
+                            picked ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-muted/40'
+                          }`}
+                        >
+                          <div className="relative w-10 h-14 rounded overflow-hidden bg-muted shrink-0">
+                            {item.cover && (
+                              <img
+                                src={item.cover}
+                                alt={item.title}
+                                referrerPolicy="no-referrer"
+                                className="absolute inset-0 w-full h-full object-cover"
+                                onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                              />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
+                            <div className="flex items-center justify-between gap-1">
+                              <h4 className="font-medium text-xs truncate text-foreground">{item.title}</h4>
+                              {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground truncate">
+                              {item.description || '—'}
+                            </div>
+                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40 gap-1">
+                              <span>ID: {item.id}{item.release_year ? ` · ${item.release_year}` : ''}</span>
+                              <Badge variant="secondary" className="text-[9px] px-1 py-0 shrink-0">
+                                {item.movie_type_display || '影片'}
+                              </Badge>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
+              ) : selectedSite === 'hdhaven' ? (
+                hdhavenResults.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">
+                    未检索到栖影片源。请先在「站点同步 → 栖影站点」绑定账号，再在下方搜索（基于 TMDB 片库）
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {hdhavenResults.map((item) => {
+                      const name = item.title || item.name || '未命名';
+                      const year = (item.release_date || item.first_air_date || '').slice(0, 4);
+                      const picked = selectedHdhaven?.id === item.id;
+                      return (
+                        <div
+                          key={item.id}
+                          onClick={() => handlePickHdhaven(item)}
+                          className={`cursor-pointer rounded-lg border p-2 flex gap-2 transition-colors ${
+                            picked ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-muted/40'
+                          }`}
+                        >
+                          <div className="relative w-10 h-14 rounded overflow-hidden bg-muted shrink-0">
+                            {item.poster_path && (
+                              <img
+                                src={`https://image.tmdb.org/t/p/w200${item.poster_path}`}
+                                alt={name}
+                                referrerPolicy="no-referrer"
+                                className="absolute inset-0 w-full h-full object-cover"
+                                onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                              />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
+                            <div className="flex items-center justify-between gap-1">
+                              <h4 className="font-medium text-xs truncate text-foreground">{name}</h4>
+                              {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground truncate">{item.overview || '—'}</div>
+                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40 gap-1">
+                              <span>TMDB: {item.id}{year ? ` · ${year}` : ''}</span>
+                              <Badge variant="secondary" className="text-[9px] px-1 py-0 shrink-0">
+                                {item.media_type === 'tv' ? '剧集' : '电影'}
+                              </Badge>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )
+              ) : selectedSite === 'xn' ? (
+                xnVideos.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">
+                    未检索到观影片库片源。请先在设置页绑定观影站点 Cookie，并尝试精简关键词
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {xnVideos.map((item) => {
+                      const picked =
+                        selectedXn?.id === item.id && selectedXn?.dir === item.dir;
+                      return (
+                        <div
+                          key={`${item.dir}-${item.id}`}
+                          onClick={() => handlePickXnVideo(item)}
+                          className={`flex gap-2.5 p-2 rounded-md border cursor-pointer transition-all ${
+                            picked
+                              ? 'border-primary bg-primary/10 shadow-xs ring-1 ring-primary'
+                              : 'border-border bg-card hover:bg-muted/50'
+                          }`}
+                        >
+                          <div className="w-12 h-16 rounded bg-muted flex items-center justify-center shrink-0 overflow-hidden relative">
+                            <Film className="h-5 w-5 text-muted-foreground/50" />
+                            {item.cover && (
+                              <img
+                                src={item.cover}
+                                alt={item.title}
+                                loading="lazy"
+                                referrerPolicy="no-referrer"
+                                className="absolute inset-0 w-full h-full object-cover"
+                                onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                              />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
+                            <div>
+                              <div className="flex items-center justify-between gap-1">
+                                <h4 className="font-medium text-xs truncate text-foreground">
+                                  {item.title}
+                                </h4>
+                                {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-1 text-[10px] text-muted-foreground flex-wrap">
+                                {item.year && (
+                                  <span className="flex items-center gap-0.5">
+                                    <Calendar className="h-2.5 w-2.5" />
+                                    {item.year}
+                                  </span>
+                                )}
+                                {item.type && (
+                                  <span className="truncate max-w-24">· {item.type}</span>
+                                )}
+                                {item.score && <span>· {item.score}分</span>}
+                              </div>
+                            </div>
+                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40">
+                              <span>
+                                {item.dir} / {item.id}
+                              </span>
+                              <Badge variant="outline" className="text-[9px] px-1 py-0">
+                                点击选定
+                              </Badge>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )
               ) : (
@@ -1003,17 +1677,17 @@ export default function QuickBindDialog({
                     <div
                       key={item.id}
                       className={`flex items-center justify-between gap-2 p-1.5 rounded border text-xs transition-colors ${
-                        item.checked ? 'bg-card border-border' : 'bg-muted/40 border-border/50 opacity-60'
+                        isLinkCheckedForSite(item, selectedSite) ? 'bg-card border-border' : 'bg-muted/40 border-border/50 opacity-60'
                       }`}
                     >
                       <div className="flex items-center gap-2 flex-1 min-w-0">
                         <Checkbox
-                          checked={item.checked}
+                          checked={isLinkCheckedForSite(item, selectedSite)}
                           onCheckedChange={() => toggleLinkChecked(item.id)}
                           className="h-3.5 w-3.5"
                         />
                         <Badge variant="secondary" className="text-[10px] px-1 py-0 shrink-0">
-                          {idx === 0 ? '首条·更新当前行' : `队列第${idx + 1}条·追加新行`}
+                          {idx === 0 ? '首条' : `第${idx + 1}条`}
                         </Badge>
                         <Badge variant="outline" className="text-[10px] px-1 py-0 shrink-0">
                           {item.pan_name}
@@ -1047,9 +1721,9 @@ export default function QuickBindDialog({
           <div className="flex items-center justify-between pt-1 border-t border-border/60">
             <div className="text-[11px] text-muted-foreground flex items-center gap-1.5">
               <Info className="h-3.5 w-3.5 text-primary shrink-0" />
-              {activeCheckedLinks.length > 1 ? (
+              {activeCheckedLinks.length > 0 ? (
                 <span>
-                  已选 <strong>{activeCheckedLinks.length}</strong> 条网盘链接：首条覆盖当前行，后续串行追加新行并挂载至站点，资源名完全一致。
+                  【{SITE_OPTIONS.find((s) => s.id === selectedSite)?.label}】已选 <strong>{activeCheckedLinks.length}</strong> 条链接；各站点勾选互相独立，发布后可继续切换站点。
                 </span>
               ) : (
                 <span>确认后将规范片名并回填网盘链接，同时发布到目标站点。</span>
@@ -1065,7 +1739,7 @@ export default function QuickBindDialog({
                 onClick={() => onOpenChange(false)}
                 className="h-8 text-xs px-3"
               >
-                取消
+                关闭
               </Button>
               <Button
                 type="button"
@@ -1083,7 +1757,7 @@ export default function QuickBindDialog({
                   <>
                     <CheckCircle2 className="h-3.5 w-3.5" />
                     {activeCheckedLinks.length > 1
-                      ? `确认队列发布并回填 (${activeCheckedLinks.length}条)`
+                      ? `确认发布并回填 (${activeCheckedLinks.length}条)`
                       : '确认回填并发布'}
                   </>
                 )}
@@ -1091,6 +1765,8 @@ export default function QuickBindDialog({
             </div>
           </div>
         </div>
+        {/* 风控图形验证码弹窗（命中站点限流时自动弹出） */}
+        {challengeDialog}
       </DialogContent>
     </Dialog>
   );

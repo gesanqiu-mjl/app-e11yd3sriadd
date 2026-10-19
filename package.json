@@ -1,11 +1,11 @@
 {
-  "name": "miaoda-react-admin",
+  "name": "media-resource-tracker",
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "echo 'Do not use this command, only use lint to check'",
-    "build": "echo 'Do not use this command, only use lint to check'",
-    "lint": "tsgo -p tsconfig.check.json; npx biome lint; .rules/check.sh;npx tailwindcss -i ./src/index.css -o /dev/null 2>&1 | grep -E '^(CssSyntaxError|Error):.*' || true;.rules/testBuild.sh"
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "tsgo -p tsconfig.check.json && biome lint"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -52,8 +52,6 @@
     "input-otp": "^1.4.2",
     "ky": "^1.13.0",
     "lucide-react": "^0.576.0",
-    "miaoda-react-devkit": "0.1.1-beta.22",
-    "miaoda-sc-plugin": "1.0.73",
     "motion": "^12.23.25",
     "next-themes": "^0.4.6",
     "qrcode": "^1.5.4",

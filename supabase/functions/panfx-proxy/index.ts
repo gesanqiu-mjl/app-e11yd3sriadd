@@ -17,6 +17,8 @@
 //   check           验证 Cookie 是否有效
 // ============================================================
 
+import { resolveCallerId } from "../_shared/internalAuth.ts";
+
 const SITE_URL = Deno.env.get("SITE_URL") ?? "*";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const BASE = "https://123panfx.com";
@@ -119,18 +121,25 @@ Deno.serve(async (req) => {
 
   try {
     // 1. 验证本站登录态
-    const authHeader = req.headers.get("Authorization") ?? "";
-    if (!authHeader.startsWith("Bearer ")) {
-      return json({ error: "请先登录" }, 401);
-    }
-    const meRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      headers: {
-        apikey: Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-        Authorization: authHeader,
-      },
+    // 鉴权：用户 JWT，或服务端 worker/定时任务的内部通道
+    //（x-internal-secret + x-user-id，见 _shared/internalAuth.ts；未配置密钥时该通道关闭）
+    const callerId = await resolveCallerId(req, async (t) => {
+      const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+        headers: {
+          apikey: Deno.env.get("SUPABASE_ANON_KEY") ?? "",
+          Authorization: `Bearer ${t}`,
+        },
+      });
+      if (!r.ok) return null;
+      const u = (await r.json().catch(() => null)) as { id?: string } | null;
+      return u?.id ?? null;
     });
-    if (!meRes.ok) return json({ error: "登录态无效或已过期" }, 401);
-    const me = await meRes.json();
+    if (!callerId) return json({ error: "登录态无效或已过期" }, 401);
+    const me = { id: callerId };
+    // 站内 REST 读写（panfx_sessions）：用户调用沿用其 JWT（走 RLS），
+    // 内部调用用 service key——下面每条查询都显式按 user_id 过滤，作用域不变
+    const restAuth = req.headers.get("Authorization") ??
+      `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""}`;
 
     // 2. 读绑定的 123panfx Cookie
     const sRes = await fetch(

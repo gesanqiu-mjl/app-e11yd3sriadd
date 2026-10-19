@@ -1,45 +1,97 @@
 import { supabase } from '@/db/supabase';
 
-const MAX_SIZE = 1 * 1024 * 1024; // 1 MB
-const MAX_DIM = 1080;
+// ============================================================
+// 资源封面规格
+//   横向封面：固定 630 × 270
+//   竖屏封面：固定 333 × 500
+//   两者均要求 ≤ 500 KB
+// 上传时按原图方向自动判定（宽 ≥ 高 → 横版，否则竖版），
+// 居中裁剪铺满目标尺寸（不变形），并压缩到 500 KB 以内，统一输出 WEBP。
+// ============================================================
 
-/** 将 File 压缩为 WEBP，分辨率不超过 1080p，质量不低于 0.4 */
-async function compressToWebp(file: File): Promise<Blob> {
+const MAX_SIZE = 500 * 1024; // 500 KB
+const LANDSCAPE = { width: 630, height: 270 };
+const PORTRAIT = { width: 333, height: 500 };
+
+/** 封面方向：横版 / 竖版 */
+export type CoverOrientation = 'landscape' | 'portrait';
+
+/** 封面目标规格 */
+export interface CoverSpec {
+  width: number;
+  height: number;
+  orientation: CoverOrientation;
+}
+
+/** 按原图方向取目标规格：宽 ≥ 高 → 横版 630×270，否则竖版 333×500 */
+export function coverSpecOf(width: number, height: number): CoverSpec {
+  return width >= height
+    ? { ...LANDSCAPE, orientation: 'landscape' }
+    : { ...PORTRAIT, orientation: 'portrait' };
+}
+
+/**
+ * 归一化封面：等比缩放到覆盖目标尺寸后居中裁掉多余部分（画面不变形），
+ * 再按质量递减编码为 WEBP，直到 ≤ 500 KB。
+ */
+function normalizeCover(file: File): Promise<{ blob: Blob; spec: CoverSpec }> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
     img.onload = () => {
       URL.revokeObjectURL(url);
-      let { width, height } = img;
-      const ratio = Math.min(MAX_DIM / Math.max(width, height), 1);
-      width = Math.round(width * ratio);
-      height = Math.round(height * ratio);
+      const naturalW = img.naturalWidth || img.width;
+      const naturalH = img.naturalHeight || img.height;
+      if (!naturalW || !naturalH) {
+        reject(new Error('图片尺寸读取失败'));
+        return;
+      }
 
+      const spec = coverSpecOf(naturalW, naturalH);
       const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0, width, height);
+      canvas.width = spec.width;
+      canvas.height = spec.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error('canvas 不可用'));
+        return;
+      }
 
-      let quality = 0.8;
-      const tryCompress = () => {
+      // 居中裁剪铺满：缩放比例取「覆盖目标」的较大值，再把多余部分从两侧/上下裁掉
+      const scale = Math.max(spec.width / naturalW, spec.height / naturalH);
+      const drawW = naturalW * scale;
+      const drawH = naturalH * scale;
+      const dx = (spec.width - drawW) / 2;
+      const dy = (spec.height - drawH) / 2;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, dx, dy, drawW, drawH);
+
+      let quality = 0.9;
+      const tryEncode = () => {
         canvas.toBlob(
           (blob) => {
-            if (!blob) { reject(new Error('压缩失败')); return; }
-            if (blob.size <= MAX_SIZE || quality <= 0.4) {
-              resolve(blob);
-            } else {
-              quality -= 0.1;
-              tryCompress();
+            if (!blob) {
+              reject(new Error('封面压缩失败'));
+              return;
             }
+            if (blob.size <= MAX_SIZE || quality <= 0.3) {
+              resolve({ blob, spec });
+              return;
+            }
+            quality = Number(Math.max(0.3, quality - 0.1).toFixed(2));
+            tryEncode();
           },
           'image/webp',
           quality
         );
       };
-      tryCompress();
+      tryEncode();
     };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('图片加载失败')); };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('图片加载失败'));
+    };
     img.src = url;
   });
 }
@@ -51,13 +103,18 @@ function safeName(name: string): string {
 
 export interface UploadResult {
   url: string;
+  /** 是否经过归一化处理（当前实现总是为 true） */
   compressed: boolean;
   finalSize: number;
+  /** 落地封面的规格（固定尺寸与方向） */
+  width: number;
+  height: number;
+  orientation: CoverOrientation;
 }
 
 /**
  * 上传封面图到 Supabase Storage covers bucket。
- * 超过 1 MB 自动压缩为 WEBP。
+ * 统一归一化为「横版 630×270 / 竖版 333×500」并压缩到 500 KB 以内（输出 WEBP）。
  * 返回公开访问 URL。
  */
 export async function uploadCover(
@@ -70,25 +127,19 @@ export async function uploadCover(
     throw new Error('仅支持 JPEG / PNG / WEBP / GIF / AVIF 格式');
   }
 
-  let blob: Blob = file;
-  let compressed = false;
+  const { blob, spec } = await normalizeCover(file);
+  onProgress?.(20);
 
-  if (file.size > MAX_SIZE) {
-    blob = await compressToWebp(file);
-    compressed = true;
-  }
-
-  const ext = compressed ? 'webp' : file.name.split('.').pop() || 'jpg';
   const { data: { user } } = await supabase.auth.getUser();
   const uid = user?.id ?? 'anon';
-  const path = `${uid}/${resourceId}_${safeName(Date.now().toString())}.${ext}`;
+  const path = `${uid}/${resourceId}_${safeName(Date.now().toString())}.webp`;
 
   onProgress?.(30);
 
   const { error } = await supabase.storage
     .from('covers')
     .upload(path, blob, {
-      contentType: compressed ? 'image/webp' : file.type,
+      contentType: 'image/webp',
       upsert: true,
     });
 
@@ -99,7 +150,14 @@ export async function uploadCover(
   const { data } = supabase.storage.from('covers').getPublicUrl(path);
   onProgress?.(100);
 
-  return { url: data.publicUrl, compressed, finalSize: blob.size };
+  return {
+    url: data.publicUrl,
+    compressed: true,
+    finalSize: blob.size,
+    width: spec.width,
+    height: spec.height,
+    orientation: spec.orientation,
+  };
 }
 
 /** 删除 covers bucket 中指定 URL 对应的文件 */

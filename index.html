@@ -2,9 +2,24 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>影视资源追踪与多盘同步管理系统</title>
+    <link rel="icon" type="image/png" href="/favicon.png?v=2" />
+    <!-- viewport-fit=cover：让页面延伸到刘海/圆角屏安全区，配合 CSS 的 safe-area-inset-* 一起用
+         （不加会导致 iPhone 上顶/底出现黑边，或内容被灵动岛/横条遮挡） -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- 跨站跳转时不泄露路径与查询参数（服务端还应下发同名 HTTP 头） -->
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>网盘推广工具</title>
+    <script>
+      // 短链跳转路径（/go/* 与 /s/*）不展示本系统任何信息：
+      // 在解析 HTML 的第一时间就清掉标题（脚本包还没加载，避免跳转那 1 秒里露出品牌名）
+      (function () {
+        if (/^\/(go|s)\//.test(location.pathname)) {
+          document.title = '';
+          var d = document.querySelector('meta[name="description"]');
+          if (d) d.remove();
+        }
+      })();
+    </script>
     <meta name="description" content="专业影视资源更新追踪与多网盘自动化同步系统，支持剧集更新追踪、多平台发布与多盘链接管理。" />
     <meta name="keywords" content="影视资源, 资源更新追踪, 网盘同步, 剧集管理, 夸克网盘" />
   </head>

@@ -25,6 +25,7 @@
 // ============================================================
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { resolveCallerId } from "../_shared/internalAuth.ts";
 
 const BASE = "https://web3.mukaku.com";
 const API = "/prod/api/v1";
@@ -189,15 +190,14 @@ Deno.serve(async (req) => {
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, serviceKey);
 
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) return json({ error: "未登录" }, 401);
-
-    const token = authHeader.replace(/^Bearer\s+/i, "");
-    const {
-      data: { user },
-      error: userError,
-    } = await supabase.auth.getUser(token);
-    if (userError || !user) return json({ error: "登录态无效" }, 401);
+    // 鉴权：用户 JWT，或服务端 worker/定时任务的内部通道
+    //（x-internal-secret + x-user-id，见 _shared/internalAuth.ts；未配置密钥时该通道关闭）
+    const callerId = await resolveCallerId(req, async (t) => {
+      const { data, error } = await supabase.auth.getUser(t);
+      return error ? null : (data?.user?.id ?? null);
+    });
+    if (!callerId) return json({ error: "登录态无效" }, 401);
+    const user = { id: callerId };
 
     const url = new URL(req.url);
     const action = url.searchParams.get("action") ?? "";

@@ -41,6 +41,18 @@ export function detectPanName(url: string): string {
   return '';
 }
 
+/**
+ * 从分享链接自带的查询参数里取提取码。
+ * 百度 / 夸克「复制链接」都会把提取码带在链接上，例如：
+ *   https://pan.baidu.com/s/1YnB-L5PmqdBcq9PjR9Z-Tw?pwd=8888
+ * 这种链接不带提取码是打不开的，所以粘贴链接时应当自动填进「提取码」输入框。
+ */
+export function extractPasscodeFromUrl(url: string): string {
+  if (!url) return '';
+  const m = /[?&#](?:pwd|password|passcode|code)=([A-Za-z0-9]{1,16})/i.exec(url);
+  return m ? m[1] : '';
+}
+
 /** 按优先级排序 PanLink 数组（不改变原数组） */
 export function sortLinksByPriority(links: PanLink[]): PanLink[] {
   return [...links].sort((a, b) => {
@@ -56,14 +68,15 @@ export const PAN_TYPE_LABELS: Record<string, string> = {
   quark: '夸克', aliyun: '阿里云盘', baidu: '百度网盘', '123': '123 网盘',
   mobile: '移动云盘', tianyi: '天翼云盘', '115': '115 网盘', uc: 'UC 网盘',
   xunlei: '迅雷云盘', weiyun: '微云', lanzou: '蓝奏云', jianguoyun: '坚果云',
-  pikpak: 'PikPak', guangya: '光雅', others: '其他',
+  pikpak: 'PikPak', guangya: '光雅', ed2k: 'ED2K', others: '其他',
 };
 
 const PAN_TYPE_ALIASES: Record<string, string[]> = {
   quark: ['夸克'], aliyun: ['阿里'], baidu: ['百度'], '123': ['123'],
   mobile: ['移动'], tianyi: ['天翼'], '115': ['115'], uc: ['uc'],
   xunlei: ['迅雷'], weiyun: ['微云', '腾讯'], lanzou: ['蓝奏'],
-  jianguoyun: ['坚果'], pikpak: ['pikpak'], guangya: ['光雅', '光鸭'], others: [],
+  jianguoyun: ['坚果'], pikpak: ['pikpak'], guangya: ['光雅', '光鸭'],
+  ed2k: ['ed2k', '电驴'], others: [],
 };
 
 function normPanText(s: string): string {

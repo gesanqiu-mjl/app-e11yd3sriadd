@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Trash2, Plus, Check, X, CloudIcon, Layers, Search, ImagePlus, Loader2, Link2, Link, RefreshCw, ShieldCheck, CircleCheck, RefreshCcw, AlertTriangle, GripVertical, Sparkles } from 'lucide-react';
+import { Trash2, Plus, Check, X, CloudIcon, Layers, Search, ImagePlus, Loader2, Link2, Link, RefreshCw, ShieldCheck, CircleCheck, RefreshCcw, AlertTriangle, GripVertical, Sparkles, FileJson, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -15,17 +15,28 @@ import { toast } from 'sonner';
 import {
   Resource, FIELD_LABELS, ResourceBinding, XnResourceBinding, YaResourceBinding,
   FramehdrResourceBinding, PanfxResourceBinding, MukakuResourceBinding, MukakuMovie,
+  JyingResourceBinding, HdhavenResourceBinding, St1ResourceBinding,
 } from '@/types/index';
 import {
-  updateResourceField, updateResourceCover, recordChange, deleteResource, insertResource,
-  fetchResourceBindings, updatePanLink, COOKIE_EXPIRED_CODE, PINGLIAN_LINK_NOT_FOUND_CODE,
-  fetchXnResourceBindings, syncResourceToXn, XN_COOKIE_EXPIRED_CODE,
+  updateResourceField, updateResourceCover, recordChange, deleteResource, importCoverFromUrl,
+  fetchResourceBindings, updatePanLink, COOKIE_EXPIRED_CODE, PINGLIAN_LINK_NOT_FOUND_CODE, bindResourceToLink,
+  fetchXnResourceBindings, syncResourceToXn, XN_COOKIE_EXPIRED_CODE, bindResourceToXnShare,
   fetchYaResourceBindings, syncResourceToYa, YA_EXPIRED_CODE, bindResourceToYa,
-  fetchFramehdrResourceBindings, syncResourceToFramehdr, FRAMEHDR_COOKIE_EXPIRED_CODE,
+  fetchFramehdrResourceBindings, syncResourceToFramehdr, FRAMEHDR_COOKIE_EXPIRED_CODE, bindResourceToFramehdr,
   fetchPanfxResourceBindings, syncResourceToPanfx, PANFX_COOKIE_EXPIRED_CODE,
+  getSt1ResourceBindings, updateSt1Resource, ST1_TOKEN_EXPIRED_CODE,
   fetchMukakuResourceBindings, syncResourceToMukaku, MUKAKU_TOKEN_EXPIRED_CODE, bindResourceToMukaku,
+  fetchJyingResourceBindings, syncResourceToJying, JYING_EXPIRED_CODE, bindResourceToJying,
+  fetchHdhavenResourceBindings, bindResourceToHdhavenBySlug, syncResourceToHdhaven,
+  HDHAVEN_EXPIRED_CODE,
+  HDHAVEN_CHALLENGE_REQUIRED_CODE,
   checkLinks, setResourceFinished, updateResourceSortOrders,
+  fetchResources, fetchResourceSyncQueue, clearResourceSyncQueue,
 } from '@/services/api';
+import { AUTO_RELOGIN_SITES, ensureSiteSession, SITE_LABELS, type SiteKey } from '@/lib/siteCredentials';
+import { importJsonText } from '@/lib/jsonImport';
+import { downloadResourcesXlsx } from '@/lib/exportXlsx';
+import { parseHdhavenMetaFromName } from '@/lib/hdhavenMeta';
 import { uploadCover, deleteCover } from '@/lib/uploadCover';
 import { matchLinkForPanType, PAN_TYPE_LABELS } from '@/lib/panUtils';
 import {
@@ -41,6 +52,14 @@ import BatchImportDialog from './BatchImportDialog';
 import BindDialog from './BindDialog';
 import ManageLinksDialog from './ManageLinksDialog';
 import QuickBindDialog, { type SiteBindingPayload } from './QuickBindDialog';
+import ResourceCardList from './ResourceCardList';
+
+/**
+ * 鸭影臻藏推送开关。
+ * 站点账号绑定 UI 已下线；按需求「保留数据但停止推送」：库里 ya_resource_bindings 一条不动，
+ * 只是资源改名/换链接不再推给鸭影。要恢复推送把它改回 true 即可（后端 worker 里的 PUSH_YA 同步改）。
+ */
+const YA_PUSH_ENABLED = false;
 
 interface EditState {
   rowId: string;
@@ -108,6 +127,11 @@ interface ResourceTableProps {
   onAddOpenChange: (v: boolean) => void;
   batchOpen: boolean;
   onBatchOpenChange: (v: boolean) => void;
+  /**
+   * 手机端工具栏追加内容（由 HomePage 传入：更新状态 / 新增资源 / 更多）。
+   * 设计稿里这些按钮与「搜索框」在同一行，所以交给本组件渲染，手机端不再多占一行。
+   */
+  toolbarExtra?: React.ReactNode;
 }
 
 // colClass 在 th/td 上使用，手机端隐藏「链接」列，桌面端恢复
@@ -128,17 +152,28 @@ function ResourceTable({
   onAddOpenChange,
   batchOpen,
   onBatchOpenChange,
+  toolbarExtra,
 }: ResourceTableProps) {
   const [editState, setEditState] = useState<EditState | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [finishTab, setFinishTab] = useState<'updating' | 'finished'>('updating');
+  // JSON 资源包导入（兼容「完整导出包」与「裸数组」两种形态）
+  const [importingJson, setImportingJson] = useState(false);
+  const [importJsonProgress, setImportJsonProgress] = useState({ done: 0, total: 0 });
+  // XLSX 导出（含封面抓取，耗时较长，需要禁用按钮并显示进度态）
+  const [exporting, setExporting] = useState(false);
+  // 封面加载失败的资源（多为旧环境地址已失效），降级为占位按钮，避免显示破图
+  const [brokenCovers, setBrokenCovers] = useState<Record<string, boolean>>({});
+  const jsonFileRef = useRef<HTMLInputElement>(null);
   // 行多选（用于右键批量操作）
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [uploadingId, setUploadingId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [checkingLinks, setCheckingLinks] = useState(false);
+  // 链接检测分片进度（done/total），检测期间在按钮上展示
+  const [checkProgress, setCheckProgress] = useState({ done: 0, total: 0 });
   // 手机端（触屏）需双击才触发编辑，防止滚动误触
   const [isTouchDevice, setIsTouchDevice] = useState(false);
   useEffect(() => {
@@ -160,13 +195,45 @@ function ResourceTable({
   const [framehdrBindings, setFramehdrBindings] = useState<Record<string, FramehdrResourceBinding>>({});
   // 123社区绑定关系
   const [panfxBindings, setPanfxBindings] = useState<Record<string, PanfxResourceBinding>>({});
+  // 1号站点绑定关系（一个资源绑定站点上的一条片源）
+  const [st1Bindings, setSt1Bindings] = useState<Record<string, St1ResourceBinding>>({});
   // 不太灵站点绑定关系
   const [mukakuBindings, setMukakuBindings] = useState<Record<string, MukakuResourceBinding[]>>({});
+  // 聚影站点绑定关系（一个资源可绑定多条：每条对应一种网盘）
+  const [jyingBindings, setJyingBindings] = useState<Record<string, JyingResourceBinding[]>>({});
+  // 栖影站点绑定关系（一个资源可绑定多条：每条对应一种网盘）
+  const [hdhavenBindings, setHdhavenBindings] = useState<Record<string, HdhavenResourceBinding[]>>({});
   const [bindTarget, setBindTarget] = useState<Resource | null>(null);
   const [bindOpen, setBindOpen] = useState(false);
   const [quickBindTarget, setQuickBindTarget] = useState<Resource | null>(null);
   const [quickBindOpen, setQuickBindOpen] = useState(false);
   const [syncingId, setSyncingId] = useState<string | null>(null);
+
+  // 订阅在服务端改了资源（集数等）后会往 resource_sync_queue 登记一条待推送任务：
+  // 站点推送依赖用户会话与各站点的自动重登 / 链接匹配，只能在前端做，所以打开本页时自动补推。
+  const [bindingsReady, setBindingsReady] = useState(false);
+  const syncQueueDrained = useRef(false);
+  useEffect(() => {
+    if (!bindingsReady || syncQueueDrained.current || resources.length === 0) return;
+    syncQueueDrained.current = true;
+    (async () => {
+      const tasks = await fetchResourceSyncQueue();
+      if (tasks.length === 0) return;
+      const finished: string[] = [];
+      for (const t of tasks) {
+        const res = resources.find((r) => r.id === t.resource_id);
+        if (!res) { finished.push(t.id); continue; } // 资源已被删除 → 任务作废
+        try {
+          await syncToSite(res);
+          finished.push(t.id);
+        } catch {
+          // 推送失败就保留任务，下次打开本页再补推
+        }
+      }
+      await clearResourceSyncQueue(finished);
+      if (finished.length > 0) toast.success(`已把 ${finished.length} 条订阅产生的变更同步到站点`);
+    })().catch(() => { /* 静默：下次打开再试 */ });
+  }, [bindingsReady, resources]);
 
   useEffect(() => {
     let cancelled = false;
@@ -177,7 +244,10 @@ function ResourceTable({
       fetchFramehdrResourceBindings().catch(() => [] as FramehdrResourceBinding[]),
       fetchPanfxResourceBindings().catch(() => [] as PanfxResourceBinding[]),
       fetchMukakuResourceBindings().catch(() => [] as MukakuResourceBinding[]),
-    ]).then(([list, xnList, yaList, framehdrList, panfxList, mukakuList]) => {
+      fetchJyingResourceBindings().catch(() => [] as JyingResourceBinding[]),
+      fetchHdhavenResourceBindings().catch(() => [] as HdhavenResourceBinding[]),
+      getSt1ResourceBindings().catch(() => [] as St1ResourceBinding[]),
+    ]).then(([list, xnList, yaList, framehdrList, panfxList, mukakuList, jyingList, hdhavenList, st1List]) => {
       if (cancelled) return;
       const map: Record<string, ResourceBinding[]> = {};
       list.forEach((b) => { (map[b.resource_id] ??= []).push(b); });
@@ -194,9 +264,19 @@ function ResourceTable({
       const panfxMap: Record<string, PanfxResourceBinding> = {};
       panfxList.forEach((b) => { panfxMap[b.resource_id] = b; });
       setPanfxBindings(panfxMap);
+      const st1Map: Record<string, St1ResourceBinding> = {};
+      st1List.forEach((b) => { st1Map[b.resource_id] = b; });
+      setSt1Bindings(st1Map);
       const mukakuMap: Record<string, MukakuResourceBinding[]> = {};
       mukakuList.forEach((b) => { (mukakuMap[b.resource_id] ??= []).push(b); });
       setMukakuBindings(mukakuMap);
+      const jyingMap: Record<string, JyingResourceBinding[]> = {};
+      jyingList.forEach((b) => { (jyingMap[b.resource_id] ??= []).push(b); });
+      setJyingBindings(jyingMap);
+      const hdhavenMap: Record<string, HdhavenResourceBinding[]> = {};
+      hdhavenList.forEach((b) => { (hdhavenMap[b.resource_id] ??= []).push(b); });
+      setHdhavenBindings(hdhavenMap);
+      setBindingsReady(true);
     });
     return () => { cancelled = true; };
   }, []);
@@ -341,28 +421,63 @@ function ResourceTable({
     const yaList = yaBindings[resource.id] ?? [];
     const fhB = framehdrBindings[resource.id];
     const pfxB = panfxBindings[resource.id];
+    const st1B = st1Bindings[resource.id];
     const mukList = mukakuBindings[resource.id] ?? [];
-    if (pinglianList.length === 0 && xnList.length === 0 && yaList.length === 0 && !fhB && !pfxB && mukList.length === 0) return;
+    const jyingList = jyingBindings[resource.id] ?? [];
+    const hdhavenList = hdhavenBindings[resource.id] ?? [];
+    if (pinglianList.length === 0 && xnList.length === 0 && yaList.length === 0 && !fhB && !pfxB && !st1B && mukList.length === 0 && jyingList.length === 0 && hdhavenList.length === 0) return;
     setSyncingId(resource.id);
 
+    // 命中这些错误码代表「站点会话失效」：先尝试用云端凭据自动重登，再重试一次
+    const RELOGIN_TRIGGER_CODES = new Set<string | undefined>([
+      COOKIE_EXPIRED_CODE,
+      XN_COOKIE_EXPIRED_CODE,
+      YA_EXPIRED_CODE,
+      FRAMEHDR_COOKIE_EXPIRED_CODE,
+      PANFX_COOKIE_EXPIRED_CODE,
+      ST1_TOKEN_EXPIRED_CODE,
+      MUKAKU_TOKEN_EXPIRED_CODE,
+      HDHAVEN_EXPIRED_CODE,
+    ]);
+
+    /** 会话失效时用云端保存的账号密码自动重登，返回是否已恢复可用 */
+    const tryAutoRelogin = async (site: SiteKey): Promise<boolean> => {
+      if (!AUTO_RELOGIN_SITES.includes(site)) return false;
+      try {
+        const r = await ensureSiteSession(site);
+        if (r.status === 'relogged' || r.status === 'ok') {
+          toast.success(`已自动重新登录「${SITE_LABELS[site]}」，正在重试同步`);
+          return true;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+
     // 单站同步失败自动重试：最多尝试 3 次（间隔递增），
-    // 登录过期/绑定失效类错误重试无意义，直接抛出
-    const syncWithRetry = async <T,>(fn: () => Promise<T>): Promise<T> => {
+    // 登录过期类错误不盲目重试——先自动重登，成功则重试，仍失败再抛出
+    const syncWithRetry = async <T,>(fn: () => Promise<T>, site?: SiteKey): Promise<T> => {
       const maxAttempts = 3;
       let lastErr: unknown = null;
+      let reloginTried = false;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
           return await fn();
         } catch (e) {
           const err = e as Error & { code?: string };
+          if (RELOGIN_TRIGGER_CODES.has(err.code)) {
+            // 会话失效：自动重登一次后重试，避免「必须手动去站点同步页重登」导致同步失败
+            if (site && !reloginTried) {
+              reloginTried = true;
+              if (await tryAutoRelogin(site)) continue;
+            }
+            throw err;
+          }
           if (
-            err.code === COOKIE_EXPIRED_CODE ||
             err.code === PINGLIAN_LINK_NOT_FOUND_CODE ||
-            err.code === XN_COOKIE_EXPIRED_CODE ||
-            err.code === YA_EXPIRED_CODE ||
-            err.code === FRAMEHDR_COOKIE_EXPIRED_CODE ||
-            err.code === PANFX_COOKIE_EXPIRED_CODE ||
-            err.code === MUKAKU_TOKEN_EXPIRED_CODE
+            // 栖影有请求频率风控：命中图形验证码门时重试无意义且会加剧风控
+            err.code === HDHAVEN_CHALLENGE_REQUIRED_CODE
           ) {
             throw err;
           }
@@ -411,7 +526,7 @@ function ResourceTable({
           link_url: matchedUrl,
           link_password: b.link_password ?? '',
           pan_type: b.pan_type ?? 'others',
-        }));
+        }), 'pinglian');
         // 站点改版后旧 link_id 失效：服务端自动迁移成功时返回新 ID，本地同步更新
         const remappedId =
           typeof upd?.data?.id === 'number' && upd.data.id !== b.link_id ? upd.data.id : null;
@@ -453,7 +568,7 @@ function ResourceTable({
         continue;
       }
       try {
-        await syncWithRetry(() => syncResourceToXn({ shareId: xnB.share_id, newTitle: title, panUrl: matchedUrl }));
+        await syncWithRetry(() => syncResourceToXn({ shareId: xnB.share_id, newTitle: title, panUrl: matchedUrl }), 'xn');
         if (!succeededSites.includes('观影站点')) succeededSites.push('观影站点');
         setXnBindings((prev) => ({
           ...prev,
@@ -470,8 +585,9 @@ function ResourceTable({
       }
     }
 
-    // 鸭影臻藏：逐条片源记录串行同步，多链接时按网盘标签匹配对应链接
-    for (const yaB of yaList) {
+    // 鸭影臻藏：站点账号绑定入口已下线，按需求「保留数据但停止推送」。
+    // 绑定记录（ya_resource_bindings）原样保留，把 YA_PUSH_ENABLED 改回 true 即可恢复同步。
+    for (const yaB of (YA_PUSH_ENABLED ? yaList : [])) {
       const matchedUrl = matchLinkForPanType(
         yaB.pan_label,
         Array.isArray(resource.links) ? resource.links : [],
@@ -505,7 +621,7 @@ function ResourceTable({
 
     if (fhB && panUrl) {
       try {
-        await syncWithRetry(() => syncResourceToFramehdr({ linkId: fhB.link_id, panUrl, driveName: fhB.drive_name, description: title }));
+        await syncWithRetry(() => syncResourceToFramehdr({ linkId: fhB.link_id, panUrl, driveName: fhB.drive_name, description: title }), 'framehdr');
         succeededSites.push('帧影站点');
         setFramehdrBindings((prev) => ({ ...prev, [resource.id]: { ...fhB, link_title: title } }));
       } catch (e) {
@@ -525,7 +641,7 @@ function ResourceTable({
           title,
           firstpid: pfxB.firstpid,
           fid: pfxB.fid,
-        }));
+        }), 'panfx');
         succeededSites.push('123社区');
         setPanfxBindings((prev) => ({ ...prev, [resource.id]: { ...pfxB, subject: title } }));
       } catch (e) {
@@ -534,6 +650,25 @@ function ResourceTable({
           ? '登录已过期，请到「站点同步」页重新绑定 Cookie'
           : (err.message || '未知错误');
         failedSites.push({ site: '123社区', reason });
+      }
+    }
+
+    // 1号站点同步：绑定的是站点上已存在的片源，用 PATCH 局部更新标题与网盘地址
+    if (st1B && panUrl) {
+      try {
+        await syncWithRetry(() => updateSt1Resource({
+          remoteId: st1B.remote_id,
+          title,
+          panUrl,
+        }), 'st1');
+        succeededSites.push('1号站点');
+        setSt1Bindings((prev) => ({ ...prev, [resource.id]: { ...st1B, title } }));
+      } catch (e) {
+        const err = e as Error & { code?: string };
+        const reason = err.code === ST1_TOKEN_EXPIRED_CODE
+          ? '令牌已失效，请到「站点同步」页重新绑定令牌'
+          : (err.message || '未知错误');
+        failedSites.push({ site: '1号站点', reason });
       }
     }
 
@@ -559,7 +694,7 @@ function ResourceTable({
           newTitle: title,
           panUrl: matchedUrl,
           shareCode: mukB.share_code || undefined,
-        }));
+        }), 'mukaku');
         succeededSites.push('不太灵站点');
         setMukakuBindings((prev) => {
           const list = prev[resource.id] ?? [];
@@ -574,6 +709,88 @@ function ResourceTable({
           ? '登录已过期，请到「站点同步」页重新登录'
           : (err.message || '未知错误');
         failedSites.push({ site: `不太灵站点 (${mukB.seed_name || `#${mukB.link_id}`})`, reason });
+      }
+    }
+
+    // 聚影站点同步：为「修改已有分享」语义 —— 逐条把已绑定分享的链接
+    // 替换为本地资源中「同网盘类型」的链接（聚影没有新建分享的批量接口）
+    for (const jyB of jyingList) {
+      const jyLabel = jyB.pan_label || '对应网盘';
+      const matchedUrl = matchLinkForPanType(
+        jyB.pan_label,
+        Array.isArray(resource.links) ? resource.links : [],
+        resource.link ?? ''
+      );
+      if (!matchedUrl) {
+        failedSites.push({
+          site: `聚影·${jyLabel}`,
+          reason: `资源中没有「${jyLabel}」类型的链接，未同步该条分享`,
+        });
+        continue;
+      }
+      try {
+        await syncWithRetry(() => syncResourceToJying({ linkId: jyB.link_id, panUrl: matchedUrl }));
+        if (!succeededSites.includes('聚影站点')) succeededSites.push('聚影站点');
+        setJyingBindings((prev) => ({
+          ...prev,
+          [resource.id]: (prev[resource.id] ?? []).map((x) =>
+            x.link_id === jyB.link_id ? { ...x, link_title: title } : x
+          ),
+        }));
+      } catch (e) {
+        const err = e as Error & { code?: string };
+        const reason = err.code === JYING_EXPIRED_CODE
+          ? '登录已过期，请到「站点同步」页重新登录'
+          : (err.message || '未知错误');
+        failedSites.push({ site: `聚影·${jyLabel}`, reason });
+      }
+    }
+
+    // 栖影站点同步：同样是「修改已有分享」语义 —— 逐条把已绑定分享的链接替换为
+    // 本地资源中「同网盘类型」的链接（栖影没有新建分享的接口，只能改已有分享）。
+    // 站点有频率风控，服务端已限速，这里保持串行逐条提交
+    for (const hdB of hdhavenList) {
+      const hdLabel = hdB.pan_label || hdB.pan_type || '对应网盘';
+      const matchedUrl = matchLinkForPanType(
+        hdB.pan_type || hdB.pan_label,
+        Array.isArray(resource.links) ? resource.links : [],
+        resource.link ?? ''
+      );
+      if (!matchedUrl) {
+        failedSites.push({
+          site: `栖影·${hdLabel}`,
+          reason: `资源中没有「${hdLabel}」类型的链接，未同步该条分享`,
+        });
+        continue;
+      }
+      try {
+        await syncWithRetry(() => syncResourceToHdhaven({
+          slug: hdB.slug,
+          panUrl: matchedUrl,
+          panType: hdB.pan_type ?? undefined,
+          // 站点 update 是「全量字段回写」：把本地标题与按名称解析出的属性一起同步，
+          // 否则站点侧分享标题/属性永远不变（此前只发 URL 的 bug）
+          title,
+          meta: parseHdhavenMetaFromName(title, {
+            isTv: hdB.media_type ? hdB.media_type === 'tv' : (resource.episode_count ?? 0) > 1,
+            episodeCount: resource.episode_count ?? null,
+          }),
+        }), 'hdhaven');
+        succeededSites.push('栖影站点');
+        setHdhavenBindings((prev) => ({
+          ...prev,
+          [resource.id]: (prev[resource.id] ?? []).map((x) =>
+            x.slug === hdB.slug ? { ...x, link_title: title } : x
+          ),
+        }));
+      } catch (e) {
+        const err = e as Error & { code?: string };
+        const reason = err.code === HDHAVEN_EXPIRED_CODE
+          ? '登录已过期，请到「站点同步」页重新登录'
+          : err.code === HDHAVEN_CHALLENGE_REQUIRED_CODE
+            ? '触发站点图形验证码风控，请先到 hdhaven.com 完成验证后重试'
+            : (err.message || '未知错误');
+        failedSites.push({ site: `栖影·${hdLabel}`, reason });
       }
     }
 
@@ -658,6 +875,66 @@ function ResourceTable({
     }
   }
 
+  /**
+   * 导出资源清单为 XLSX（标题 / 封面图片 / 网盘链接（带云盘名称）/ 状态）。
+   * 勾选了资源时只导出勾选的，未勾选的不纳入导出；一条都没勾选时导出全部。
+   */
+  async function handleExportXlsx() {
+    const targets = selectedIds.size > 0
+      ? resources.filter((r) => selectedIds.has(r.id))
+      : resources;
+    if (targets.length === 0) {
+      toast.info('当前没有可导出的资源');
+      return;
+    }
+    setExporting(true);
+    try {
+      const result = await downloadResourcesXlsx(targets);
+      if (!result) {
+        toast.info('当前没有可导出的资源');
+        return;
+      }
+      toast.success(
+        `已导出 ${result.exported} 条资源${result.covers > 0 ? `（含封面 ${result.covers} 张）` : ''}`
+      );
+    } catch (e) {
+      toast.error((e as Error).message || '导出失败，请重试');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  /**
+   * 导入 JSON 资源包：兼容「完整导出包」与「裸数组」两种形态。
+   * 与批量导入（粘贴文本、靠解析）互补 —— 这条用于迁移/恢复导出的数据，
+   * 完整保留封面、网盘链接、完结状态等字段。
+   */
+  async function handleImportJson(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // 允许连续导入同一个文件
+    if (!file || importingJson) return;
+
+    setImportingJson(true);
+    setImportJsonProgress({ done: 0, total: 0 });
+    try {
+      const res = await importJsonText(await file.text(), (done, total) =>
+        setImportJsonProgress({ done, total })
+      );
+      // 批量写入后直接以服务端结果重建列表，避免本地拼接的顺序与 sort_order 不一致
+      onResourcesChange(await fetchResources());
+      if (res.failed === 0) {
+        toast.success(`导入完成：新增 ${res.inserted} 条资源`);
+      } else {
+        toast.warning(`导入完成：成功 ${res.inserted} 条，失败 ${res.failed} 条`);
+      }
+    } catch (err) {
+      toast.error((err as Error).message || '导入失败，请重试');
+    } finally {
+      setImportingJson(false);
+      setImportJsonProgress({ done: 0, total: 0 });
+    }
+  }
+
   async function handleCheckLinks() {
     const targets = filtered.filter((r) => r.link || (r.links && r.links.length > 0));
     if (targets.length === 0) {
@@ -665,8 +942,12 @@ function ResourceTable({
       return;
     }
     setCheckingLinks(true);
+    setCheckProgress({ done: 0, total: targets.length });
     try {
-      const results = await checkLinks(targets.map((r) => r.id));
+      const { results, failedChunks } = await checkLinks(
+        targets.map((r) => r.id),
+        (done, total) => setCheckProgress({ done, total })
+      );
       const map = new Map(results.map((r) => [r.id, r]));
       onResourcesChange(
         resources.map((r) => {
@@ -688,7 +969,14 @@ function ResourceTable({
       );
       const invalid = results.filter((r) => r.status === 'invalid').length;
       const partial = results.filter((r) => r.status === 'partial').length;
-      if (invalid > 0) {
+      if (failedChunks > 0) {
+        // 部分批次超时：已检测的结果照常展示，并提示重试剩余部分
+        toast.warning(
+          `已检测 ${results.length} 条（${invalid} 条全部失效${partial > 0 ? `、${partial} 条部分失效` : ''}），` +
+            `另有 ${failedChunks} 批因外站响应过慢超时，请稍后重试`,
+          { duration: 8000 }
+        );
+      } else if (invalid > 0) {
         toast.error(`检测完成：${invalid} 条资源链接已全部失效${partial > 0 ? `，${partial} 条部分失效` : ''}`);
       } else if (partial > 0) {
         toast.warning(`检测完成：${partial} 条资源存在部分失效链接`);
@@ -699,6 +987,7 @@ function ResourceTable({
       toast.error((e as Error).message || '链接检测失败');
     } finally {
       setCheckingLinks(false);
+      setCheckProgress({ done: 0, total: 0 });
     }
   }
 
@@ -732,9 +1021,15 @@ function ResourceTable({
         );
         onResourcesChange(newResources);
         onResourceUpdated({ ...resource, cover_url: result.url }, '封面');
-        const msg = result.compressed
-          ? `封面已上传（已自动压缩至 ${(result.finalSize / 1024).toFixed(0)} KB）`
-          : '封面已上传';
+        // 新封面上传成功后清掉「失效」标记，恢复正常展示
+        setBrokenCovers((prev) => {
+          if (!prev[resourceId]) return prev;
+          const next = { ...prev };
+          delete next[resourceId];
+          return next;
+        });
+        // 封面已按规格归一化：提示最终版式与体积
+        const msg = `封面已上传（${result.orientation === 'landscape' ? '横版' : '竖版'} ${result.width}×${result.height}，${(result.finalSize / 1024).toFixed(0)} KB）`;
         toast.success(msg);
       }
     } catch (err) {
@@ -746,6 +1041,7 @@ function ResourceTable({
   }, [resources, onResourcesChange, onResourceUpdated]);
 
   async function handleRemoveCover(resource: Resource) {
+    if (readOnly) return;
     if (!resource.cover_url) return;
     try {
       await deleteCover(resource.cover_url);
@@ -797,13 +1093,17 @@ function ResourceTable({
       const xnList2 = xnBindings[resource.id] ?? [];
       const yaList2 = yaBindings[resource.id] ?? [];
       const mukList2 = mukakuBindings[resource.id] ?? [];
+      const jyList2 = jyingBindings[resource.id] ?? [];
+      const hdList2 = hdhavenBindings[resource.id] ?? [];
       const allBound = bList.length + xnList2.length + yaList2.length
         + (framehdrBindings[resource.id] ? 1 : 0) + (panfxBindings[resource.id] ? 1 : 0)
-        + mukList2.length;
+        + (st1Bindings[resource.id] ? 1 : 0)
+        + mukList2.length + jyList2.length + hdList2.length;
       return (
         <div className="flex items-center gap-1 min-w-0">
+          {/* touch-manipulation：关掉双击缩放，否则触屏上双击会变成缩放、触发不了 dblclick */}
           <div
-            className="flex-1 min-w-0 overflow-hidden cursor-pointer group rounded px-1 -mx-1 hover:bg-muted/60 transition-colors"
+            className="flex-1 min-w-0 overflow-hidden touch-manipulation cursor-pointer group rounded px-1 -mx-1 hover:bg-muted/60 transition-colors"
             title={isTouchDevice ? '双击编辑名称' : undefined}
             onClick={!isTouchDevice ? () => startEdit(resource.id, col.key, scalarValue) : undefined}
             onDoubleClick={isTouchDevice ? () => startEdit(resource.id, col.key, scalarValue) : undefined}
@@ -826,7 +1126,10 @@ function ResourceTable({
           <Button
             variant="outline"
             size="sm"
-            title="快捷绑定：搜索站点片库并自动回填名称与链接"
+            title={readOnly
+              ? '会员已到期，编辑功能已锁定'
+              : '快捷绑定：搜索站点片库并自动回填名称与链接'}
+            disabled={readOnly}
             onClick={(e) => {
               e.stopPropagation();
               setQuickBindTarget(resource);
@@ -842,7 +1145,8 @@ function ResourceTable({
           <Button
             variant="ghost"
             size="icon"
-            title="管理链接"
+            title={readOnly ? '会员已到期，编辑功能已锁定' : '管理链接'}
+            disabled={readOnly}
             onClick={(e) => { e.stopPropagation(); setManageLinksTarget(resource); setManageLinksOpen(true); }}
             className="md:hidden h-6 w-6 shrink-0 text-muted-foreground/60 hover:text-primary hover:bg-primary/10"
           >
@@ -851,11 +1155,14 @@ function ResourceTable({
           <Button
             variant="ghost"
             size="icon"
-            title={allBound > 1
-              ? `已绑定 ${allBound} 条站点记录`
-              : bList.length === 1
-                ? `已绑定：${bList[0].vod_name || bList[0].link_title || `#${bList[0].link_id}`}`
-                : '绑定站点剧集'}
+            title={readOnly
+              ? '会员已到期，编辑功能已锁定'
+              : allBound > 1
+                ? `已绑定 ${allBound} 条站点记录`
+                : bList.length === 1
+                  ? `已绑定：${bList[0].vod_name || bList[0].link_title || `#${bList[0].link_id}`}`
+                  : '绑定站点剧集'}
+            disabled={readOnly}
             onClick={(e) => { e.stopPropagation(); setBindTarget(resource); setBindOpen(true); }}
             className={`h-6 w-6 shrink-0 ${allBound > 0 ? 'text-secondary hover:text-secondary hover:bg-secondary/10' : 'text-muted-foreground/60 hover:text-primary hover:bg-primary/10'}`}
           >
@@ -873,8 +1180,9 @@ function ResourceTable({
         : resource.link?.trim() ? [{ url: resource.link, pan_name: '' }] : [];
       return (
         <div
-          className="flex flex-wrap items-center gap-1 cursor-pointer group min-w-0"
-          onClick={() => { setManageLinksTarget(resource); setManageLinksOpen(true); }}
+          className={`flex flex-wrap items-center gap-1 group min-w-0 ${readOnly ? '' : 'cursor-pointer'}`}
+          title={readOnly ? '会员已到期，编辑功能已锁定' : undefined}
+          onClick={() => { if (readOnly) return; setManageLinksTarget(resource); setManageLinksOpen(true); }}
         >
           {panLinks.length > 0 ? (
             panLinks.map((l, i) => (
@@ -921,7 +1229,7 @@ function ResourceTable({
     filledName: string,
     filledLink: string,
     coverUrl?: string | null,
-    siteBinding?: SiteBindingPayload
+    siteBindings?: SiteBindingPayload[]
   ) {
     const resource = resources.find((r) => r.id === resourceId);
     if (!resource) return;
@@ -961,15 +1269,18 @@ function ResourceTable({
     // 3. 若提供封面海报且当前未设置封面，自动更新封面
     if (coverUrl && !resource.cover_url) {
       try {
-        await updateResourceCover(resourceId, coverUrl);
-        updatedResource = { ...updatedResource, cover_url: coverUrl };
+        // 外站封面先下载导入本应用存储桶，避免防盗链 / 跨域导致无法显示与合成分享卡片
+        const localCover = await importCoverFromUrl(resourceId, coverUrl);
+        const finalCover = localCover || coverUrl;
+        await updateResourceCover(resourceId, finalCover);
+        updatedResource = { ...updatedResource, cover_url: finalCover };
       } catch (err) {
         console.warn('自动设置封面失败', err);
       }
     }
 
-    // 4. 若自动发布到了站点，持久化站点绑定映射
-    if (siteBinding) {
+    // 4. 若自动发布到了站点，持久化站点绑定映射（首条 + 队列各条，全部绑到当前行）
+    for (const siteBinding of siteBindings ?? []) {
       try {
         if (siteBinding.site === 'mukaku' && siteBinding.movies_id && siteBinding.link_id) {
           await bindResourceToMukaku(resourceId, {
@@ -990,14 +1301,76 @@ function ResourceTable({
             video_id: siteBinding.video_id,
             video_title: siteBinding.vod_name || filledName,
             name: siteBinding.vod_name || filledName,
-            drive_label: siteBinding.pan_type || '网盘',
-            url: filledLink,
+            // 网盘名一律由该绑定「对应的本地链接」按 URL 推导：
+            // 站点对光鸭等网盘只返回 drive_type='others'，而本地链接的 pan_name
+            // 来自 URL 识别 —— 两者不同源时同步会报「资源中没有 others 类型链接」
+            url: siteBinding.pan_url || filledLink,
             extract_code: siteBinding.code || '',
           });
           const yaList = await fetchYaResourceBindings();
           const yaMap: Record<string, YaResourceBinding[]> = {};
           yaList.forEach((b) => { (yaMap[b.resource_id] ??= []).push(b); });
           setYaBindings(yaMap);
+        } else if (siteBinding.site === 'pinglian' && siteBinding.link_id) {
+          // 盘链：发布成功后落地「资源 × 盘链记录」绑定
+          await bindResourceToLink(resourceId, {
+            id: siteBinding.link_id,
+            title: siteBinding.link_title || filledName,
+            video_title: siteBinding.vod_name || filledName,
+            pan_type: siteBinding.pan_type || 'others',
+            password: siteBinding.code || null,
+          });
+          const plList = await fetchResourceBindings();
+          const plMap: Record<string, ResourceBinding[]> = {};
+          plList.forEach((b) => { (plMap[b.resource_id] ??= []).push(b); });
+          setBindings(plMap);
+        } else if (siteBinding.site === 'framehdr' && siteBinding.link_id) {
+          // 帧影：发布成功后落地「资源 × 帧影链接」绑定
+          await bindResourceToFramehdr(resourceId, {
+            id: siteBinding.link_id,
+            title: siteBinding.vod_name || filledName,
+            drive_name: siteBinding.pan_type || null,
+          } as import('@/types/index').FramehdrLink);
+          const fhList = await fetchFramehdrResourceBindings();
+          const fhMap: Record<string, FramehdrResourceBinding> = {};
+          fhList.forEach((b) => { fhMap[b.resource_id] = b; });
+          setFramehdrBindings(fhMap);
+        } else if (siteBinding.site === 'jying' && siteBinding.link_id) {
+          // 聚影：同步成功后落地「资源 × 聚影分享条目」绑定
+          await bindResourceToJying(resourceId, {
+            id: siteBinding.link_id,
+            vod_name: siteBinding.vod_name || filledName,
+            title: siteBinding.link_title || filledName,
+            share_link: siteBinding.pan_url || filledLink,
+          });
+          const jyList = await fetchJyingResourceBindings();
+          const jyMap: Record<string, JyingResourceBinding[]> = {};
+          jyList.forEach((b) => { (jyMap[b.resource_id] ??= []).push(b); });
+          setJyingBindings(jyMap);
+        } else if (siteBinding.site === 'xn' && siteBinding.share_id) {
+          // 观影小牛：发布成功后落地「资源 × 观影分享」绑定
+          await bindResourceToXnShare(resourceId, {
+            id: siteBinding.share_id,
+            title: siteBinding.link_title || filledName,
+            url: siteBinding.share_url || filledLink,
+          });
+          const xnList = await fetchXnResourceBindings();
+          const xnMap: Record<string, XnResourceBinding[]> = {};
+          xnList.forEach((b) => { (xnMap[b.resource_id] ??= []).push(b); });
+          setXnBindings(xnMap);
+        } else if (siteBinding.site === 'hdhaven' && siteBinding.share_id) {
+          // 栖影：投稿成功后落地「资源 × 栖影分享条目」绑定（slug 存放在 share_id）
+          await bindResourceToHdhavenBySlug({
+            resourceId,
+            slug: siteBinding.share_id,
+            linkTitle: siteBinding.link_title || filledName,
+            vodName: siteBinding.vod_name || filledName,
+            panType: siteBinding.pan_type ?? null,
+          });
+          const hdList = await fetchHdhavenResourceBindings();
+          const hdMap: Record<string, HdhavenResourceBinding[]> = {};
+          hdList.forEach((b) => { (hdMap[b.resource_id] ??= []).push(b); });
+          setHdhavenBindings(hdMap);
         }
       } catch (bindErr) {
         console.warn('保存站点绑定映射失败', bindErr);
@@ -1013,142 +1386,77 @@ function ResourceTable({
     syncToSite(updatedResource);
   }
 
-  // 快捷绑定：多云盘链接队列回填（完成一条再执行下一条，各行资源名称完全一致并同步发布到站点）
-  async function handleQueueAppend(
-    baseResource: Resource,
-    filledName: string,
-    linksQueue: Array<{
-      url: string;
-      pan_name?: string;
-      extract_code?: string;
-      siteBinding?: SiteBindingPayload;
-    }>
-  ) {
-    if (linksQueue.length === 0) return;
-
-    const baseIndex = resources.findIndex((r) => r.id === baseResource.id);
-    const baseOrder = baseResource.sort_order ?? 0;
-
-    let currentResources = [...resources];
-
-    for (let i = 0; i < linksQueue.length; i++) {
-      const item = linksQueue[i];
-      if (!item.url) continue;
-
-      // 串行插入新资源：资源名称完全一致，集数一致，填入独立网盘链接
-      const inserted = await insertResource({
-        name: filledName,
-        episode_count: baseResource.episode_count ?? 0,
-        link: item.url,
-        links: [{ url: item.url, pan_name: item.pan_name ?? '' }],
-        sort_order: baseOrder + i + 1,
-        cover_url: baseResource.cover_url ?? null,
-      });
-
-      if (inserted) {
-        if (item.siteBinding) {
-          try {
-            if (item.siteBinding.site === 'mukaku' && item.siteBinding.movies_id && item.siteBinding.link_id) {
-              await bindResourceToMukaku(inserted.id, {
-                id: item.siteBinding.link_id,
-                movies_id: item.siteBinding.movies_id,
-                seed_name: filledName,
-                vod_name: item.siteBinding.vod_name || filledName,
-                pan_type: item.siteBinding.pan_type,
-                code: item.siteBinding.code,
-              });
-            } else if (item.siteBinding.site === 'ya' && item.siteBinding.video_id && item.siteBinding.link_id) {
-              await bindResourceToYa(inserted.id, {
-                id: item.siteBinding.link_id,
-                video_id: item.siteBinding.video_id,
-                video_title: item.siteBinding.vod_name || filledName,
-                name: item.siteBinding.vod_name || filledName,
-                drive_label: item.siteBinding.pan_type || '网盘',
-                url: item.url,
-                extract_code: item.siteBinding.code || '',
-              });
-            }
-          } catch (bindErr) {
-            console.warn('队列插入资源持久化绑定失败', bindErr);
-          }
-        }
-
-        await recordChange({
-          resource_id: inserted.id,
-          resource_name: filledName,
-          field_name: 'name',
-          field_label: '多云盘队列录入',
-          old_value: '',
-          new_value: `${filledName} (${item.pan_name || '网盘'})`,
-        });
-
-        // 紧贴当前行下方追加
-        const insertPos = baseIndex >= 0 ? baseIndex + 1 + i : currentResources.length;
-        currentResources.splice(insertPos, 0, inserted);
-        onResourceAdded(inserted);
-      }
-    }
-
-    onResourcesChange(currentResources);
-  }
-
   return (
     <div className="flex flex-col gap-2 md:gap-3 h-full">
-      {/* Tab 切换：更新中 / 已完结 */}
-      <div className="flex shrink-0 border-b border-border bg-muted/20 rounded-t-lg overflow-hidden -mx-0">
+      {/* Tab 切换：更新中 / 已完结。
+          手机端（<md）＝设计稿的分段控件（选中浅蓝底 + 蓝字）；
+          桌面端（md+）＝ **完全保持原有下划线样式**，PC 展示不变 */}
+      <div className="flex shrink-0 overflow-hidden rounded-xl border border-border bg-card md:rounded-none md:rounded-t-lg md:border-0 md:border-b md:border-border md:bg-muted/20">
         <button
           onClick={() => { setFinishTab('updating'); setSelectedIds(new Set()); }}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-medium transition-colors ${
+          className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium transition-colors md:py-2 ${
             finishTab === 'updating'
-              ? 'bg-card text-primary border-b-2 border-primary'
-              : 'text-muted-foreground hover:text-foreground hover:bg-muted/40'
+              ? 'bg-primary/10 text-primary md:bg-card md:text-primary md:border-b-2 md:border-primary'
+              : 'text-muted-foreground hover:text-foreground hover:bg-muted/40 md:hover:bg-muted/40'
           }`}
         >
           <RefreshCcw className="h-3.5 w-3.5" />
           更新中
-          <span className="text-[10px] text-muted-foreground">({resources.filter((r) => !r.is_finished).length})</span>
+          <span className={`text-[10px] ${finishTab === 'updating' ? 'text-primary/70 md:text-muted-foreground' : 'text-muted-foreground'}`}>
+            ({resources.filter((r) => !r.is_finished).length})
+          </span>
         </button>
+        <div className="w-px shrink-0 bg-border md:hidden" />
         <button
           onClick={() => { setFinishTab('finished'); setSelectedIds(new Set()); }}
-          className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-medium transition-colors ${
+          className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium transition-colors md:py-2 ${
             finishTab === 'finished'
-              ? 'bg-card text-accent border-b-2 border-accent'
-              : 'text-muted-foreground hover:text-foreground hover:bg-muted/40'
+              ? 'bg-primary/10 text-primary md:bg-card md:text-accent md:border-b-2 md:border-accent'
+              : 'text-muted-foreground hover:text-foreground hover:bg-muted/40 md:hover:bg-muted/40'
           }`}
         >
           <CircleCheck className="h-3.5 w-3.5" />
           已完结
-          <span className="text-[10px] text-muted-foreground">({resources.filter((r) => r.is_finished).length})</span>
+          <span className={`text-[10px] ${finishTab === 'finished' ? 'text-primary/70 md:text-muted-foreground' : 'text-muted-foreground'}`}>
+            ({resources.filter((r) => r.is_finished).length})
+          </span>
         </button>
       </div>
 
-      {/* 工具栏 */}
-      <div className="flex items-center gap-2 shrink-0">
-        {/* 搜索框 */}
-        <div className="relative flex-1 min-w-0">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+      {/* 工具栏（手机端按设计稿：搜索框 + 更新状态 + 新增资源 + ⋯ + 链接检测，一行全显示）
+          搜索框 min-w-0 flex-1 吸收剩余宽度，右侧按钮 shrink-0 固定大小 → 谁都不会被切掉 */}
+      <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        {/* 搜索框（手机端字号保持 16px：iOS 上输入框 < 16px 时聚焦会自动放大整页） */}
+        <div className="relative min-w-0 flex-1">
+          <Search className="absolute left-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground pointer-events-none" />
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="搜索资源名称或链接…"
-            className="pl-8 h-8 text-xs bg-input border-border focus-visible:ring-primary/40"
+            placeholder="搜索资源名称…"
+            className="h-9 min-w-0 rounded-full border-border/60 bg-muted/50 pl-8 text-base focus-visible:ring-primary/40 md:h-8 md:rounded-lg md:border-border md:bg-input md:text-xs"
           />
           {search && (
             <button
               onClick={() => setSearch('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
             >
               <X className="h-3 w-3" />
             </button>
           )}
         </div>
-        {/* 手机端：链接检测按钮（桌面端按钮在右侧工具栏） */}
+        {/* 手机端：页面动作按钮（HomePage 传入，与搜索框同一行） */}
+        {toolbarExtra}
+        {/* 手机端：链接检测（带文字，避免只有一个图标看不出是功能键） */}
         <Button variant="outline" size="sm" onClick={handleCheckLinks}
+          title="检测链接有效性"
           disabled={checkingLinks || filtered.length === 0}
-          className="md:hidden h-8 gap-1 shrink-0 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+          className="md:hidden h-7 shrink-0 gap-0.5 whitespace-nowrap rounded-full border-border px-1.5 text-[9px] text-muted-foreground hover:bg-muted hover:text-foreground">
           {checkingLinks
-            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            : <ShieldCheck className="h-3.5 w-3.5" />}
+            ? <Loader2 className="h-2.5 w-2.5 shrink-0 animate-spin" />
+            : <ShieldCheck className="h-2.5 w-2.5 shrink-0" />}
+          {checkingLinks && checkProgress.total > 0
+            ? `${checkProgress.done}/${checkProgress.total}`
+            : '链接检测'}
         </Button>
         {/* 桌面端显示按钮（手机端按钮在页面标题栏） */}
         <div className="hidden md:flex items-center gap-2 shrink-0">
@@ -1161,6 +1469,30 @@ function ResourceTable({
             className="h-8 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
             <Layers className="h-3.5 w-3.5" />批量导入
           </Button>
+          <Button variant="outline" size="sm" onClick={handleExportXlsx}
+            disabled={exporting}
+            title="导出 XLSX：勾选资源后仅导出勾选项"
+            className="h-8 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+            {exporting
+              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              : <Download className="h-3.5 w-3.5" />}
+            导出 XLSX{selectedIds.size > 0 ? `（已选 ${selectedIds.size}）` : ''}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => jsonFileRef.current?.click()}
+            disabled={readOnly || importingJson}
+            className="h-8 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+            {importingJson
+              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              : <FileJson className="h-3.5 w-3.5" />}
+            {importingJson ? `导入中 ${importJsonProgress.done}/${importJsonProgress.total}` : '导入 JSON'}
+          </Button>
+          <input
+            ref={jsonFileRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={handleImportJson}
+          />
           <Button size="sm" onClick={() => onAddOpenChange(true)}
             disabled={readOnly}
             className="h-8 gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90">
@@ -1172,7 +1504,9 @@ function ResourceTable({
             {checkingLinks
               ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
               : <ShieldCheck className="h-3.5 w-3.5" />}
-            链接检测
+            {checkingLinks
+              ? `检测中 ${checkProgress.done}/${checkProgress.total}`
+              : '链接检测'}
           </Button>
         </div>
       </div>
@@ -1181,9 +1515,38 @@ function ResourceTable({
       <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/avif"
         className="hidden" onChange={handleFileChange} />
 
-      {/* 表格区域：手机用 table-fixed（4列）不横滚，桌面 table-auto min-w-max 恢复原样 */}
+      {/* 表格区域：手机用卡片列表（设计稿），桌面 table-auto min-w-max 恢复原样 */}
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
-      <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-border">
+      {/* 手机端：卡片列表（自身滚动）。动作与行内编辑全部复用下方表格的同一套状态与回调 */}
+      <div className="min-h-0 flex-1 overflow-y-auto md:hidden">
+        <ResourceCardList
+          resources={filtered}
+          readOnly={readOnly}
+          isTouchDevice={isTouchDevice}
+          brokenCovers={brokenCovers}
+          onCoverBroken={(id) => setBrokenCovers((prev) => ({ ...prev, [id]: true }))}
+          onCoverClick={triggerCoverUpload}
+          onRemoveCover={handleRemoveCover}
+          uploadingId={uploadingId}
+          uploadProgress={uploadProgress}
+          deletingId={deletingId}
+          onDelete={handleDelete}
+          onQuickBind={(r) => { setQuickBindTarget(r); setQuickBindOpen(true); }}
+          onBind={(r) => { setBindTarget(r); setBindOpen(true); }}
+          onManageLinks={(r) => { setManageLinksTarget(r); setManageLinksOpen(true); }}
+          editState={editState}
+          onStartEdit={(r, field) =>
+            startEdit(r.id, field, field === 'episode_count' ? r.episode_count ?? 0 : r.name ?? '')
+          }
+          onEditValueChange={(v) => setEditState((s) => (s ? { ...s, value: v } : s))}
+          onSaveEdit={saveEdit}
+          onCancelEdit={cancelEdit}
+          inputRef={inputRef}
+          onEditKeyDown={handleKeyDown}
+        />
+      </div>
+
+      <div className="hidden flex-1 min-h-0 overflow-auto rounded-lg border border-border md:block">
         <table className="w-full table-fixed md:table-auto md:min-w-max text-sm">
           <thead className="sticky top-0 z-10">
             <tr className="border-b border-border bg-card">
@@ -1302,23 +1665,36 @@ function ResourceTable({
                           <Loader2 className="h-3 w-3 text-primary animate-spin" />
                           <span className="text-[9px] text-primary">{uploadProgress}%</span>
                         </div>
-                      ) : resource.cover_url ? (
+                      ) : resource.cover_url && !brokenCovers[resource.id] ? (
                         <>
-                          <img src={resource.cover_url} alt="封面" className="w-full h-full object-cover" />
-                          <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-0.5">
+                          <img
+                            src={resource.cover_url}
+                            alt="封面"
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-cover"
+                            onError={() =>
+                              setBrokenCovers((prev) => ({ ...prev, [resource.id]: true }))
+                            }
+                          />
+                          {/* 注意：触屏没有 hover —— 手机上必须常显，否则「更换 / 删除」永远点不到；
+                              桌面端保持 hover 才浮现，避免遮挡封面。按钮补内边距扩大触控区 */}
+                          <div className="absolute inset-0 bg-black/50 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-0.5">
                             <button onClick={() => triggerCoverUpload(resource.id)}
-                              className="text-white text-[9px] hover:text-primary-foreground leading-tight">更换</button>
+                              className="text-white text-[9px] leading-tight px-1.5 py-1 rounded hover:bg-white/20 active:bg-white/25">更换</button>
                             <button onClick={() => handleRemoveCover(resource)}
-                              className="text-red-300 text-[9px] hover:text-red-200 leading-tight">删除</button>
+                              className="text-red-300 text-[9px] leading-tight px-1.5 py-1 rounded hover:bg-red-500/20 active:bg-red-500/25">删除</button>
                           </div>
                         </>
                       ) : (
                         <button
                           onClick={() => triggerCoverUpload(resource.id)}
+                          title={brokenCovers[resource.id] ? '原封面地址已失效，点击上传新封面' : undefined}
                           className="w-full h-full bg-muted/60 border border-dashed border-border hover:border-primary/50 hover:bg-primary/5 transition-colors flex flex-col items-center justify-center gap-0.5 rounded"
                         >
                           <ImagePlus className="h-3.5 w-3.5 text-muted-foreground group-hover:text-primary" />
-                          <span className="text-[9px] text-muted-foreground leading-tight">添加封面</span>
+                          <span className="text-[9px] text-muted-foreground leading-tight">
+                            {brokenCovers[resource.id] ? '封面失效' : '添加封面'}
+                          </span>
                         </button>
                       )}
                     </div>
@@ -1330,7 +1706,7 @@ function ResourceTable({
                   ))}
                   <td className="px-1 md:px-3 py-1 md:py-2 align-middle w-10 md:min-w-16">
                     <Button variant="ghost" size="icon"
-                      className="h-7 w-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                      className="h-9 w-9 md:h-7 md:w-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                       onClick={() => handleDelete(resource.id)}
                       disabled={readOnly || deletingId === resource.id}>
                       <Trash2 className="h-3.5 w-3.5" />
@@ -1360,7 +1736,10 @@ function ResourceTable({
         yaBindings={bindTarget ? yaBindings[bindTarget.id] ?? [] : []}
         framehdrBinding={bindTarget ? framehdrBindings[bindTarget.id] ?? null : null}
         panfxBinding={bindTarget ? panfxBindings[bindTarget.id] ?? null : null}
+        st1Binding={bindTarget ? st1Bindings[bindTarget.id] ?? null : null}
         mukakuBindings={bindTarget ? mukakuBindings[bindTarget.id] ?? [] : []}
+        jyingBindings={bindTarget ? jyingBindings[bindTarget.id] ?? [] : []}
+        hdhavenBindings={bindTarget ? hdhavenBindings[bindTarget.id] ?? [] : []}
         open={bindOpen}
         onOpenChange={setBindOpen}
         onPinglianBound={(resourceId, b) => setBindings((prev) => {
@@ -1414,6 +1793,12 @@ function ResourceTable({
           delete next[resourceId];
           return next;
         })}
+        onSt1Bound={(resourceId, b) => setSt1Bindings((prev) => ({ ...prev, [resourceId]: b }))}
+        onSt1Unbound={(resourceId) => setSt1Bindings((prev) => {
+          const next = { ...prev };
+          delete next[resourceId];
+          return next;
+        })}
         onMukakuBound={(resourceId, b) => setMukakuBindings((prev) => {
           const list = prev[resourceId] ?? [];
           const idx = list.findIndex((x) => x.link_id === b.link_id);
@@ -1426,6 +1811,32 @@ function ResourceTable({
             return next;
           }
           return { ...prev, [resourceId]: (prev[resourceId] ?? []).filter((x) => x.link_id !== linkId) };
+        })}
+        onJyingBound={(resourceId, b) => setJyingBindings((prev) => {
+          const list = prev[resourceId] ?? [];
+          const idx = list.findIndex((x) => x.link_id === b.link_id);
+          return { ...prev, [resourceId]: idx >= 0 ? list.map((x, i) => (i === idx ? b : x)) : [...list, b] };
+        })}
+        onJyingUnbound={(resourceId, linkId) => setJyingBindings((prev) => {
+          if (linkId == null) {
+            const next = { ...prev };
+            delete next[resourceId];
+            return next;
+          }
+          return { ...prev, [resourceId]: (prev[resourceId] ?? []).filter((x) => x.link_id !== linkId) };
+        })}
+        onHdhavenBound={(resourceId, b) => setHdhavenBindings((prev) => {
+          const list = prev[resourceId] ?? [];
+          const idx = list.findIndex((x) => x.slug === b.slug);
+          return { ...prev, [resourceId]: idx >= 0 ? list.map((x, i) => (i === idx ? b : x)) : [...list, b] };
+        })}
+        onHdhavenUnbound={(resourceId, slug) => setHdhavenBindings((prev) => {
+          if (slug == null) {
+            const next = { ...prev };
+            delete next[resourceId];
+            return next;
+          }
+          return { ...prev, [resourceId]: (prev[resourceId] ?? []).filter((x) => x.slug !== slug) };
         })}
       />
 
@@ -1444,7 +1855,6 @@ function ResourceTable({
         open={quickBindOpen}
         onOpenChange={setQuickBindOpen}
         onUpdateCurrent={handleUpdateCurrent}
-        onQueueAppend={handleQueueAppend}
       />
     </div>
   );

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Layers, Wand2, Trash2, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Layers, Wand2, Trash2, CheckCircle2, AlertTriangle, Info } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -12,7 +12,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
 import { Resource } from '@/types/index';
-import { insertResources } from '@/services/api';
+import { insertResources, fetchResourceQuota, RESOURCE_QUOTA_EXCEEDED_CODE } from '@/services/api';
 import { parseMultipleResources, type ParsedResource } from '@/lib/parse';
 
 interface BatchImportDialogProps {
@@ -31,6 +31,8 @@ export default function BatchImportDialog({
   const [rawText, setRawText] = useState('');
   const [parsed, setParsed] = useState<ParsedResource[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  // 资源配额（非管理员上限，管理员为 null 表示不限制）
+  const [quota, setQuota] = useState<{ isAdmin: boolean; used: number; limit: number } | null>(null);
 
   useEffect(() => {
     if (!open) {
@@ -38,6 +40,19 @@ export default function BatchImportDialog({
       setParsed([]);
     }
   }, [open]);
+
+  // 打开弹窗时拉取配额，提前展示剩余额度（管理员不展示）
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    fetchResourceQuota()
+      .then((q) => { if (!cancelled) setQuota(q); })
+      .catch(() => { if (!cancelled) setQuota(null); });
+    return () => { cancelled = true; };
+  }, [open]);
+
+  /** 非管理员剩余可导入条数（管理员为 null，表示不限制） */
+  const remaining = quota && !quota.isAdmin ? Math.max(quota.limit - quota.used, 0) : null;
 
   function handleParse() {
     if (!rawText.trim()) {
@@ -49,7 +64,7 @@ export default function BatchImportDialog({
     if (result.length > 0) {
       toast.success(`已解析出 ${result.length} 条资源`);
     } else {
-      toast.info('未能解析出资源，请检查文本格式');
+      toast.info('未能解析出资源，请检查格式');
     }
   }
 
@@ -69,15 +84,24 @@ export default function BatchImportDialog({
       toast.error('没有可导入的资源，请先解析或填写资源名称');
       return;
     }
+    // 非管理员配额预检：超出剩余额度直接拦下，不发请求
+    if (remaining !== null && valid.length > remaining) {
+      toast.error(
+        `非管理员账号最多 ${quota?.limit ?? 0} 条资源，当前已有 ${quota?.used ?? 0} 条，最多还可导入 ${remaining} 条（本次 ${valid.length} 条）`
+      );
+      return;
+    }
     setSubmitting(true);
     try {
-      const items = valid.map((p, i) => ({
+      const items = valid.map((p) => ({
         name: p.name.trim(),
         episode_count: Number(p.episode_count) || 0,
         link: p.links[0]?.url ?? p.link.trim(),
         links: p.links.length > 0 ? p.links : (p.link.trim() ? [{ url: p.link.trim(), pan_name: '' }] : []),
         sort_order: 0,
+        // 文本解析不含封面与完结状态，统一给默认值
         cover_url: null,
+        is_finished: false,
       }));
       const results = await insertResources(items);
       if (results.length > 0) {
@@ -87,8 +111,9 @@ export default function BatchImportDialog({
         setParsed([]);
         onOpenChange(false);
       }
-    } catch {
-      toast.error('导入失败，请重试');
+    } catch (err) {
+      const e = err as Error & { code?: string };
+      toast.error(e.code === RESOURCE_QUOTA_EXCEEDED_CODE ? e.message : '导入失败，请重试');
     } finally {
       setSubmitting(false);
     }
@@ -108,10 +133,18 @@ export default function BatchImportDialog({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 min-h-0 flex-1 overflow-hidden">
+          {/* 非管理员配额提示 */}
+          {remaining !== null && (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0">
+              <Info className="h-3 w-3 shrink-0" />
+              非管理员账号最多 {quota?.limit} 条资源：当前已有 {quota?.used} 条，还可导入 {remaining} 条
+            </div>
+          )}
+
           {/* 粘贴区 */}
           <div className="shrink-0 space-y-2">
             <div className="flex items-center gap-1.5">
-              <Wand2 className="h-3.5 w-3.5 text-primary" />
+              <Wand2 className="h-3.5 w-3.5 text-primary shrink-0" />
               <span className="text-xs text-muted-foreground">
                 粘贴多行资源文本，每条资源以「链接：」行或链接结尾分隔，点击下方按钮自动解析
               </span>

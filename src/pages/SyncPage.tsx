@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-  RefreshCw, Link2, Unlink, Loader2, Pencil, Trash2, UploadCloud, Info, Tv2, Drama,
-  User, Award, CalendarCheck, HardDrive, Star, LogIn,
+  RefreshCw, Link2, Unlink, Loader2, Pencil, Trash2, UploadCloud, Info, Tv2,
+  HardDrive, LogIn, ShieldAlert, Save, ShieldCheck, Radio,
 } from 'lucide-react';
 import AppLayout from '@/components/layouts/AppLayout';
 import PageMeta from '@/components/common/PageMeta';
@@ -15,7 +15,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -23,15 +23,12 @@ import {
 } from '@/components/ui/alert-dialog';
 import { toast } from 'sonner';
 import {
-  getPinglianBinding, loginPinglian, unbindPinglian,
+  getPinglianBinding, loginPinglian, unbindPinglian, fetchPinglianCaptcha, bindPinglianByCookie,
   loadPanLinks, updatePanLink, deletePanLink,
   getXnBinding, bindXnCookie, unbindXn,
   loadXnShares, editXnShare, delXnShare,
   XN_COOKIE_EXPIRED_CODE,
-  getYaBinding, bindYaAccount, unbindYa,
-  fetchYaShareRecords, yaGetAccountStatus,
-  YA_EXPIRED_CODE,
-  getFramehdrBinding, bindFramehdrCookie, unbindFramehdr, loginFramehdr,
+  getFramehdrBinding, unbindFramehdr, loginFramehdr,
   loadFramehdrLinks, editFramehdrLink, deleteFramehdrLink,
   FRAMEHDR_COOKIE_EXPIRED_CODE,
   getPanfxBinding, bindPanfxCookie, unbindPanfx, loadPanfxPosts,
@@ -40,14 +37,54 @@ import {
   fetchMukakuResources, searchMukakuMovies, getMukakuMovieDetail,
   addMukakuResource, updateMukakuResource, deleteMukakuResource,
   MUKAKU_TOKEN_EXPIRED_CODE,
+  getJyingBinding, loginJying, unbindJying, loadJyingShares,
+  updateJyingShareLink, JYING_EXPIRED_CODE, revalidateJyingSession,
+  getHdhavenBinding, loginHdhaven, bindHdhavenCookie, unbindHdhaven, loadHdhavenShares, getHdhavenShareDetail,
+  updateHdhavenShareLink, revalidateHdhavenSession,
+  HDHAVEN_EXPIRED_CODE, HDHAVEN_TOTP_REQUIRED_CODE,
+  // 1号站点（开放 API 令牌型 + 站点账号登录）
+  getSt1Binding, bindSt1Credential, unbindSt1, checkSt1,
+  st1Categories, setSt1DefaultCategory, ST1_TOKEN_EXPIRED_CODE,
+  st1Captcha, st1Login, st1MyResources, updateSt1Resource,
+  // 盘链：同时发送到群组
+  pinglianShareTargets, getPinglianGroupPref, savePinglianGroupPref,
+  type PinglianShareGroup,
 } from '@/services/api';
+import { useHdhavenChallenge } from '@/components/HdhavenChallengeDialog';
+import BatchPostButton from '@/components/BatchPostButton';
+import { PAN_TYPE_LABELS } from '@/lib/panUtils';
+import { SITE_URLS, SITE_LABELS, siteHost, type SiteKey } from '@/lib/siteCredentials';
 import type {
-  PinglianBinding, PinglianLink, XnBinding, XnShare, YaBinding, YaLink,
-  YaAccountStatus, FramehdrBinding, FramehdrLink, PanfxBinding,
+  PinglianBinding, PinglianLink, PinglianCaptcha, XnBinding, XnShare,
+  FramehdrBinding, FramehdrLink, PanfxBinding,
   MukakuBinding, MukakuCaptcha, MukakuWpResource, MukakuMovie,
+  JyingBinding, JyingShareItem,
+  HdhavenBinding, HdhavenShareItem,
+  St1Binding,
 } from '@/types/index';
 
 const PINGLIAN_EXPIRED_CODE = 'PINGLIAN_COOKIE_EXPIRED';
+
+/**
+ * 站点网址：显示在每个「XX站点账号绑定」标题的后面。
+ * 用户要知道该开哪个站才能拿 Cookie / 登录，之前只有「不太灵」一处挂了域名。
+ */
+function SiteUrlHint({ site }: { site: SiteKey }) {
+  const url = SITE_URLS[site];
+  if (!url) return null;
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(e) => e.stopPropagation()}
+      className="rounded px-1.5 py-0.5 font-mono text-[11px] font-normal text-muted-foreground hover:text-primary hover:underline"
+      title={`打开 ${SITE_LABELS[site]}：${url}`}
+    >
+      {siteHost(url)}
+    </a>
+  );
+}
 
 function AccountStat({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
@@ -93,11 +130,148 @@ function fmtDate(iso?: string | null) {
 }
 
 // ─── 盘链标签页 ─────────────────────────────────────────────
+/**
+ * 盘链「同时发送到群组」（自包含卡片）：
+ *   · 群组来源 = 站点 GET /api/chat-groups/share-targets（带 selectable / hint 配额提示）
+ *   · 选择保存在 pinglian_sessions（sync_group_enabled / sync_group_ids）
+ *   · 开启后由 panlinks-proxy 在每次 add/update 成功后自动 POST
+ *     /api/chat-groups/{groupId}/messages/link { link_id }
+ */
+function PinglianGroupsCard({ bound }: { bound: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [groups, setGroups] = useState<PinglianShareGroup[]>([]);
+  const [enabled, setEnabled] = useState(false);
+  const [ids, setIds] = useState<string[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!bound) return;
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    Promise.all([pinglianShareTargets(), getPinglianGroupPref()])
+      .then(([t, p]) => {
+        if (cancelled) return;
+        setGroups(t.groups ?? []);
+        setEnabled(p.enabled);
+        setIds(p.ids);
+      })
+      .catch((e) => { if (!cancelled) setErr((e as Error).message || '读取群组失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [bound]);
+
+  if (!bound) return null;
+
+  const toggle = (id: string) =>
+    setIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  async function save() {
+    if (enabled && ids.length === 0) { toast.error('请至少选择一个群组'); return; }
+    setSaving(true);
+    try {
+      await savePinglianGroupPref({ enabled, ids });
+      toast.success(
+        enabled
+          ? `已开启：之后每次分享到盘链都会同步到 ${ids.length} 个群组`
+          : '已关闭「同时发送到群组」'
+      );
+    } catch (e) {
+      toast.error('保存失败：' + ((e as Error).message || ''));
+    } finally { setSaving(false); }
+  }
+
+  const pickedNames = groups.filter((g) => ids.includes(g.id)).map((g) => g.name || g.id);
+
+  return (
+    <div className="mt-4 pt-4 border-t border-border space-y-3">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="min-w-0">
+          <div className="text-sm text-foreground">同时发送到群组</div>
+          <div className="text-[11px] text-muted-foreground leading-relaxed">
+            开启后，每次把剧集<strong className="text-foreground">分享到盘链站点</strong>（含自动同步）时会同时把这条链接发到你勾选的群组。
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            variant={enabled ? 'default' : 'outline'} size="sm"
+            onClick={() => setEnabled((v) => !v)}
+            className={`h-8 gap-1.5 ${enabled
+              ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+              : 'border-border text-muted-foreground hover:text-foreground hover:bg-muted'}`}>
+            {enabled ? '已开启' : '已关闭'}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setOpen((v) => !v)}
+            className="h-8 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+            {open ? '收起' : '选择群组'}{ids.length > 0 ? `（${ids.length}）` : ''}
+          </Button>
+          <Button size="sm" onClick={save} disabled={saving}
+            className="h-8 gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90">
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存
+          </Button>
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="text-[11px] text-muted-foreground">正在读取可同步群组…</p>
+      ) : err ? (
+        <p className="text-[11px] text-destructive">{err}</p>
+      ) : open ? (
+        groups.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground">站点没有返回可同步的群组（请先在盘链加入群组再试）。</p>
+        ) : (
+          <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+            {groups.map((g) => {
+              const checked = ids.includes(g.id);
+              const disabled = g.selectable === false;
+              return (
+                <button
+                  key={g.id} type="button" disabled={disabled} onClick={() => toggle(g.id)}
+                  className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${checked
+                    ? 'border-primary/50 bg-primary/10'
+                    : 'border-border hover:bg-muted/40'} ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                  <div className="flex items-center gap-2">
+                    {checked
+                      ? <span className="h-3.5 w-3.5 rounded-full border-2 border-primary bg-primary/30 shrink-0" />
+                      : <span className="h-3.5 w-3.5 rounded-full border border-border shrink-0" />}
+                    <span className="text-xs text-foreground truncate">{g.name || `群组 ${g.id}`}</span>
+                    {g.is_official && (
+                      <span className="text-[10px] px-1 rounded bg-muted text-muted-foreground shrink-0">官方</span>
+                    )}
+                  </div>
+                  {g.hint && <div className="text-[10px] text-muted-foreground mt-0.5 pl-5">{g.hint}</div>}
+                </button>
+              );
+            })}
+          </div>
+        )
+      ) : ids.length > 0 ? (
+        <p className="text-[11px] text-muted-foreground">
+          已选 {ids.length} 个群组：{pickedNames.join('、') || ids.join('、')}
+        </p>
+      ) : (
+        <p className="text-[11px] text-muted-foreground">
+          点「选择群组」勾选要同步的群，保存后每次分享到盘链都会自动发到这些群。
+        </p>
+      )}
+    </div>
+  );
+}
+
 function PinglianTab() {
   const [binding, setBinding] = useState<PinglianBinding | null>(null);
   const [bindingLoading, setBindingLoading] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  // 图形验证码（站点 2026-09-27 起登录前置）
+  const [captchaCode, setCaptchaCode] = useState('');
+  const [captchaData, setCaptchaData] = useState<PinglianCaptcha | null>(null);
+  const [captchaLoading, setCaptchaLoading] = useState(false);
+  // 备用通道：直接粘贴站点 Cookie 绑定（验证码取不到时使用）
+  const [cookieInput, setCookieInput] = useState('');
+  const [showCookieFallback, setShowCookieFallback] = useState(false);
   const [binding_, setBinding_] = useState(false);
   const [links, setLinks] = useState<PinglianLink[]>([]);
   const [listLoading, setListLoading] = useState(false);
@@ -117,6 +291,20 @@ function PinglianTab() {
       setBinding(info);
     } catch { toast.error('加载绑定信息失败'); }
     finally { setBindingLoading(false); }
+  }, []);
+
+  /** 拉取盘链图形验证码（一次性，有效期约 5 分钟） */
+  const loadCaptcha = useCallback(async () => {
+    setCaptchaLoading(true);
+    try {
+      const c = await fetchPinglianCaptcha();
+      setCaptchaData(c);
+      setCaptchaCode('');
+    } catch (e) {
+      toast.error((e as Error).message || '获取图形验证码失败，请重试');
+    } finally {
+      setCaptchaLoading(false);
+    }
   }, []);
 
   const loadLinks = useCallback(async () => {
@@ -140,18 +328,43 @@ function PinglianTab() {
     if (binding?.status === 'active') loadLinks();
     else setLinks([]);
   }, [binding?.status, loadLinks]);
+  // 未绑定 / 已过期时才需要验证码（绑定正常时不再拉取）
+  useEffect(() => {
+    if (binding?.status !== 'active') void loadCaptcha();
+  }, [binding?.status, loadCaptcha]);
 
   async function handleBind() {
     if (!username.trim() || !password) { toast.error('请输入盘链账号和密码'); return; }
+    if (!captchaData?.id) { toast.error('图形验证码尚未就绪，请点击图片刷新'); void loadCaptcha(); return; }
+    if (!captchaCode.trim()) { toast.error('请输入图形验证码'); return; }
     setBinding_(true);
     try {
-      await loginPinglian(username.trim(), password);
+      await loginPinglian(username.trim(), password, captchaData.id, captchaCode.trim());
       toast.success('盘链账号登录成功，资源更新时将自动同步');
+      setUsername('');
+      setPassword('');
+      setCaptchaCode('');
+      await loadBinding();
+    } catch (e) {
+      toast.error((e as Error).message || '登录失败，请检查账号密码');
+      // 验证码一次性有效：任何登录失败都换一张，避免重复提交同一张
+      void loadCaptcha();
+    } finally { setBinding_(false); }
+  }
+
+  /** 备用绑定：粘贴浏览器里的整串 Cookie（含 HttpOnly 的 admin_session） */
+  async function handleBindByCookie() {
+    if (!cookieInput.trim()) { toast.error('请粘贴盘链站点 Cookie'); return; }
+    setBinding_(true);
+    try {
+      await bindPinglianByCookie(cookieInput.trim(), username.trim() || undefined);
+      toast.success('盘链账号绑定成功（Cookie 方式）');
+      setCookieInput('');
       setUsername('');
       setPassword('');
       await loadBinding();
     } catch (e) {
-      toast.error((e as Error).message || '登录失败，请检查账号密码');
+      toast.error((e as Error).message || '绑定失败，请检查 Cookie 是否正确');
     } finally { setBinding_(false); }
   }
 
@@ -226,6 +439,7 @@ function PinglianTab() {
           <div className="flex items-center gap-2">
             <Link2 className="h-4 w-4 text-primary shrink-0" />
             <h2 className="font-serif text-base font-bold text-foreground">盘链账号绑定</h2>
+            <SiteUrlHint site="pinglian" />
           </div>
           {bindingLoading ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -273,8 +487,71 @@ function PinglianTab() {
               />
             </div>
           </div>
+          <div className="space-y-1.5">
+            <Label className="text-sm text-foreground">图形验证码</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                value={captchaCode}
+                onChange={(e) => setCaptchaCode(e.target.value)}
+                placeholder="输入图片中的字符"
+                autoComplete="off"
+                disabled={binding_}
+                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40 flex-1"
+              />
+              <div
+                onClick={() => { if (!captchaLoading) void loadCaptcha(); }}
+                title="点击刷新验证码"
+                className="h-9 w-32 px-1 rounded-md border border-border bg-background flex items-center justify-center cursor-pointer hover:border-primary transition-colors shrink-0 overflow-hidden"
+              >
+                {captchaLoading ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                ) : captchaData?.image ? (
+                  <img src={captchaData.image} alt="图形验证码" className="h-8 w-auto object-contain" />
+                ) : (
+                  <span className="text-[11px] text-muted-foreground flex items-center gap-1">
+                    <RefreshCw className="h-3 w-3" /> 点击加载
+                  </span>
+                )}
+              </div>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              pinglian.lol 登录已启用图形验证码，有效期约 5 分钟；验证码错误或登录失败会自动换一张。
+            </p>
+          </div>
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setShowCookieFallback((v) => !v)}
+              className="text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2"
+            >
+              {showCookieFallback ? '收起备用方式' : '验证码加载不出来？改用 Cookie 绑定'}
+            </button>
+            {showCookieFallback && (
+              <div className="space-y-2">
+                <Textarea
+                  value={cookieInput}
+                  onChange={(e) => setCookieInput(e.target.value)}
+                  placeholder="粘贴整串 Cookie（须含 HttpOnly 的 admin_session=…）"
+                  className="min-h-20 px-3 text-xs bg-input border-border focus-visible:ring-primary/40 font-mono"
+                />
+                <Button
+                  variant="outline"
+                  onClick={handleBindByCookie}
+                  disabled={binding_}
+                  className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5"
+                >
+                  {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <Link2 className="h-4 w-4" />}
+                  用 Cookie 绑定
+                </Button>
+                <p className="text-[11px] text-muted-foreground">
+                  浏览器登录 pinglian.lol → F12 → Network → 刷新页面 → 任意请求的 Request Headers →
+                  复制完整 Cookie（admin_session 为 HttpOnly，document.cookie 读不到）。上方「盘链账号」会作为账号名保存。
+                </p>
+              </div>
+            )}
+          </div>
           <div className="flex items-center gap-2 flex-wrap">
-            <Button onClick={handleBind} disabled={binding_}
+            <Button onClick={handleBind} disabled={binding_ || captchaLoading}
               className="h-9 bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
               {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
               {isBound || isExpired ? '重新登录' : '登录绑定'}
@@ -285,12 +562,18 @@ function PinglianTab() {
                 <Unlink className="h-4 w-4" />解绑
               </Button>
             )}
+            <BatchPostButton site="pinglian" disabled={binding_} />
           </div>
         </div>
         <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
           <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-          <span>输入你在 pinglian.lol 的<strong>账号和密码</strong>即可完成绑定，服务端会安全地模拟登录并保存会话，<strong>密码不会落库</strong>。会话过期后只需重新输入密码登录一次即可恢复。</span>
+          <span>输入你在 pinglian.lol 的<strong>账号、密码和图形验证码</strong>即可完成绑定，服务端会安全地模拟登录并保存会话，<strong>密码不会落库</strong>。会话过期后只需重新登录一次即可恢复。</span>
         </div>
+      </div>
+
+      {/* 同时发送到群组（盘链）*/}
+      <div className="rounded-xl border border-border bg-card p-4 md:p-6">
+        <PinglianGroupsCard bound={isBound} />
       </div>
 
       {/* 发布记录区 */}
@@ -315,26 +598,56 @@ function PinglianTab() {
             <div className="py-16 text-center text-sm text-muted-foreground">暂无发布记录</div>
           ) : (
             <div className="w-full max-w-full overflow-x-auto bg-card">
-              <table className="w-full min-w-max text-sm">
+              <table className="w-full table-fixed text-sm md:table-auto md:min-w-max">
                 <thead>
                   <tr className="border-b border-border bg-card">
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-48">标题</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-16">网盘</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-40">链接</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">更新时间</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap">操作</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:min-w-48">标题</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell md:min-w-16">网盘</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell md:min-w-40">链接</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">更新时间</th>
+                    <th className="hidden px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   {links.map((link) => (
                     <tr key={link.id} className="border-b border-border/50 hover:bg-muted/20">
-                      <td className="px-4 py-3 whitespace-nowrap font-medium text-foreground max-w-xs truncate">{link.title || '—'}</td>
-                      <td className="px-4 py-3 whitespace-nowrap">
+                      <td className="px-4 py-3 font-medium text-foreground break-words md:max-w-xs md:truncate md:whitespace-nowrap">
+                        {link.title || '—'}
+                        {/* 手机端：网盘 / 链接 / 更新时间折到标题下方，不必横向滚动看半截表格 */}
+                        <div className="mt-1.5 space-y-1 md:hidden">
+                          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge variant="secondary" className="bg-muted text-muted-foreground border-0 text-[10px] h-4 px-1.5">
+                                {PAN_TYPES.find((t) => t.value === link.pan_type)?.label ?? link.pan_type}
+                              </Badge>
+                              <span className="text-[11px] font-normal text-muted-foreground">{fmtDate(link.updated_at)}</span>
+                            </div>
+                            {/* 手机端：操作跟在信息行右端，不单独占一列空着 */}
+                            <div className="flex items-center gap-1">
+                              <Button variant="ghost" size="sm" onClick={() => openEdit(link)}
+                                className="h-7 px-2 text-xs font-normal text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
+                                <Pencil className="h-3.5 w-3.5" />修改
+                              </Button>
+                              <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(link)}
+                                className="h-7 px-2 text-xs font-normal text-destructive hover:text-destructive hover:bg-muted">
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                          {link.url ? (
+                            <a href={link.url} target="_blank" rel="noreferrer"
+                              className="block break-all text-[11px] font-normal text-primary hover:underline">
+                              {link.url}
+                            </a>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td className="hidden px-4 py-3 whitespace-nowrap md:table-cell">
                         <Badge variant="secondary" className="bg-muted text-muted-foreground border-0 text-xs">
                           {PAN_TYPES.find((t) => t.value === link.pan_type)?.label ?? link.pan_type}
                         </Badge>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap max-w-xs">
+                      <td className="hidden px-4 py-3 whitespace-nowrap max-w-xs md:table-cell">
                         {link.url ? (
                           <a href={link.url} target="_blank" rel="noreferrer"
                             className="text-xs text-primary hover:underline truncate inline-block max-w-[200px] align-bottom">
@@ -342,8 +655,8 @@ function PinglianTab() {
                           </a>
                         ) : '—'}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">{fmtDate(link.updated_at)}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-right">
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">{fmtDate(link.updated_at)}</td>
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-right md:table-cell">
                         <div className="flex justify-end gap-1.5">
                           <Button variant="ghost" size="sm" onClick={() => openEdit(link)}
                             className="h-7 text-xs text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
@@ -366,7 +679,7 @@ function PinglianTab() {
 
       {/* 编辑弹窗 */}
       <Dialog open={!!editTarget} onOpenChange={(o) => !o && setEditTarget(null)}>
-        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg bg-card border-border">
+        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg max-h-[90dvh] overflow-y-auto bg-card border-border">
           <DialogHeader><DialogTitle>修改发布记录</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
@@ -567,6 +880,7 @@ function XnSiteTab() {
           <div className="flex items-center gap-2">
             <Tv2 className="h-4 w-4 text-primary shrink-0" />
             <h2 className="font-serif text-base font-bold text-foreground">观影站点账号绑定</h2>
+            <SiteUrlHint site="xn" />
           </div>
           {bindingLoading ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -618,6 +932,7 @@ function XnSiteTab() {
                 <Unlink className="h-4 w-4" />解绑
               </Button>
             )}
+            <BatchPostButton site="xnsite" disabled={binding_} />
           </div>
         </div>
         <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
@@ -672,27 +987,57 @@ function XnSiteTab() {
             <div className="py-16 text-center text-sm text-muted-foreground">暂无分享记录</div>
           ) : (
             <div className="w-full max-w-full overflow-x-auto bg-card">
-              <table className="w-full min-w-max text-sm">
+              <table className="w-full table-fixed text-sm md:table-auto md:min-w-max">
                 <thead>
                   <tr className="border-b border-border bg-card">
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-48">标题</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">绑定作品</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-40">链接</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">发布时间</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">状态</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap">操作</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:min-w-48">标题</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">绑定作品</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell md:min-w-40">链接</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">发布时间</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">状态</th>
+                    <th className="hidden px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   {shares.map((share) => (
                     <tr key={share.id} className="border-b border-border/50 hover:bg-muted/20">
-                      <td className="px-4 py-3 whitespace-nowrap font-medium text-foreground max-w-xs truncate">
+                      <td className="px-4 py-3 font-medium text-foreground break-words md:max-w-xs md:truncate md:whitespace-nowrap">
                         {share.title || '—'}
+                        {/* 手机端：绑定作品 / 状态 / 链接 / 时间折到标题下方 */}
+                        <div className="mt-1.5 space-y-1 md:hidden">
+                          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] font-normal text-muted-foreground">
+                              <span>{share.tname || share.atitle || '—'}</span>
+                              <Badge variant="secondary"
+                                className={`text-[10px] h-4 px-1.5 border-0 ${share.status === 1 ? 'bg-secondary/15 text-secondary' : 'bg-muted text-muted-foreground'}`}>
+                                {share.status === 1 ? '开启' : '关闭'}
+                              </Badge>
+                              <span>{share.time || '—'}</span>
+                            </div>
+                            {/* 手机端：操作跟在信息行右端，不单独占一列空着 */}
+                            <div className="flex items-center gap-1">
+                              <Button variant="ghost" size="sm" onClick={() => openEdit(share)}
+                                className="h-7 px-2 text-xs font-normal text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
+                                <Pencil className="h-3.5 w-3.5" />修改
+                              </Button>
+                              <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(share)}
+                                className="h-7 px-2 text-xs font-normal text-destructive hover:text-destructive hover:bg-muted">
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                          {share.url ? (
+                            <a href={share.url} target="_blank" rel="noreferrer"
+                              className="block break-all text-[11px] font-normal text-primary hover:underline">
+                              {share.url}
+                            </a>
+                          ) : null}
+                        </div>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">
                         {share.tname || share.atitle || '—'}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap max-w-xs">
+                      <td className="hidden px-4 py-3 whitespace-nowrap max-w-xs md:table-cell">
                         {share.url ? (
                           <a href={share.url} target="_blank" rel="noreferrer"
                             className="text-xs text-primary hover:underline truncate inline-block max-w-[180px] align-bottom">
@@ -700,14 +1045,14 @@ function XnSiteTab() {
                           </a>
                         ) : '—'}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">{share.time || '—'}</td>
-                      <td className="px-4 py-3 whitespace-nowrap">
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">{share.time || '—'}</td>
+                      <td className="hidden px-4 py-3 whitespace-nowrap md:table-cell">
                         <Badge variant="secondary"
                           className={`text-xs border-0 ${share.status === 1 ? 'bg-secondary/15 text-secondary' : 'bg-muted text-muted-foreground'}`}>
                           {share.status === 1 ? '开启' : '关闭'}
                         </Badge>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-right">
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-right md:table-cell">
                         <div className="flex justify-end gap-1.5">
                           <Button variant="ghost" size="sm" onClick={() => openEdit(share)}
                             className="h-7 text-xs text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
@@ -730,7 +1075,7 @@ function XnSiteTab() {
 
       {/* 编辑弹窗 */}
       <Dialog open={!!editTarget} onOpenChange={(o) => !o && setEditTarget(null)}>
-        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg bg-card border-border">
+        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg max-h-[90dvh] overflow-y-auto bg-card border-border">
           <DialogHeader><DialogTitle>修改分享记录</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
@@ -794,256 +1139,10 @@ function XnSiteTab() {
   );
 }
 
-// ─── 鸭影臻藏标签页 ──────────────────────────────────────────
-function YaSiteTab() {
-  const [binding, setBinding] = useState<YaBinding | null>(null);
-  const [bindingLoading, setBindingLoading] = useState(true);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [remark, setRemark] = useState('');
-  const [binding_, setBinding_] = useState(false);
-
-  const [records, setRecords] = useState<{ id: string; link_title: string | null; link_url: string | null; created_at: string }[]>([]);
-  const [listLoading, setListLoading] = useState(false);
-  const [account, setAccount] = useState<YaAccountStatus | null>(null);
-
-  const loadBinding = useCallback(async () => {
-    setBindingLoading(true);
-    try {
-      const info = await getYaBinding();
-      setBinding(info);
-      if (info?.remark) setRemark(info.remark);
-    } catch { toast.error('加载鸭影臻藏绑定信息失败'); }
-    finally { setBindingLoading(false); }
-  }, []);
-
-  const loadRecords = useCallback(async () => {
-    setListLoading(true);
-    try {
-      const data = await fetchYaShareRecords();
-      setRecords(data);
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      if (err.code === YA_EXPIRED_CODE) {
-        setBinding((b) => b ? { ...b, status: 'expired' } : b);
-      }
-      toast.error(err.message || '加载分享记录失败');
-      setRecords([]);
-    } finally { setListLoading(false); }
-  }, []);
-
-  const loadAccount = useCallback(async () => {
-    try {
-      const info = await yaGetAccountStatus();
-      setAccount(info);
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      if (err.code === YA_EXPIRED_CODE) setBinding((b) => (b ? { ...b, status: 'expired' } : b));
-    }
-  }, []);
-
-  useEffect(() => { loadBinding(); }, [loadBinding]);
-  useEffect(() => { if (binding?.status === 'active') loadRecords(); }, [binding?.status, loadRecords]);
-  useEffect(() => { if (binding?.status === 'active') loadAccount(); }, [binding?.status, loadAccount]);
-
-  async function handleBind() {
-    if (!username.trim() || !password.trim()) { toast.error('请填写鸭影臻藏站点账号和密码'); return; }
-    setBinding_(true);
-    try {
-      await bindYaAccount(username.trim(), password.trim(), remark.trim());
-      toast.success('绑定成功');
-      setUsername('');
-      setPassword('');
-      await loadBinding();
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      toast.error(err.code === YA_EXPIRED_CODE ? '账号或密码错误，或登录已失效' : '绑定失败，请检查账号密码');
-    } finally { setBinding_(false); }
-  }
-
-  async function handleUnbind() {
-    setBinding_(true);
-    try {
-      await unbindYa();
-      toast.success('已解绑');
-      setBinding(null);
-      setRecords([]);
-      setAccount(null);
-    } catch { toast.error('解绑失败'); }
-    finally { setBinding_(false); }
-  }
-
-  const isBound = binding?.status === 'active';
-  const isExpired = binding?.status === 'expired';
-
-  return (
-    <div className="space-y-6">
-      {/* 绑定区 */}
-      <div className="rounded-xl border border-border bg-card p-4 md:p-6">
-        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
-            <Drama className="h-4 w-4 text-primary shrink-0" />
-            <h2 className="font-serif text-base font-bold text-foreground">鸭影臻藏站点账号绑定</h2>
-          </div>
-          {bindingLoading ? (
-            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-          ) : isBound ? (
-            <Badge className="bg-secondary/15 text-secondary border-0 hover:bg-secondary/15">已绑定 · 正常</Badge>
-          ) : isExpired ? (
-            <Badge className="bg-destructive/15 text-destructive border-0 hover:bg-destructive/15">已过期</Badge>
-          ) : (
-            <Badge variant="secondary" className="bg-muted text-muted-foreground border-0">未绑定</Badge>
-          )}
-        </div>
-
-        {isBound && (
-          <div className="mb-4 p-3 rounded-lg bg-muted/60 text-xs text-muted-foreground">
-            鸭影臻藏站点凭证正常（最近检测：{fmtDate(binding?.last_check_at)}）
-            {binding?.remark && <span className="ml-2">备注：{binding.remark}</span>}
-          </div>
-        )}
-        {isExpired && (
-          <div className="mb-4 p-3 rounded-lg bg-destructive/10 text-xs text-destructive">
-            鸭影臻藏站点凭证已失效，请重新登录站点获取新凭证并粘贴绑定。
-          </div>
-        )}
-
-        <div className="space-y-3">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">鸭影臻藏站点账号</Label>
-              <Input value={username} onChange={(e) => setUsername(e.target.value)}
-                placeholder="鸭影臻藏站点用户名"
-                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40" />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">密码</Label>
-              <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                placeholder="鸭影臻藏站点登录密码"
-                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40" />
-            </div>
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-sm text-foreground">备注（可选）</Label>
-            <Input value={remark} onChange={(e) => setRemark(e.target.value)} placeholder="如：主账号"
-              className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40" />
-          </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <Button onClick={handleBind} disabled={binding_}
-              className="h-9 bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
-              {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <Link2 className="h-4 w-4" />}
-              {isBound || isExpired ? '重新绑定' : '绑定账号'}
-            </Button>
-            {(isBound || isExpired) && (
-              <Button variant="outline" onClick={handleUnbind} disabled={binding_}
-                className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
-                <Unlink className="h-4 w-4" />解绑
-              </Button>
-            )}
-          </div>
-        </div>
-        <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
-          <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-          <span>绑定后，下方将展示该账号所分享的网盘资源记录与账号信息；账号密码仅用于服务端登录，不会暴露给浏览器。</span>
-        </div>
-      </div>
-
-      {/* 账号信息（我的网盘统计 / 追更） */}
-      {isBound && account && (
-        <div className="rounded-xl border border-border bg-card p-4 md:p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <User className="h-4 w-4 text-primary shrink-0" />
-            <h2 className="font-serif text-base font-bold text-foreground">账号信息</h2>
-            {account.member_level_label && (
-              <Badge className="bg-secondary/15 text-secondary border-0 hover:bg-secondary/15">{account.member_level_label}</Badge>
-            )}
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
-            <AccountStat icon={<User className="h-3 w-3" />} label="用户名" value={account.username ?? '—'} />
-            <AccountStat icon={<Award className="h-3 w-3" />} label="积分" value={String(account.points ?? 0)} />
-            <AccountStat icon={<CalendarCheck className="h-3 w-3" />} label="连续签到" value={`${account.consecutive_check_ins ?? 0} 天`} />
-            <AccountStat icon={<Star className="h-3 w-3" />} label="最近签到" value={account.last_check_in ?? '—'} />
-          </div>
-          <div className="grid grid-cols-3 gap-3 mb-4">
-            <AccountStat icon={<HardDrive className="h-3 w-3" />} label="网盘总数" value={String(account.pan_stats?.total_drive ?? 0)} />
-            <AccountStat icon={<HardDrive className="h-3 w-3" />} label="磁力总数" value={String(account.pan_stats?.total_magnet ?? 0)} />
-            <AccountStat icon={<HardDrive className="h-3 w-3" />} label="今日发布" value={String(account.pan_stats?.today_drive ?? 0)} />
-          </div>
-          {account.tracking && account.tracking.length > 0 && (
-            <div>
-              <p className="text-xs font-medium text-muted-foreground mb-2">我的追更</p>
-              <div className="flex flex-wrap gap-2">
-                {account.tracking.map((t) => (
-                  <Badge key={t.video_id} variant="secondary" className="bg-muted text-muted-foreground border-0 gap-1">
-                    <span className="truncate max-w-40">{t.title}</span>
-                    {t.update_day && <span className="text-[10px] opacity-70 shrink-0">{t.update_day}</span>}
-                  </Badge>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 网盘分享记录 */}
-      {isBound && (
-        <div className="rounded-xl border border-border bg-card overflow-hidden">
-          <div className="flex items-center justify-between px-4 md:px-6 py-4 border-b border-border gap-3 flex-wrap">
-            <div className="flex items-center gap-2 min-w-0">
-              <UploadCloud className="h-4 w-4 text-muted-foreground shrink-0" />
-              <h2 className="font-serif text-base font-bold text-foreground">网盘分享记录</h2>
-              <span className="text-xs text-muted-foreground">{records.length} 条</span>
-            </div>
-            <Button variant="ghost" size="sm" onClick={loadRecords} disabled={listLoading}
-              className="h-8 text-xs text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
-              <RefreshCw className={`h-3.5 w-3.5 ${listLoading ? 'animate-spin' : ''}`} />刷新
-            </Button>
-          </div>
-
-          {listLoading ? (
-            <div className="py-16 text-center text-sm text-muted-foreground">
-              <Loader2 className="h-5 w-5 animate-spin inline mr-2" />加载中…
-            </div>
-          ) : records.length === 0 ? (
-            <div className="py-16 text-center text-sm text-muted-foreground">暂无网盘分享记录</div>
-          ) : (
-            <div className="w-full max-w-full overflow-x-auto bg-card">
-              <table className="w-full min-w-max text-sm">
-                <thead>
-                  <tr className="border-b border-border bg-card">
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-48">资源名称</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-40">资源链接</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {records.map((rec) => (
-                    <tr key={rec.id} className="border-b border-border/50 hover:bg-muted/20">
-                      <td className="px-4 py-3 whitespace-nowrap font-medium text-foreground max-w-xs truncate">{rec.link_title || '—'}</td>
-                      <td className="px-4 py-3 whitespace-nowrap max-w-xs">
-                        {rec.link_url ? (
-                          <a href={rec.link_url} target="_blank" rel="noreferrer"
-                            className="text-xs text-primary hover:underline truncate inline-block max-w-[200px] align-bottom">
-                            {rec.link_url}
-                          </a>
-                        ) : '—'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ─── 帧影站点标签页 ──────────────────────────────────────────
 function FramehdrSiteTab() {
   const [binding, setBinding] = useState<FramehdrBinding | null>(null);
   const [bindingLoading, setBindingLoading] = useState(true);
-  const [cookie, setCookie] = useState('');
   const [remark, setRemark] = useState('');
   const [binding_, setBinding_] = useState(false);
   const [username, setUsername] = useState('');
@@ -1062,7 +1161,7 @@ function FramehdrSiteTab() {
   const [deleting, setDeleting] = useState(false);
 
   const handleExpired = useCallback(() => {
-    toast.error('帧影站点登录已过期，请重新绑定 Cookie');
+    toast.error('帧影站点登录已过期，请重新登录');
     setBinding((b) => b ? { ...b, status: 'expired' } : b);
   }, []);
 
@@ -1094,18 +1193,6 @@ function FramehdrSiteTab() {
     else setLinks([]);
   }, [binding?.status, loadLinks]);
 
-  async function handleBind() {
-    if (!cookie.trim()) { toast.error('请粘贴帧影站点 Cookie'); return; }
-    setBinding_(true);
-    try {
-      await bindFramehdrCookie(cookie.trim(), remark.trim());
-      toast.success('绑定成功');
-      setCookie('');
-      await loadBinding();
-    } catch { toast.error('绑定失败，请检查 Cookie 是否正确'); }
-    finally { setBinding_(false); }
-  }
-
   async function handleLogin() {
     if (!username.trim() || !password) { toast.error('请输入帧影账号和密码'); return; }
     setLoggingIn(true);
@@ -1115,6 +1202,9 @@ function FramehdrSiteTab() {
       setUsername('');
       setPassword('');
       await loadBinding();
+      // 重新登录时 binding.status 仍是 active，上面的 useEffect 依赖未变化不会触发，
+      // 这里显式刷新一次发布记录，避免「已登录但列表不更新」
+      await loadLinks();
     } catch (e) {
       toast.error((e as Error).message || '登录失败，请检查账号密码');
     } finally { setLoggingIn(false); }
@@ -1187,6 +1277,7 @@ function FramehdrSiteTab() {
           <div className="flex items-center gap-2">
             <Link2 className="h-4 w-4 text-primary shrink-0" />
             <h2 className="font-serif text-base font-bold text-foreground">帧影站点账号绑定</h2>
+            <SiteUrlHint site="framehdr" />
           </div>
           {bindingLoading ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -1207,23 +1298,12 @@ function FramehdrSiteTab() {
         )}
         {isExpired && (
           <div className="mb-4 p-3 rounded-lg bg-destructive/10 text-xs text-destructive">
-            帧影站点登录已过期，请重新粘贴 Cookie 绑定。
+            帧影站点登录已过期，请重新登录。
           </div>
         )}
 
-        <Tabs defaultValue="password" className="w-full">
-          <TabsList className="w-full bg-muted border border-border h-9 mb-3">
-            <TabsTrigger value="password"
-              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
-              账号密码登录（推荐）
-            </TabsTrigger>
-            <TabsTrigger value="cookie"
-              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
-              手动粘贴 Cookie
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="password" className="mt-0">
-            <div className="space-y-3">
+        <div className="w-full">
+          <div className="space-y-3">
               <div className="space-y-1.5">
                 <Label className="text-sm text-foreground">帧影账号</Label>
                 <Input
@@ -1256,52 +1336,13 @@ function FramehdrSiteTab() {
                     <Unlink className="h-4 w-4" />解绑
                   </Button>
                 )}
+                <BatchPostButton site="framehdr" disabled={binding_} />
               </div>
               <p className="text-[11px] text-muted-foreground leading-relaxed">
                 服务端模拟登录帧影站点并保存会话，密码不会保存到数据库。若连续失败 5 次账号会被锁定。
               </p>
             </div>
-          </TabsContent>
-          <TabsContent value="cookie" className="mt-0">
-            <div className="space-y-3">
-              <div className="space-y-1.5">
-                <Label className="text-sm text-foreground">帧影站点 Cookie</Label>
-                <Textarea
-                  value={cookie}
-                  onChange={(e) => setCookie(e.target.value)}
-                  placeholder="粘贴 framehdr.com 的完整 Cookie（含 wangpan_session 等 HttpOnly 项）"
-                  className="min-h-20 px-3 text-xs bg-input border-border focus-visible:ring-primary/40 font-mono"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-sm text-foreground">备注（可选）</Label>
-                <Input
-                  value={remark}
-                  onChange={(e) => setRemark(e.target.value)}
-                  placeholder="如：主账号"
-                  className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
-                />
-              </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <Button onClick={handleBind} disabled={binding_}
-                  className="h-9 bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
-                  {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <Link2 className="h-4 w-4" />}
-                  {isBound || isExpired ? '重新绑定' : '绑定账号'}
-                </Button>
-                {(isBound || isExpired) && (
-                  <Button variant="outline" onClick={handleUnbind} disabled={binding_}
-                    className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
-                    <Unlink className="h-4 w-4" />解绑
-                  </Button>
-                )}
-              </div>
-            </div>
-          </TabsContent>
-        </Tabs>
-        <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
-          <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-          <span>获取 Cookie：Chrome 打开 framehdr.com 登录 → F12 → Network → 刷新 → 点击任意 /user/ 请求 → Headers → Request Headers → 复制完整 Cookie（必须含 HttpOnly 项，document.cookie 读不到）。</span>
-        </div>
+          </div>
       </div>
 
       {/* 发布记录区 */}
@@ -1326,26 +1367,56 @@ function FramehdrSiteTab() {
             <div className="py-16 text-center text-sm text-muted-foreground">暂无发布记录</div>
           ) : (
             <div className="w-full max-w-full overflow-x-auto bg-card">
-              <table className="w-full min-w-max text-sm">
+              <table className="w-full table-fixed text-sm md:table-auto md:min-w-max">
                 <thead>
                   <tr className="border-b border-border bg-card">
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-48">标题</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-24">网盘</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-40">链接</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">发布时间</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap">操作</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:min-w-48">标题</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell md:min-w-24">网盘</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell md:min-w-40">链接</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">发布时间</th>
+                    <th className="hidden px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   {links.map((link) => (
                     <tr key={link.id} className="border-b border-border/50 hover:bg-muted/20">
-                      <td className="px-4 py-3 whitespace-nowrap font-medium text-foreground max-w-xs truncate">{link.title || '—'}</td>
-                      <td className="px-4 py-3 whitespace-nowrap">
+                      <td className="px-4 py-3 font-medium text-foreground break-words md:max-w-xs md:truncate md:whitespace-nowrap">
+                        {link.title || '—'}
+                        {/* 手机端：网盘 / 链接 / 发布时间折到标题下方 */}
+                        <div className="mt-1.5 space-y-1 md:hidden">
+                          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge variant="secondary" className="bg-muted text-muted-foreground border-0 text-[10px] h-4 px-1.5">
+                                {link.drive_name || '—'}
+                              </Badge>
+                              <span className="text-[11px] font-normal text-muted-foreground">{link.created_at ?? '—'}</span>
+                            </div>
+                            {/* 手机端：操作跟在信息行右端，不单独占一列空着 */}
+                            <div className="flex items-center gap-1">
+                              <Button variant="ghost" size="sm" onClick={() => openEdit(link)}
+                                className="h-7 px-2 text-xs font-normal text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
+                                <Pencil className="h-3.5 w-3.5" />修改
+                              </Button>
+                              <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(link)}
+                                className="h-7 px-2 text-xs font-normal text-destructive hover:text-destructive hover:bg-muted">
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                          {link.url ? (
+                            <a href={link.url} target="_blank" rel="noreferrer"
+                              className="block break-all text-[11px] font-normal text-primary hover:underline">
+                              {link.url}
+                            </a>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td className="hidden px-4 py-3 whitespace-nowrap md:table-cell">
                         <Badge variant="secondary" className="bg-muted text-muted-foreground border-0 text-xs">
                           {link.drive_name || '—'}
                         </Badge>
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap max-w-xs">
+                      <td className="hidden px-4 py-3 whitespace-nowrap max-w-xs md:table-cell">
                         {link.url ? (
                           <a href={link.url} target="_blank" rel="noreferrer"
                             className="text-xs text-primary hover:underline truncate inline-block max-w-[200px] align-bottom">
@@ -1353,8 +1424,8 @@ function FramehdrSiteTab() {
                           </a>
                         ) : '—'}
                       </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">{link.created_at ?? '—'}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-right">
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">{link.created_at ?? '—'}</td>
+                      <td className="hidden px-4 py-3 whitespace-nowrap text-right md:table-cell">
                         <div className="flex justify-end gap-1.5">
                           <Button variant="ghost" size="sm" onClick={() => openEdit(link)}
                             className="h-7 text-xs text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
@@ -1377,7 +1448,7 @@ function FramehdrSiteTab() {
 
       {/* 编辑弹窗 */}
       <Dialog open={!!editTarget} onOpenChange={(o) => !o && setEditTarget(null)}>
-        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg bg-card border-border">
+        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg max-h-[90dvh] overflow-y-auto bg-card border-border">
           <DialogHeader><DialogTitle>修改发布记录</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
@@ -1433,6 +1504,539 @@ function FramehdrSiteTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+// ─── 1号站点（开放 API · pat_ 令牌）标签页 ─────────────────────
+/** 站点 /categories 的返回结构不固定，统一解析成 {id, name}[] */
+function parseSt1Categories(raw: unknown): Array<{ id: string; name: string }> {
+  const r = (raw ?? {}) as { data?: unknown; items?: unknown; list?: unknown };
+  const arr = Array.isArray(raw)
+    ? raw
+    : Array.isArray(r.data)
+      ? (r.data as unknown[])
+      : Array.isArray(r.items)
+        ? (r.items as unknown[])
+        : Array.isArray(r.list)
+          ? (r.list as unknown[])
+          : [];
+  return arr
+    .map((c) => {
+      const o = (c ?? {}) as Record<string, unknown>;
+      const id = o.id ?? o.category_id ?? o.cid;
+      if (id === undefined || id === null) return null;
+      return { id: String(id), name: String(o.name ?? o.title ?? o.label ?? id) };
+    })
+    .filter((x): x is { id: string; name: string } => !!x);
+}
+
+function St1SiteTab() {
+  const [binding, setBinding] = useState<St1Binding | null>(null);
+  const [loadingBinding, setLoadingBinding] = useState(true);
+  const [baseUrl, setBaseUrl] = useState('');
+  const [token, setToken] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [cats, setCats] = useState<Array<{ id: string; name: string }>>([]);
+  const [catLoading, setCatLoading] = useState(false);
+  // 「我的已发布片源」列表与编辑
+  const [mine, setMine] = useState<Array<Record<string, unknown>>>([]);
+  const [mineLoading, setMineLoading] = useState(false);
+  const [mineFiltered, setMineFiltered] = useState(true);
+  const [mineScanned, setMineScanned] = useState(0);
+  const [mineHint, setMineHint] = useState<string | null>(null);
+  const [editItem, setEditItem] = useState<Record<string, unknown> | null>(null);
+  const [editForm, setEditForm] = useState({ title: '', panUrl: '', panCode: '', content: '', categoryId: '' });
+  const [editSaving, setEditSaving] = useState(false);
+  // 站点账号密码登录（图形验证码）
+  const [loginUser, setLoginUser] = useState('');
+  const [loginPass, setLoginPass] = useState('');
+  const [captchaCode, setCaptchaCode] = useState('');
+  const [captchaSvg, setCaptchaSvg] = useState('');
+  const [captchaLoading, setCaptchaLoading] = useState(false);
+  const [loggingIn, setLoggingIn] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoadingBinding(true);
+    try {
+      const b = await getSt1Binding();
+      setBinding(b);
+      if (b?.base_url) setBaseUrl(b.base_url);
+    } catch { /* 未绑定或读取失败：按未绑定展示 */ }
+    finally { setLoadingBinding(false); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const isBound = !!binding && binding.status === 'active';
+  const isExpired = !!binding && binding.status === 'expired';
+
+  async function handleBind() {
+    if (!token.trim()) { toast.error('请填写站点「开放API」标签里生成的令牌（pat_…）'); return; }
+    setSaving(true);
+    try {
+      // 站点地址由服务端内置，不再需要用户填写
+      const r = await bindSt1Credential({
+        token,
+        defaultCategoryId: binding?.default_category_id ?? null,
+      });
+      const b = await getSt1Binding();
+      setBinding(b ?? {
+        base_url: baseUrl.trim(), username: r?.username ?? null, default_category_id: null,
+        status: 'active', last_error: null, last_check_at: new Date().toISOString(),
+      });
+      setToken('');
+      toast.success(`1号站点绑定成功${r?.username ? `（${r.username}）` : ''}`);
+      void loadCats();
+      void loadMine();
+    } catch (e) {
+      toast.error('绑定失败：' + ((e as Error).message || '请检查站点地址与令牌'));
+    } finally { setSaving(false); }
+  }
+
+  async function handleUnbind() {
+    setSaving(true);
+    try {
+      await unbindSt1();
+      setBinding(null);
+      setCats([]);
+      toast.success('已解绑 1号站点');
+    } catch { toast.error('解绑失败'); }
+    finally { setSaving(false); }
+  }
+
+  async function handleCheck() {
+    setChecking(true);
+    try {
+      const r = await checkSt1();
+      setBinding((prev) => prev
+        ? { ...prev, status: 'active', username: r?.username ?? prev.username, last_check_at: new Date().toISOString(), last_error: null }
+        : prev);
+      toast.success(`令牌有效${r?.username ? `（${r.username}）` : ''}`);
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      if (err.code === ST1_TOKEN_EXPIRED_CODE) {
+        setBinding((prev) => prev ? { ...prev, status: 'expired', last_error: err.message } : prev);
+      }
+      toast.error(err.message || '验证失败');
+    } finally { setChecking(false); }
+  }
+
+  async function loadCats() {
+    setCatLoading(true);
+    try {
+      setCats(parseSt1Categories(await st1Categories()));
+    } catch (e) {
+      toast.error('读取站点分类失败：' + ((e as Error).message || ''));
+    } finally { setCatLoading(false); }
+  }
+
+  async function handlePickCategory(id: string) {
+    try {
+      await setSt1DefaultCategory(id || null);
+      setBinding((prev) => prev ? { ...prev, default_category_id: id || null } : prev);
+      toast.success(id ? '已设为默认发布分类' : '已清除默认发布分类');
+    } catch { toast.error('保存默认分类失败'); }
+  }
+
+  /** 从站点片源对象里取字符串字段（站点字段名不确定，做兼容） */
+  function pickStr(o: Record<string, unknown>, keys: string[]): string {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === 'string') return v;
+      if (typeof v === 'number') return String(v);
+    }
+    return '';
+  }
+  function remoteIdOf(o: Record<string, unknown>): string {
+    return pickStr(o, ['id', 'resource_id', 'rid']);
+  }
+
+  /** 读取「我发布的片源」 */
+  async function loadMine() {
+    setMineLoading(true);
+    setMineHint(null);
+    try {
+      const r = await st1MyResources({ pageSize: 50 });
+      setMine(r.items ?? []);
+      setMineFiltered(r.filtered !== false);
+      setMineScanned(r.scanned ?? (r.items ?? []).length);
+      if (!r.filtered) setMineHint('站点列表未返回作者字段，下面是站点片源列表（可搜索后再编辑）。');
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      setMine([]);
+      setMineHint(err.message || '读取站点片源失败');
+      if (err.code === ST1_TOKEN_EXPIRED_CODE) {
+        setBinding((prev) => prev ? { ...prev, status: 'expired', last_error: err.message } : prev);
+      }
+    } finally { setMineLoading(false); }
+  }
+
+  function openEdit(item: Record<string, unknown>) {
+    setEditItem(item);
+    setEditForm({
+      title: pickStr(item, ['title', 'name']),
+      panUrl: pickStr(item, ['pan_url', 'panUrl', 'link', 'url']),
+      panCode: pickStr(item, ['pan_code', 'panCode', 'code', 'password']),
+      content: pickStr(item, ['content', 'description', 'desc']),
+      categoryId: pickStr(item, ['category_id', 'categoryId']) || (binding?.default_category_id ?? ''),
+    });
+  }
+
+  /** 保存站点片源修改（PATCH 局部更新，只提交改动字段） */
+  async function saveEdit() {
+    if (!editItem) return;
+    const remoteId = remoteIdOf(editItem);
+    if (!remoteId) { toast.error('该片源缺少 id，无法编辑'); return; }
+    if (!editForm.title.trim()) { toast.error('标题不能为空'); return; }
+    setEditSaving(true);
+    try {
+      await updateSt1Resource({
+        remoteId,
+        title: editForm.title.trim(),
+        ...(editForm.panUrl.trim() ? { panUrl: editForm.panUrl.trim() } : {}),
+        panCode: editForm.panCode.trim(),
+        content: editForm.content,
+        categoryId: editForm.categoryId || null,
+      });
+      // 顺手记住分类：之后发布新片源默认用它
+      if (editForm.categoryId) {
+        try { await setSt1DefaultCategory(editForm.categoryId); } catch { /* 非关键 */ }
+      }
+      toast.success('已在 1号站点更新');
+      setEditItem(null);
+      void loadMine();
+    } catch (e) {
+      toast.error('更新失败：' + ((e as Error).message || ''));
+    } finally { setEditSaving(false); }
+  }
+
+  /** 验证码 SVG → data URL：当图片渲染，SVG 里即便带脚本也不会执行（比 dangerouslySetInnerHTML 安全） */
+  const captchaSrc = useMemo(() => {
+    if (!captchaSvg) return '';
+    const bytes = new TextEncoder().encode(captchaSvg);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    try {
+      return `data:image/svg+xml;base64,${btoa(bin)}`;
+    } catch {
+      return '';
+    }
+  }, [captchaSvg]);
+
+  async function loadCaptcha() {
+    setCaptchaLoading(true);
+    try {
+      const r = await st1Captcha();
+      setCaptchaSvg(r?.svg ?? '');
+      setCaptchaCode('');
+    } catch (e) {
+      toast.error('获取验证码失败：' + ((e as Error).message || ''));
+    } finally { setCaptchaLoading(false); }
+  }
+
+  async function handleLogin() {
+    if (!loginUser.trim() || !loginPass) { toast.error('请填写站点账号与密码'); return; }
+    if (!captchaCode.trim()) { toast.error('请填写图形验证码'); return; }
+    setLoggingIn(true);
+    try {
+      const r = await st1Login({ username: loginUser, password: loginPass, captcha: captchaCode });
+      setBinding((prev) => prev
+        ? { ...prev, username: r?.username ?? prev.username, status: 'active', last_error: null }
+        : {
+            base_url: null, username: r?.username ?? null, default_category_id: null,
+            status: 'active', last_error: null, last_check_at: new Date().toISOString(),
+          });
+      setLoginPass('');
+      setCaptchaCode('');
+      toast.success(`站点登录成功${r?.username ? `（${r.username}）` : ''}`);
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      toast.error(err.message || '登录失败');
+      // 验证码错误/过期 → 自动换一张（验证码与会话绑定，必须重新取）
+      if (err.code === 'ST1_CAPTCHA_ERROR' || /验证码/.test(err.message ?? '')) void loadCaptcha();
+    } finally { setLoggingIn(false); }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="rounded-xl border border-border bg-card p-4 md:p-6">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <Radio className="h-4 w-4 text-primary shrink-0" />
+            <h2 className="font-serif text-base font-bold text-foreground">1号站点 · 开放 API 绑定</h2>
+            <SiteUrlHint site="st1" />
+          </div>
+          <div className="flex items-center gap-2">
+            {loadingBinding ? (
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : isBound ? (
+              <Badge className="bg-secondary/15 text-secondary border-0 hover:bg-secondary/15">
+                已绑定{binding?.username ? ` · ${binding.username}` : ' · 正常'}
+              </Badge>
+            ) : isExpired ? (
+              <Badge className="bg-destructive/15 text-destructive border-0 hover:bg-destructive/15">令牌已失效</Badge>
+            ) : (
+              <Badge variant="secondary" className="bg-muted text-muted-foreground border-0">未绑定</Badge>
+            )}
+            {isBound && (
+              <Button variant="outline" size="sm" onClick={handleCheck} disabled={checking}
+                className="h-8 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+                {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}检测令牌
+              </Button>
+            )}
+            {(isBound || isExpired) && (
+              <Button variant="outline" size="sm" onClick={handleUnbind} disabled={saving}
+                className="h-8 gap-1.5 border-border text-destructive hover:text-destructive hover:bg-destructive/10">
+                <Trash2 className="h-3.5 w-3.5" />解绑
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <div className="mb-4 p-3 rounded-lg bg-muted/60 text-xs text-muted-foreground leading-relaxed space-y-1">
+          <div>
+            1号站点是<b className="text-foreground">开放 API</b>型站点：登录站点后到「<b className="text-foreground">开放API</b>」标签生成自己的令牌
+            （形如 <code className="font-mono">pat_xxx</code>，明文只显示一次），把它填到这里即可。
+          </div>
+          <div>
+            接入地址为 <code className="font-mono">&lt;站点&gt;/api/open</code>，鉴权 <code className="font-mono">Authorization: Bearer pat_…</code>；
+            支持发布片源（<code className="font-mono">POST /resources</code>）与编辑片源（<code className="font-mono">PATCH /resources/:id</code>）、
+            分类 / PT 标签 / 豆瓣查询。
+          </div>
+          <div>
+            绑定后：资源管理里把资源发布到该站点时使用的就是<b className="text-foreground">你自己的令牌</b>；资源改名或换链接后会自动 PATCH 同步。
+            站点侧重新生成令牌后旧的立即失效，需要在这里重新绑定。
+          </div>
+        </div>
+
+        {isExpired && (
+          <div className="mb-4 p-3 rounded-lg bg-destructive/10 text-xs text-destructive leading-relaxed">
+            令牌已失效（{binding?.last_error || '站点返回 401'}）。请到 1号站点「开放API」标签重新生成令牌后，在下面重新填写。
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {/* 站点地址：已内置在服务端，用户不需要填写 */}
+          <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">
+            <div className="text-sm text-foreground">
+              站点地址：<span className="font-mono text-xs">{binding?.base_url || 'http://zy.beida.pw'}</span>
+            </div>
+            <div className="text-[11px] text-muted-foreground leading-relaxed">
+              已由系统内置（服务端统一配置），不需要填写；接口前缀固定为 <code className="font-mono">/api/open</code>。
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-sm text-foreground">开放 API 令牌</Label>
+            <Input
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder={isBound ? '如需更换令牌，粘贴新的 pat_… 后点保存' : 'pat_…'}
+              className="h-9 bg-input border-border font-mono text-xs"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Button onClick={handleBind} disabled={saving} className="gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90">
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              {isBound ? '更新绑定' : '保存并校验'}
+            </Button>
+            <span className="text-[11px] text-muted-foreground">
+              保存时会先调用站点的 <code className="font-mono">GET /profile</code> 校验令牌，失败不会落库。
+            </span>
+          </div>
+        </div>
+
+        {/* 站点账号密码登录（图形验证码）：拿站点内部会话，和开放 API 令牌相互独立 */}
+        <div className="mt-5 pt-4 border-t border-border space-y-3">
+          <div className="flex items-start justify-between gap-2 flex-wrap">
+            <div className="min-w-0">
+              <div className="text-sm text-foreground">站点账号登录（可选）</div>
+              <div className="text-[11px] text-muted-foreground leading-relaxed">
+                用你在 1号站点的<b className="text-foreground">账号密码</b>登录，建立站点内部会话（登录需要
+                <b className="text-foreground">图形验证码</b>，所以无法自动重登）。它和上面那枚「开放 API 令牌」是两套凭据：
+                发布 / 编辑片源走令牌。
+              </div>
+            </div>
+            {binding?.username && (
+              <Badge variant="secondary" className="bg-muted text-muted-foreground border-0 shrink-0">
+                站点账号：{binding.username}
+              </Badge>
+            )}
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">站点账号</Label>
+              <Input value={loginUser} onChange={(e) => setLoginUser(e.target.value)}
+                placeholder="站点用户名" className="h-9 bg-input border-border" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">站点密码</Label>
+              <Input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)}
+                placeholder="站点密码" className="h-9 bg-input border-border" />
+            </div>
+          </div>
+          <div className="flex items-end gap-3 flex-wrap">
+            <div className="space-y-1.5 w-44">
+              <Label className="text-sm text-foreground">图形验证码</Label>
+              <Input value={captchaCode} onChange={(e) => setCaptchaCode(e.target.value)}
+                placeholder="输入图片中的字符" className="h-9 bg-input border-border" />
+            </div>
+            <button
+              type="button"
+              onClick={loadCaptcha}
+              title="点击刷新验证码"
+              className="h-9 min-w-[120px] px-3 rounded-md border border-border bg-input flex items-center justify-center"
+            >
+              {captchaLoading ? (
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              ) : captchaSrc ? (
+                <img src={captchaSrc} alt="图形验证码" className="h-7" />
+              ) : (
+                <span className="text-[11px] text-muted-foreground">点击获取验证码</span>
+              )}
+            </button>
+            <Button onClick={handleLogin} disabled={loggingIn} variant="outline"
+              className="h-9 gap-1.5 border-border text-foreground hover:bg-muted">
+              {loggingIn ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+              账号登录
+            </Button>
+            <span className="text-[11px] text-muted-foreground pb-2">
+              验证码与本次会话绑定：先点验证码图片获取，再填账号密码与验证码。
+            </span>
+          </div>
+        </div>
+
+        {/* 凭据云端保存（需求③）：绑定信息与会话/令牌都在服务端，换设备不用重填 */}
+        <div className="mt-4 text-[11px] text-muted-foreground leading-relaxed">
+          凭据已保存到<b className="text-foreground">云端</b>：绑定信息在服务端{' '}
+          <code className="font-mono">st1_sessions</code>（站点地址、开放 API 令牌、站点会话 Cookie、站点账号），
+          令牌与站点密码另存一份<b className="text-foreground">加密副本</b>（
+          <code className="font-mono">site_credentials</code>）——换浏览器、换设备都不需要重新填写。
+        </div>
+
+        {/* 我的已发布片源（需求②）：展示账号在站点的片源，并支持编辑 */}
+        {isBound && (
+          <div className="mt-5 pt-4 border-t border-border space-y-3">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="min-w-0">
+                <div className="text-sm text-foreground">我的已发布片源</div>
+                <div className="text-[11px] text-muted-foreground leading-relaxed">
+                  读取站点 <code className="font-mono">GET /resources</code>
+                  {mineScanned ? `（扫描 ${mineScanned} 条${mineFiltered ? '，已筛出你的' : ''}）` : ''}；
+                  点「编辑」可直接改标题 / 云盘地址 / 提取码 / 简介 / 分类（站点{' '}
+                  <code className="font-mono">PATCH /resources/:id</code>）。
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button variant="outline" size="sm" onClick={loadCats} disabled={catLoading}
+                  className="h-8 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+                  {catLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}读取分类
+                </Button>
+                <Button variant="outline" size="sm" onClick={loadMine} disabled={mineLoading}
+                  className="h-8 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+                  {mineLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新片源
+                </Button>
+              </div>
+            </div>
+            {mineHint && <p className="text-[11px] text-muted-foreground">{mineHint}</p>}
+            {mineLoading && mine.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">正在读取站点片源…</p>
+            ) : mine.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">
+                {mineHint ? '' : '还没有读取到你在该站点发布的片源（发布后会出现在这里，可直接编辑）。'}
+              </p>
+            ) : (
+              <div className="space-y-2 max-h-[340px] overflow-y-auto pr-1">
+                {mine.map((it, i) => {
+                  const rid = remoteIdOf(it);
+                  const title = pickStr(it, ['title', 'name']) || `（无标题${rid ? ` #${rid}` : ''}）`;
+                  const link = pickStr(it, ['pan_url', 'panUrl', 'link', 'url']);
+                  const cat = pickStr(it, ['category_name', 'category_name_text', 'category', 'category_id']);
+                  const at = pickStr(it, ['updated_at', 'updatedAt', 'created_at', 'time']);
+                  return (
+                    <div key={rid || i} className="rounded-lg border border-border px-3 py-2 space-y-1">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="text-sm text-foreground leading-snug min-w-0 break-words">{title}</div>
+                        <Button variant="ghost" size="sm" onClick={() => openEdit(it)} disabled={!rid}
+                          className="h-7 shrink-0 gap-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted">
+                          <Pencil className="h-3.5 w-3.5" />编辑
+                        </Button>
+                      </div>
+                      <div className="text-[11px] text-muted-foreground break-all">
+                        {[cat && `分类：${cat}`, at && `更新：${at}`, link].filter(Boolean).join(' · ')}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 编辑站点片源（PATCH 只提交改动字段） */}
+      <Dialog open={!!editItem} onOpenChange={(o) => !o && setEditItem(null)}>
+        <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg max-h-[90dvh] overflow-y-auto bg-card border-border">
+          <DialogHeader>
+            <DialogTitle>编辑 1号站点片源</DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              只提交改动的字段，保存后站点立即生效（更换云盘地址后站点的失效计数会自动清零）。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">标题</Label>
+              <Input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })}
+                className="h-9 bg-input border-border" />
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label className="text-sm text-foreground">云盘地址</Label>
+                <Input value={editForm.panUrl} onChange={(e) => setEditForm({ ...editForm, panUrl: e.target.value })}
+                  placeholder="http(s)://…" className="h-9 bg-input border-border" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-sm text-foreground">提取码</Label>
+                <Input value={editForm.panCode} onChange={(e) => setEditForm({ ...editForm, panCode: e.target.value })}
+                  className="h-9 bg-input border-border" />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">分类</Label>
+              {cats.length > 0 ? (
+                <Select value={editForm.categoryId || ''} onValueChange={(v) => setEditForm({ ...editForm, categoryId: v })}>
+                  <SelectTrigger className="h-9 bg-input border-border"><SelectValue placeholder="选择分类" /></SelectTrigger>
+                  <SelectContent>
+                    {cats.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <Input value={editForm.categoryId} onChange={(e) => setEditForm({ ...editForm, categoryId: e.target.value })}
+                    placeholder="分类 ID（或点右侧「读取分类」）" className="h-9 bg-input border-border" />
+                  <Button variant="outline" size="sm" onClick={loadCats} disabled={catLoading}
+                    className="h-9 shrink-0 gap-1.5 border-border text-muted-foreground hover:text-foreground hover:bg-muted">
+                    {catLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}读取分类
+                  </Button>
+                </div>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">简介（支持 BBCode）</Label>
+              <Textarea value={editForm.content} onChange={(e) => setEditForm({ ...editForm, content: e.target.value })}
+                rows={6} className="bg-input border-border text-xs" />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditItem(null)}
+              className="border-border text-muted-foreground hover:text-foreground hover:bg-muted">取消</Button>
+            <Button onClick={saveEdit} disabled={editSaving}
+              className="gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90">
+              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存修改
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -1571,6 +2175,7 @@ function PanfxSiteTab() {
           <div className="flex items-center gap-2">
             <Tv2 className="h-4 w-4 text-primary shrink-0" />
             <h2 className="font-serif text-base font-bold text-foreground">123社区账号绑定</h2>
+            <SiteUrlHint site="panfx" />
           </div>
           <div className="flex items-center gap-2">
             {isBound ? (
@@ -1668,14 +2273,14 @@ function PanfxSiteTab() {
             </div>
           ) : (
             <div className="w-full max-w-full overflow-x-auto bg-card">
-              <table className="w-full min-w-max text-sm">
+              <table className="w-full table-fixed text-sm md:table-auto md:min-w-max">
                 <thead>
                   <tr className="border-b border-border bg-card">
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap min-w-52">标题</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">回复</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">浏览</th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">发布时间</th>
-                    <th className="px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap">操作</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:min-w-52">标题</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">回复</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">浏览</th>
+                    <th className="hidden px-4 py-3 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">发布时间</th>
+                    <th className="hidden px-4 py-3 text-right text-xs font-semibold text-muted-foreground whitespace-nowrap md:table-cell">操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1686,16 +2291,30 @@ function PanfxSiteTab() {
                     const url = `https://www.123panfx.com/thread-${post.tid}-1-1.html`;
                     return (
                       <tr key={post.tid} className="border-b border-border/50 hover:bg-muted/20">
-                        <td className="px-4 py-3 font-medium text-foreground max-w-xs truncate whitespace-nowrap">
+                        <td className="px-4 py-3 font-medium text-foreground break-words md:max-w-xs md:truncate md:whitespace-nowrap">
                           <a href={url} target="_blank" rel="noreferrer"
                             className="hover:text-primary hover:underline transition-colors">
                             {post.subject || '—'}
                           </a>
+                          {/* 手机端：回复 / 浏览 / 发布时间折到标题下方，操作跟在信息行右端 */}
+                          <div className="mt-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 md:hidden">
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] font-normal text-muted-foreground">
+                              <span>回复 {post.posts ?? '—'}</span>
+                              <span>浏览 {post.views ?? '—'}</span>
+                              <span>{date}</span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(post)}
+                                className="h-7 px-2 text-xs font-normal text-destructive hover:text-destructive hover:bg-muted">
+                                <Trash2 className="h-3.5 w-3.5" />删除
+                              </Button>
+                            </div>
+                          </div>
                         </td>
-                        <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">{post.posts ?? '—'}</td>
-                        <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">{post.views ?? '—'}</td>
-                        <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">{date}</td>
-                        <td className="px-4 py-3 whitespace-nowrap text-right">
+                        <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">{post.posts ?? '—'}</td>
+                        <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">{post.views ?? '—'}</td>
+                        <td className="hidden px-4 py-3 whitespace-nowrap text-xs text-muted-foreground md:table-cell">{date}</td>
+                        <td className="hidden px-4 py-3 whitespace-nowrap text-right md:table-cell">
                           <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(post)}
                             className="h-7 text-xs text-destructive hover:text-destructive hover:bg-muted">
                             <Trash2 className="h-3.5 w-3.5" />
@@ -2047,7 +2666,7 @@ function MukakuSiteTab() {
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-sm font-semibold text-foreground">不太灵影视站点</span>
-                <span className="text-[11px] text-muted-foreground font-mono">(web3.mukaku.com)</span>
+                <SiteUrlHint site="mukaku" />
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
                 支持片源搜索与一键直接挂载，免去先到站点发布的繁琐流程
@@ -2185,6 +2804,7 @@ function MukakuSiteTab() {
                 <Unlink className="h-3.5 w-3.5" />
                 解除绑定
               </Button>
+              <BatchPostButton site="mukaku" disabled={binding_} />
             </div>
           </div>
         )}
@@ -2550,12 +3170,677 @@ function MukakuSiteTab() {
   );
 }
 
+// ─── 聚影标签页 (www.jying.top) ──────────────────────────────
+
+function JyingTab() {
+  const [binding, setBinding] = useState<JyingBinding | null>(null);
+  const [bindingLoading, setBindingLoading] = useState(true);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [binding_, setBinding_] = useState(false);
+  const [shares, setShares] = useState<JyingShareItem[]>([]);
+  const [listLoading, setListLoading] = useState(false);
+  const [keyword, setKeyword] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [editTarget, setEditTarget] = useState<JyingShareItem | null>(null);
+  const [editUrl, setEditUrl] = useState('');
+  const [editSaving, setEditSaving] = useState(false);
+
+  const isBound = binding?.status === 'active';
+  const isExpired = binding?.status === 'expired';
+
+  const loadBinding = useCallback(async () => {
+    setBindingLoading(true);
+    try {
+      const b = await getJyingBinding();
+      setBinding(b);
+      // 本地标记为失效时向站点复检一次：站点侧仍有效则自动恢复为可用，
+      // 避免「其实还能用，却被卡在已失效、发不了」的情况
+      if (b?.status === 'expired') {
+        setBinding(await revalidateJyingSession());
+      }
+    }
+    catch { toast.error('加载绑定信息失败'); }
+    finally { setBindingLoading(false); }
+  }, []);
+
+  const loadShares = useCallback(async (kw = '') => {
+    setListLoading(true);
+    try { setShares(await loadJyingShares(kw)); }
+    catch (e) {
+      const err = e as Error & { code?: string };
+      if (err.code === JYING_EXPIRED_CODE) {
+        toast.error('聚影登录已过期，请重新登录聚影账号');
+        setBinding((b) => (b ? { ...b, status: 'expired' } : b));
+      } else { toast.error(err.message || '加载我的分享失败'); }
+    } finally { setListLoading(false); }
+  }, []);
+
+  useEffect(() => { loadBinding(); }, [loadBinding]);
+  useEffect(() => {
+    if (binding?.status === 'active') loadShares('');
+    else setShares([]);
+  }, [binding?.status, loadShares]);
+
+  async function handleBind() {
+    if (!username.trim() || !password) { toast.error('请输入聚影账号和密码'); return; }
+    setBinding_(true);
+    try {
+      await loginJying(username.trim(), password);
+      toast.success('聚影账号登录成功，资源更新时将自动同步');
+      setUsername('');
+      setPassword('');
+      await loadBinding();
+    } catch (e) { toast.error((e as Error).message || '登录失败，请检查账号密码'); }
+    finally { setBinding_(false); }
+  }
+
+  async function handleUnbind() {
+    setBinding_(true);
+    try {
+      await unbindJying();
+      toast.success('已解绑');
+      setBinding(null);
+      setShares([]);
+    } catch { toast.error('解绑失败'); }
+    finally { setBinding_(false); }
+  }
+
+  async function handleSearch() {
+    setSearching(true);
+    try { await loadShares(keyword); }
+    finally { setSearching(false); }
+  }
+
+  function openEdit(item: JyingShareItem) {
+    setEditTarget(item);
+    setEditUrl(item.share_link ?? '');
+  }
+
+  async function handleSaveEdit() {
+    if (!editTarget) return;
+    if (!editUrl.trim()) { toast.error('分享链接不能为空'); return; }
+    setEditSaving(true);
+    try {
+      await updateJyingShareLink(editTarget.id, editUrl.trim());
+      toast.success('分享链接已更新');
+      setEditTarget(null);
+      await loadShares(keyword);
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      if (err.code === JYING_EXPIRED_CODE) {
+        toast.error('聚影登录已过期，请重新登录');
+        setBinding((b) => (b ? { ...b, status: 'expired' } : b));
+      } else { toast.error(err.message || '更新失败'); }
+    } finally { setEditSaving(false); }
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* 绑定区 */}
+      <div className="rounded-xl border border-border bg-card p-4 md:p-6">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <Link2 className="h-4 w-4 text-primary shrink-0" />
+            <h2 className="font-serif text-base font-bold text-foreground">聚影账号绑定</h2>
+            <SiteUrlHint site="jying" />
+          </div>
+          {bindingLoading ? (
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+          ) : isBound ? (
+            <Badge className="bg-secondary/15 text-secondary border-0 hover:bg-secondary/15">已绑定 · 正常</Badge>
+          ) : isExpired ? (
+            <Badge className="bg-destructive/15 text-destructive border-0 hover:bg-destructive/15">已过期</Badge>
+          ) : (
+            <Badge variant="secondary" className="bg-muted text-muted-foreground border-0">未绑定</Badge>
+          )}
+        </div>
+
+        {isBound && (
+          <div className="mb-4 p-3 rounded-lg bg-muted/60 text-xs text-muted-foreground">
+            聚影账号「{binding?.username || '未知'}」正常（最近检测：{fmtDate(binding?.last_check_at)}）
+          </div>
+        )}
+        {isExpired && (
+          <div className="mb-4 p-3 rounded-lg bg-destructive/10 text-xs text-destructive">
+            聚影登录已过期，请重新输入账号密码登录。
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">聚影账号</Label>
+              <Input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="jying.top 用户名或邮箱"
+                autoComplete="username"
+                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">密码</Label>
+              <Input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleBind(); }}
+                placeholder="jying.top 密码"
+                autoComplete="current-password"
+                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button onClick={handleBind} disabled={binding_}
+              className="h-9 bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
+              {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+              {isBound || isExpired ? '重新登录' : '登录绑定'}
+            </Button>
+            {(isBound || isExpired) && (
+              <Button variant="outline" onClick={handleUnbind} disabled={binding_}
+                className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
+                <Unlink className="h-4 w-4" />解绑
+              </Button>
+            )}
+            <BatchPostButton site="jying" disabled={binding_} />
+          </div>
+        </div>
+        <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
+          <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+          <span>输入你在 www.jying.top 的<strong>账号和密码</strong>即可完成绑定，服务端会模拟登录并保存会话，<strong>密码不会落库</strong>。同步时按网盘类型匹配本地链接，仅替换已发布分享的链接。</span>
+        </div>
+      </div>
+
+      {/* 我的分享记录 */}
+      {isBound && (
+        <div className="rounded-xl border border-border bg-card overflow-hidden">
+          <div className="flex items-center justify-between px-4 md:px-6 py-4 border-b border-border gap-3 flex-wrap">
+            <div className="flex items-center gap-2 min-w-0">
+              <UploadCloud className="h-4 w-4 text-muted-foreground shrink-0" />
+              <h2 className="font-serif text-base font-bold text-foreground">我的分享记录</h2>
+              <span className="text-xs text-muted-foreground">{shares.length} 条</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                value={keyword}
+                onChange={(e) => setKeyword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
+                placeholder="按片名筛选"
+                className="h-8 w-40 text-xs bg-input border-border"
+              />
+              <Button variant="outline" size="sm" onClick={handleSearch} disabled={searching}
+                className="h-8 text-xs border-border gap-1">
+                {searching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                刷新
+              </Button>
+            </div>
+          </div>
+
+          {listLoading ? (
+            <div className="flex items-center justify-center py-12 text-muted-foreground text-sm gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" />加载中…
+            </div>
+          ) : shares.length === 0 ? (
+            <div className="py-12 text-center text-sm text-muted-foreground">暂无分享记录</div>
+          ) : (
+            <div className="divide-y divide-border">
+              {shares.map((item) => (
+                <div key={item.id} className="px-4 md:px-6 py-3 flex items-start gap-3 hover:bg-muted/30 transition-colors">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-medium text-foreground truncate">{item.movie_title || item.title}</span>
+                      <Badge variant="secondary" className="text-[10px] px-1.5 py-0 shrink-0">
+                        {item.resource_type_display || item.resource_type || '未知网盘'}
+                      </Badge>
+                      <Badge variant="outline" className="text-[10px] px-1.5 py-0 shrink-0">#{item.id}</Badge>
+                    </div>
+                    <div className="mt-0.5 text-xs text-muted-foreground truncate">{item.title}</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground/80 truncate break-all">
+                      {item.share_link || '（站点未返回链接）'}
+                    </div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => openEdit(item)}
+                    className="h-7 text-xs border-border shrink-0 gap-1">
+                    <Pencil className="h-3 w-3" />改链接
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 编辑弹窗 */}
+      <Dialog open={!!editTarget} onOpenChange={(o) => { if (!o) setEditTarget(null); }}>
+        <DialogContent className="max-w-[calc(100%-1.5rem)] sm:max-w-lg max-h-[90dvh] overflow-y-auto bg-card border-border">
+          <DialogHeader>
+            <DialogTitle className="font-serif">修改分享链接</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="text-xs text-muted-foreground">
+              片源：{editTarget?.movie_title} · 条目 #{editTarget?.id}（{editTarget?.resource_type_display || editTarget?.resource_type}）
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">分享链接</Label>
+              <Input
+                value={editUrl}
+                onChange={(e) => setEditUrl(e.target.value)}
+                placeholder="https://pan.quark.cn/s/xxxx"
+                className="h-9 px-3 text-sm bg-input border-border"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}
+              className="h-8 text-xs border-border">取消</Button>
+            <Button onClick={handleSaveEdit} disabled={editSaving}
+              className="h-8 text-xs bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
+              {editSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+// ─── 栖影 HDHaven 标签页（hdhaven.com） ───────────────────────
+
+/** 栖影网盘类型（guangya / 115 / 123 / ed2k）→ 中文标签 */
+function hdhavenPanLabel(panType?: string | null) {
+  if (!panType) return '未知网盘';
+  return PAN_TYPE_LABELS[panType] ?? panType;
+}
+
+function HdhavenTab() {
+  const [binding, setBinding] = useState<HdhavenBinding | null>(null);
+  const [bindingLoading, setBindingLoading] = useState(true);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [totp, setTotp] = useState('');
+  const [needTotp, setNeedTotp] = useState(false);
+  // 站点登录已加人机验证（Cloudflare Turnstile）→ 支持粘贴浏览器会话 Cookie 绑定
+  const [cookieDraft, setCookieDraft] = useState('');
+  const [binding_, setBinding_] = useState(false);
+  const [shares, setShares] = useState<HdhavenShareItem[]>([]);
+  const [listLoading, setListLoading] = useState(false);
+  const [keyword, setKeyword] = useState('');
+  const [editTarget, setEditTarget] = useState<HdhavenShareItem | null>(null);
+  const [editUrl, setEditUrl] = useState('');
+  const [editLoading, setEditLoading] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+
+  // 站点风控（图形验证码）闭环：命中时弹窗人工识别，验证通过后自动重放原请求
+  const { withChallenge, challengeDialog } = useHdhavenChallenge();
+
+  const isBound = binding?.status === 'active';
+  const isExpired = binding?.status === 'expired';
+
+  // 站点无分页/筛选参数，一次取全量后在前端按片名过滤
+  const visibleShares = keyword.trim()
+    ? shares.filter((s) =>
+        `${s.title ?? ''} ${s.media_title ?? ''}`.toLowerCase().includes(keyword.trim().toLowerCase())
+      )
+    : shares;
+
+  const loadBinding = useCallback(async () => {
+    setBindingLoading(true);
+    try {
+      const b = await getHdhavenBinding();
+      setBinding(b);
+      // 本地标记为失效时向站点复检一次：站点侧仍有效则自动恢复为可用
+      if (b?.status === 'expired') {
+        setBinding(await revalidateHdhavenSession());
+      }
+    }
+    catch { toast.error('加载绑定信息失败'); }
+    finally { setBindingLoading(false); }
+  }, []);
+
+  const loadShares = useCallback(async () => {
+    setListLoading(true);
+    try { setShares(await withChallenge(() => loadHdhavenShares())); }
+    catch (e) {
+      const err = e as Error & { code?: string };
+      if (err.code === HDHAVEN_EXPIRED_CODE) {
+        toast.error(err.message || '栖影登录已过期，请重新登录栖影账号');
+        setBinding((b) => (b ? { ...b, status: 'expired' } : b));
+      } else { toast.error(err.message || '加载我的分享失败'); }
+    } finally { setListLoading(false); }
+  }, [withChallenge]);
+
+  useEffect(() => { loadBinding(); }, [loadBinding]);
+  useEffect(() => {
+    if (binding?.status === 'active') loadShares();
+    else setShares([]);
+  }, [binding?.status, loadShares]);
+
+  async function handleBind() {
+    if (!username.trim() || !password) { toast.error('请输入栖影账号和密码'); return; }
+    setBinding_(true);
+    try {
+      await withChallenge(() => loginHdhaven(username.trim(), password, needTotp ? totp : undefined));
+      toast.success('栖影账号登录成功，资源更新时将自动同步');
+      setUsername(''); setPassword(''); setTotp(''); setNeedTotp(false);
+      await loadBinding();
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      if (err.code === HDHAVEN_TOTP_REQUIRED_CODE) {
+        // 账号开启两步验证：展开动态码输入后重试
+        setNeedTotp(true);
+        toast.error(err.message || '该账号开启了两步验证，请输入 6 位动态码');
+      } else {
+        toast.error(err.message || '登录失败，请检查账号密码');
+      }
+    }
+    finally { setBinding_(false); }
+  }
+
+  /**
+   * 粘贴浏览器会话 Cookie 绑定（站点登录已加 Cloudflare 人机验证，服务端登录不可行）。
+   * 服务端只用它校验一次会话有效性，之后所有请求都由代理带着这个 Cookie 发出。
+   */
+  async function handleBindCookie() {
+    if (!cookieDraft.trim()) { toast.error('请粘贴栖影的 Cookie'); return; }
+    setBinding_(true);
+    try {
+      await bindHdhavenCookie(cookieDraft);
+      toast.success('栖影 Cookie 校验通过，已绑定');
+      setCookieDraft('');
+      await loadBinding();
+    } catch (e) {
+      toast.error((e as Error).message || 'Cookie 校验失败，请重新复制');
+    } finally { setBinding_(false); }
+  }
+
+  async function handleUnbind() {
+    setBinding_(true);
+    try {
+      await unbindHdhaven();
+      toast.success('已解绑');
+      setBinding(null);
+      setShares([]);
+    } catch { toast.error('解绑失败'); }
+    finally { setBinding_(false); }
+  }
+
+  /** 打开改链接弹窗：先取详情拿到站点当前链接作为默认值 */
+  async function openEdit(item: HdhavenShareItem) {
+    setEditTarget(item);
+    setEditUrl(item.url ?? '');
+    setEditLoading(true);
+    try {
+      const detail = await withChallenge(() => getHdhavenShareDetail(item.slug));
+      if (detail?.url) setEditUrl(detail.url);
+    } catch { /* 详情取不到时允许手动填写 */ }
+    finally { setEditLoading(false); }
+  }
+
+  async function handleSaveEdit() {
+    if (!editTarget) return;
+    if (!editUrl.trim()) { toast.error('分享链接不能为空'); return; }
+    setEditSaving(true);
+    try {
+      await withChallenge(() =>
+        updateHdhavenShareLink({ slug: editTarget.slug, url: editUrl.trim() })
+      );
+      toast.success('分享链接已更新（栖影会重新审核该资源）');
+      setEditTarget(null);
+      await loadShares();
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      if (err.code === HDHAVEN_EXPIRED_CODE) {
+        toast.error(err.message || '栖影登录已过期，请重新登录');
+        setBinding((b) => (b ? { ...b, status: 'expired' } : b));
+      } else { toast.error(err.message || '更新失败'); }
+    } finally { setEditSaving(false); }
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* 绑定区 */}
+      <div className="rounded-xl border border-border bg-card p-4 md:p-6">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <Link2 className="h-4 w-4 text-primary shrink-0" />
+            <h2 className="font-serif text-base font-bold text-foreground">栖影账号绑定</h2>
+            <SiteUrlHint site="hdhaven" />
+          </div>
+          {bindingLoading ? (
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+          ) : isBound ? (
+            <Badge className="bg-secondary/15 text-secondary border-0 hover:bg-secondary/15">已绑定 · 正常</Badge>
+          ) : isExpired ? (
+            <Badge className="bg-destructive/15 text-destructive border-0 hover:bg-destructive/15">已过期</Badge>
+          ) : (
+            <Badge variant="secondary" className="bg-muted text-muted-foreground border-0">未绑定</Badge>
+          )}
+        </div>
+
+        {isBound && (
+          <div className="mb-4 p-3 rounded-lg bg-muted/60 text-xs text-muted-foreground">
+            栖影账号「{binding?.username || '未知'}」
+            {binding?.user_number ? `（UID ${binding.user_number}）` : ''}
+            正常（最近检测：{fmtDate(binding?.last_check_at)}）
+          </div>
+        )}
+        {isExpired && (
+          <div className="mb-4 p-3 rounded-lg bg-destructive/10 text-xs text-destructive">
+            栖影会话已失效，请在浏览器重新登录后<strong>重新粘贴 Cookie</strong>（账号密码登录已因站点人机验证不可用）。
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div className={`grid grid-cols-1 gap-3 ${needTotp ? 'md:grid-cols-3' : 'md:grid-cols-2'}`}>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">栖影账号</Label>
+              <Input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="hdhaven.com 用户名"
+                autoComplete="username"
+                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">密码</Label>
+              <Input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleBind(); }}
+                placeholder="hdhaven.com 密码"
+                autoComplete="current-password"
+                className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
+              />
+            </div>
+            {needTotp && (
+              <div className="space-y-1.5">
+                <Label className="text-sm text-foreground">两步验证码</Label>
+                <Input
+                  value={totp}
+                  onChange={(e) => setTotp(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleBind(); }}
+                  placeholder="6 位动态码"
+                  inputMode="numeric"
+                  maxLength={6}
+                  className="h-9 px-3 text-sm bg-input border-border focus-visible:ring-primary/40"
+                />
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button onClick={handleBind} disabled={binding_}
+              className="h-9 bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
+              {binding_ ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+              {isBound || isExpired ? '重新登录' : '登录绑定'}
+            </Button>
+            {(isBound || isExpired) && (
+              <Button variant="outline" onClick={handleUnbind} disabled={binding_}
+                className="h-9 border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1.5">
+                <Unlink className="h-4 w-4" />解绑
+              </Button>
+            )}
+            <BatchPostButton site="hdhaven" disabled={binding_} />
+          </div>
+
+          {/* 站点登录已加人机验证（Cloudflare Turnstile）→ 走「浏览器登录一次 + 粘贴会话 Cookie」 */}
+          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-2">
+            <div className="flex items-start gap-2">
+              <ShieldAlert className="h-3.5 w-3.5 shrink-0 mt-0.5 text-primary" />
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                栖影自 2026-10 起在<strong>登录接口</strong>要求完成<strong>人机验证</strong>（Cloudflare Turnstile），
+                服务端已无法自动登录；其余接口只认会话 Cookie。请改用
+                <strong>「浏览器登录一次 → 粘贴 Cookie」</strong>：① 用能打开站点的网络（境外 IP / 梯子）在浏览器登录 hdhaven.com，
+                人机验证你自己点一下；② F12 → Network → 点任意 hdhaven.com 请求 → 复制 Request Headers 里的
+                <code className="font-mono"> Cookie:</code> 整串（或 Application → Cookies 里复制）；
+                ③ 粘到下面提交。绑定后所有同步请求都由服务端代理发出，
+                <strong>与你的本机网络 / 大陆 IP 无关</strong>。
+              </p>
+            </div>
+            <Textarea
+              value={cookieDraft}
+              onChange={(e) => setCookieDraft(e.target.value)}
+              placeholder="粘贴 Cookie：name=value; name2=value2 …"
+              className="min-h-20 px-3 text-xs bg-input border-border focus-visible:ring-primary/40 font-mono"
+            />
+            <div className="flex items-center gap-2 flex-wrap">
+              <Button size="sm" onClick={handleBindCookie} disabled={binding_}
+                className="h-8 text-xs bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
+                {binding_ ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogIn className="h-3.5 w-3.5" />}
+                校验并绑定 Cookie
+              </Button>
+            </div>
+          </div>
+        </div>
+        <div className="mt-4 flex items-start gap-2 p-3 rounded-lg bg-muted/40 text-xs text-muted-foreground">
+          <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+          <span>
+            上面「账号密码登录」是历史路径：站点加了人机验证后提交会直接返回「请先完成人机验证」，
+            因此<strong>请优先用 Cookie 绑定</strong>。Cookie 仅用于服务端会话校验与请求，<strong>不落库明文密码</strong>。
+            同步时按网盘类型匹配本地链接，仅替换已发布分享的链接；普通用户改动后资源会<strong>重新进入审核</strong>。
+            站点有请求频率风控，同步请勿过于频繁。
+          </span>
+        </div>
+      </div>
+
+      {/* 我的分享记录 */}
+      {isBound && (
+        <div className="rounded-xl border border-border bg-card overflow-hidden">
+          <div className="flex items-center justify-between px-4 md:px-6 py-4 border-b border-border gap-3 flex-wrap">
+            <div className="flex items-center gap-2 min-w-0">
+              <UploadCloud className="h-4 w-4 text-muted-foreground shrink-0" />
+              <h2 className="font-serif text-base font-bold text-foreground">我的分享记录</h2>
+              <span className="text-xs text-muted-foreground">{visibleShares.length} 条</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                value={keyword}
+                onChange={(e) => setKeyword(e.target.value)}
+                placeholder="按片名筛选"
+                className="h-8 w-40 text-xs bg-input border-border"
+              />
+              <Button variant="outline" size="sm" onClick={() => loadShares()} disabled={listLoading}
+                className="h-8 text-xs border-border gap-1">
+                {listLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                刷新
+              </Button>
+            </div>
+          </div>
+
+          {listLoading && shares.length === 0 ? (
+            <div className="flex items-center justify-center py-12 text-muted-foreground text-sm gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" />加载中…
+            </div>
+          ) : visibleShares.length === 0 ? (
+            <div className="py-12 text-center text-sm text-muted-foreground">
+              {shares.length === 0 ? '暂无分享记录' : '没有匹配的分享记录'}
+            </div>
+          ) : (
+            <div className="divide-y divide-border">
+              {visibleShares.map((item) => (
+                <div key={item.slug} className="px-4 md:px-6 py-3 flex items-start gap-3 hover:bg-muted/30 transition-colors">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-medium text-foreground truncate">{item.title || '未命名分享'}</span>
+                      <Badge variant="secondary" className="text-[10px] px-1.5 py-0 shrink-0">
+                        {hdhavenPanLabel(item.pan_type)}
+                      </Badge>
+                      {item.share_size && (
+                        <Badge variant="outline" className="text-[10px] px-1.5 py-0 shrink-0">{item.share_size}</Badge>
+                      )}
+                      {item.review_status === 'pending' && (
+                        <Badge className="text-[10px] px-1.5 py-0 bg-destructive/15 text-destructive border-0 hover:bg-destructive/15 shrink-0">
+                          审核中
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="mt-0.5 text-xs text-muted-foreground truncate">
+                      {item.media_type === 'tv' ? '剧集' : '电影'}
+                      {item.media_title ? ` · ${item.media_title}` : ''}
+                      {item.file_count ? ` · ${item.file_count} 个文件` : ''}
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-muted-foreground/70 font-mono truncate">{item.slug}</div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => openEdit(item)}
+                    className="h-7 text-xs border-border shrink-0 gap-1">
+                    <Pencil className="h-3 w-3" />改链接
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 编辑弹窗 */}
+      <Dialog open={!!editTarget} onOpenChange={(o) => { if (!o) setEditTarget(null); }}>
+        <DialogContent className="max-w-[calc(100%-1.5rem)] sm:max-w-lg max-h-[90dvh] overflow-y-auto bg-card border-border">
+          <DialogHeader>
+            <DialogTitle className="font-serif">修改分享链接</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="text-xs text-muted-foreground">
+              分享：{editTarget?.title || editTarget?.slug}（{hdhavenPanLabel(editTarget?.pan_type)}）
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">分享链接</Label>
+              <Input
+                value={editUrl}
+                onChange={(e) => setEditUrl(e.target.value)}
+                placeholder={editLoading ? '正在读取站点当前链接…' : 'https://www.guangyapan.com/s/xxxx'}
+                className="h-9 px-3 text-sm bg-input border-border"
+              />
+              <p className="text-[11px] text-muted-foreground">
+                栖影的更新接口为「全量字段回写」，服务端会先取原值再合并，只替换链接，其余字段不会被清空。
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}
+              className="h-8 text-xs border-border">取消</Button>
+            <Button onClick={handleSaveEdit} disabled={editSaving}
+              className="h-8 text-xs bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5">
+              {editSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 风控图形验证码弹窗（命中站点限流时自动弹出） */}
+      {challengeDialog}
+    </div>
+  );
+}
+
 // ─── 页面入口 ────────────────────────────────────────────────
 export default function SyncPage() {
   return (
     <AppLayout>
       <PageMeta
-        title="站点同步管理 - 多平台网盘资源自动化发布中心"
+        title="站点同步管理 - 网盘推广工具"
         description="多平台与站点同步管理，支持盘链、观影、鸭影、帧影等第三方影视社区的账号绑定与自动化片源同步。"
         keywords="站点同步, 网盘发布, 多平台同步, 鸭影臻藏, 资源分发"
       />
@@ -2571,38 +3856,49 @@ export default function SyncPage() {
         </div>
 
         <Tabs defaultValue="pinglian">
-          <TabsList className="mb-6 bg-muted border border-border h-9">
+          {/* 站点多了以后标签会超出一行：手机端换行全部铺开（不藏站点），桌面端维持一行横向滚动 */}
+          <TabsList className="mb-6 bg-muted border border-border h-auto w-full max-w-full flex-wrap justify-start gap-1 p-1 md:h-9 md:flex-nowrap md:gap-0 md:overflow-x-auto">
             <TabsTrigger value="pinglian"
-              className="text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               盘链站点
             </TabsTrigger>
             <TabsTrigger value="xnsite"
-              className="text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               观影站点
             </TabsTrigger>
-            <TabsTrigger value="ya"
-              className="text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
-              鸭影臻藏站点
-            </TabsTrigger>
             <TabsTrigger value="framehdr"
-              className="text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               帧影站点
             </TabsTrigger>
             <TabsTrigger value="panfx"
-              className="text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               123社区
             </TabsTrigger>
             <TabsTrigger value="mukaku"
-              className="text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               不太灵站点
+            </TabsTrigger>
+            <TabsTrigger value="jying"
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              聚影站点
+            </TabsTrigger>
+            <TabsTrigger value="hdhaven"
+              className="text-xs px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              栖影站点
+            </TabsTrigger>
+            <TabsTrigger value="st1"
+              className="text-xs whitespace-nowrap px-2 md:px-3 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              1号站点
             </TabsTrigger>
           </TabsList>
           <TabsContent value="pinglian"><PinglianTab /></TabsContent>
           <TabsContent value="xnsite"><XnSiteTab /></TabsContent>
-          <TabsContent value="ya"><YaSiteTab /></TabsContent>
           <TabsContent value="framehdr"><FramehdrSiteTab /></TabsContent>
           <TabsContent value="panfx"><PanfxSiteTab /></TabsContent>
           <TabsContent value="mukaku"><MukakuSiteTab /></TabsContent>
+          <TabsContent value="jying"><JyingTab /></TabsContent>
+          <TabsContent value="hdhaven"><HdhavenTab /></TabsContent>
+          <TabsContent value="st1"><St1SiteTab /></TabsContent>
         </Tabs>
       </div>
     </AppLayout>

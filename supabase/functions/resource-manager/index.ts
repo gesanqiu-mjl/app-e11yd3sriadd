@@ -8,12 +8,29 @@
  *      鸭影后端校验「登录态有效 + 密钥有效」双通过才执行
  *
  * 支持的 action（POST JSON）：
- *   bindToken      - 绑定鸭影臻藏凭证（miaoda-auth 完整 JSON 或裸 access_token）
- *   searchVideos   - 搜索片源（api_search_videos）
- *   updateResource - 修改本人资源（api_update_resource）
- *   accountStatus  - 查看账号状态（api_get_account_status）
+ *   login                       - 账号密码登录并绑定（lookup_email_by_username → auth token）
+ *   searchVideos                - 站内片源搜索（直查 videos + resource_links，供绑定用）
+ *   searchMyVideos              - 查询片源与本人提交的有效资源链接（api_search_videos）
+ *   addResource                 - 添加网盘资源（api_add_resource）
+ *   updateResource              - 修改本人资源（api_update_resource）
+ *   accountStatus               - 查看账号状态（api_get_account_status）
+ *   checkIn                     - 每日签到（do_check_in）
+ *   draw                        - 积分抽奖（do_draw）
+ *   buyLuckyTicket              - 幸运抽签（buy_lucky_ticket）
+ *   luckyDraw                   - 抽签池状态（api_get_lucky_draw）
+ *   subscribeLink               - 订阅资源（api_subscribe_link）
+ *   unsubscribeLink             - 取消订阅（api_unsubscribe_link）
+ *   listSubscriptions           - 我的订阅列表（api_list_subscriptions）
+ *   getSubscriptionNotifications- 拉取订阅更新通知（api_get_subscription_notifications）
+ *   markNotificationsRead       - 标记通知已读（api_mark_notifications_read）
+ *
+ * 说明：所有业务 RPC 均由服务端注入 p_api_key（sk_ 开头），前端不接触密钥。
+ *   searchVideos 与 searchMyVideos 用途不同：
+ *     - searchVideos   查「站内有哪些片源/链接」，用于把本地资源绑定到站点已有片源
+ *     - searchMyVideos 查「本人提交的资源」，返回 link_id 供订阅/修改定位
  */
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { resolveCallerId } from "../_shared/internalAuth.ts";
 
 // 本 App Supabase（平台自动注入）
 const APP_URL = Deno.env.get("SUPABASE_URL")!;
@@ -88,15 +105,32 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   try {
     const appClient = createClient(APP_URL, SVC_KEY);
-    const appToken = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-    if (!appToken) return res({ success: false, error: "请先登录本应用" }, 401);
-
-    const { data: { user } } = await appClient.auth.getUser(appToken);
-    if (!user?.id) return res({ success: false, error: "登录态无效，请重新登录" }, 401);
-    const uid = user.id;
+    // 鉴权：用户 JWT，或服务端 worker/定时任务的内部通道
+    //（x-internal-secret + x-user-id，见 _shared/internalAuth.ts；未配置密钥时该通道关闭）
+    const callerId = await resolveCallerId(req, async (t) => {
+      const { data } = await appClient.auth.getUser(t);
+      return data?.user?.id ?? null;
+    });
+    if (!callerId) return res({ success: false, error: "登录态无效，请重新登录" }, 401);
+    const uid = callerId;
 
     const body = await req.json();
     const { action, ...p } = body;
+
+    // 服务端密钥前置检查：缺失时给出可操作提示，
+    // 否则调用站点只会得到「密钥无效」这类看不出根因的报错
+    if (!YA_ANON) {
+      return res(
+        { success: false, error: "服务端未配置鸭影站点公钥（YA_ANON_KEY / GUANGYA_ANON_KEY），请先在 Supabase secrets 中配置" },
+        500
+      );
+    }
+    if (action !== "login" && !SCRIPT_KEY) {
+      return res(
+        { success: false, error: "服务端未配置鸭影 API 密钥（SCRIPT_API_KEY / GUANGYA_P_API_KEY，sk_ 开头），请先在鸭影站点后台创建密钥并配置" },
+        500
+      );
+    }
 
     // ── login：账号密码登录，校验并存储鸭影臻藏 token ──────────────────────
     if (action === "login") {
@@ -172,7 +206,7 @@ Deno.serve(async (req) => {
         const fetchVideos = async (kwLike: string): Promise<unknown[]> => {
           const q = new URLSearchParams();
           // 使用正确的 PostgREST 嵌套资源语法，过滤条件通过 query params 传递
-          q.set("select", "id,title,category,resource_links(id,url,name,drive_type,extract_code,created_at)");
+          q.set("select", "id,title,category,cover_url,resource_links(id,url,name,drive_type,extract_code,created_at)");
           q.set("title", `ilike.*${likeEsc(kwLike)}*`);
           q.set("limit", "20");
           // 只返回有效链接
@@ -205,26 +239,27 @@ Deno.serve(async (req) => {
           );
         }
 
-        // 过滤无有效链接的片源（排除纯磁力链）；精确匹配（忽略大小写/去全部空格后相等）置顶
+        // 精确匹配（忽略大小写/去全部空格后相等）置顶。
+        // 注意：这里**不再**要求片源必须带「本人」的云盘链接 ——
+        // 搜索的用途是「确认站点是否存在该片源，以便在其下发布资源」，
+        // 而 resource_links 只挂本人提交的链接（submitter_id 过滤），
+        // 若据此丢弃片源，则「自己没发过的片子」一律搜不到，绝大多数场景直接失效。
         const isCloud = (l: { drive_type?: string }) => l.drive_type !== "magnet";
-        const withLinks = videos.filter(
-          (v: { resource_links?: unknown[] }) =>
-            Array.isArray(v.resource_links) &&
-            (v.resource_links as { drive_type?: string }[]).some(isCloud)
-        );
         const isExact = (v: { title?: string }) => norm(v.title ?? "") === norm(kw) ||
           compact(v.title ?? "").toLowerCase() === kwCompact.toLowerCase();
         const ordered = [
-          ...withLinks.filter((v: { title?: string }) => isExact(v)),
-          ...withLinks.filter((v: { title?: string }) => !isExact(v)),
+          ...videos.filter((v: { title?: string }) => isExact(v)),
+          ...videos.filter((v: { title?: string }) => !isExact(v)),
         ];
         result = {
           found: ordered.length > 0,
           videos: ordered.map(
-            (v: { id: number; title: string; category: string | null; resource_links: unknown[] }) => ({
-              video: { id: v.id, title: v.title, category: v.category },
-              // 只返回云盘链接，过滤磁力链
-              links: (v.resource_links as { drive_type?: string }[]).filter(isCloud),
+            (v: { id: number; title: string; category: string | null; cover_url?: string | null; resource_links?: unknown[] }) => ({
+              video: { id: v.id, title: v.title, category: v.category, cover_url: v.cover_url ?? null },
+              // links 仅保留本人提交的云盘链接（过滤磁力链），可能为空数组
+              links: Array.isArray(v.resource_links)
+                ? (v.resource_links as { drive_type?: string }[]).filter(isCloud)
+                : [],
             })
           ),
         };
@@ -256,6 +291,108 @@ Deno.serve(async (req) => {
       case "accountStatus":
         result = await call("api_get_account_status", {});
         break;
+
+      // ── 每日签到（do_check_in）→ { points_earned, consecutive } ──────────
+      case "checkIn":
+        result = await call("do_check_in", {});
+        break;
+
+      // ── 积分抽奖（do_draw）：count 次数、cost 单次消耗积分（以站点规则为准）──
+      case "draw": {
+        const count = Number(p.count ?? 1);
+        const cost = Number(p.cost ?? NaN);
+        if (!Number.isFinite(count) || count < 1) {
+          return res({ success: false, error: "抽奖次数不合法" }, 400);
+        }
+        if (!Number.isFinite(cost) || cost < 0) {
+          return res({ success: false, error: "缺少 cost（单次抽奖消耗的积分，以站点当前规则为准）" }, 400);
+        }
+        // 站点要求 p_cost 为本次实际消耗总量，需与 p_count 匹配
+        result = await call("do_draw", { p_count: count, p_cost: cost * count });
+        break;
+      }
+
+      // ── 幸运抽签（buy_lucky_ticket）：每日限一次，消耗 15 积分 ────────────
+      case "buyLuckyTicket":
+        result = await call("buy_lucky_ticket", {});
+        break;
+
+      // ── 抽签池状态（api_get_lucky_draw）────────────────────────────────
+      case "luckyDraw":
+        result = await call("api_get_lucky_draw", {});
+        break;
+
+      // ── 查询片源与本人提交的有效资源链接（api_search_videos）──────────────
+      case "searchMyVideos": {
+        const title = String(p.title ?? "").trim();
+        if (!title) return res({ success: false, error: "缺少 title" }, 400);
+        const rpcBody: Record<string, unknown> = { p_title: title };
+        if (p.category) rpcBody.p_category = String(p.category);
+        if (p.limit) rpcBody.p_limit = Number(p.limit);
+        result = await call("api_search_videos", rpcBody);
+        break;
+      }
+
+      // ── 订阅资源（api_subscribe_link）：p_link_id 精确 或 p_title 模糊 ────
+      case "subscribeLink": {
+        const rpcBody: Record<string, unknown> = {};
+        if (p.linkId !== undefined && p.linkId !== null) rpcBody.p_link_id = Number(p.linkId);
+        if (p.title) {
+          rpcBody.p_title = String(p.title);
+          if (p.category) rpcBody.p_category = String(p.category);
+          if (p.keyword) rpcBody.p_keyword = String(p.keyword);
+        }
+        if (rpcBody.p_link_id === undefined && !rpcBody.p_title) {
+          return res({ success: false, error: "缺少 p_link_id（推荐）或 p_title" }, 400);
+        }
+        if (p.active !== undefined) rpcBody.p_active = Boolean(p.active);
+        result = await call("api_subscribe_link", rpcBody);
+        break;
+      }
+
+      // ── 取消订阅（api_unsubscribe_link）─────────────────────────────────
+      case "unsubscribeLink": {
+        const rpcBody: Record<string, unknown> = {};
+        if (p.linkId !== undefined && p.linkId !== null) rpcBody.p_link_id = Number(p.linkId);
+        if (p.title) rpcBody.p_title = String(p.title);
+        if (rpcBody.p_link_id === undefined && !rpcBody.p_title) {
+          return res({ success: false, error: "缺少 p_link_id 或 p_title" }, 400);
+        }
+        result = await call("api_unsubscribe_link", rpcBody);
+        break;
+      }
+
+      // ── 我的订阅列表（api_list_subscriptions）───────────────────────────
+      case "listSubscriptions": {
+        const rpcBody: Record<string, unknown> = {};
+        if (p.activeOnly !== undefined) rpcBody.p_active_only = Boolean(p.activeOnly);
+        if (p.limit) rpcBody.p_limit = Number(p.limit);
+        result = await call("api_list_subscriptions", rpcBody);
+        break;
+      }
+
+      // ── 拉取订阅更新通知（api_get_subscription_notifications）────────────
+      case "getSubscriptionNotifications": {
+        const rpcBody: Record<string, unknown> = {};
+        if (p.limit) rpcBody.p_limit = Number(p.limit);
+        if (p.onlyUnread !== undefined) rpcBody.p_only_unread = Boolean(p.onlyUnread);
+        if (p.markRead !== undefined) rpcBody.p_mark_read = Boolean(p.markRead);
+        if (p.since) rpcBody.p_since = String(p.since);
+        result = await call("api_get_subscription_notifications", rpcBody);
+        break;
+      }
+
+      // ── 标记通知已读（api_mark_notifications_read）：ids 批量 或 all ──────
+      case "markNotificationsRead": {
+        const rpcBody: Record<string, unknown> = {};
+        if (Array.isArray(p.ids) && p.ids.length) rpcBody.p_ids = p.ids.map((i: unknown) => Number(i));
+        if (p.all) rpcBody.p_all = true;
+        if (!rpcBody.p_ids && !rpcBody.p_all) {
+          return res({ success: false, error: "请提供 ids（数组）或 all=true" }, 400);
+        }
+        result = await call("api_mark_notifications_read", rpcBody);
+        break;
+      }
 
       default:
         return res({ success: false, error: `未知 action: ${action}` }, 400);

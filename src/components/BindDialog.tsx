@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Search, Loader2, Link2, Unlink, CheckCircle2, Info, Tv2, Drama, Film } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,12 +15,19 @@ import {
   searchYaVideos, bindResourceToYa, unbindResourceFromYa, YA_EXPIRED_CODE,
   loadFramehdrLinks, bindResourceToFramehdr, unbindResourceFromFramehdr, FRAMEHDR_COOKIE_EXPIRED_CODE,
   loadPanfxPosts, bindResourceToPanfx, unbindResourceFromPanfx, PANFX_COOKIE_EXPIRED_CODE,
+  st1MyResources, bindResourceToSt1, unbindResourceFromSt1, ST1_TOKEN_EXPIRED_CODE,
   fetchMukakuResources, bindResourceToMukaku, unbindResourceFromMukaku, MUKAKU_TOKEN_EXPIRED_CODE,
+  loadJyingShares, bindResourceToJying, unbindResourceFromJying, JYING_EXPIRED_CODE,
+  loadHdhavenShares, bindResourceToHdhaven, unbindResourceFromHdhaven, HDHAVEN_EXPIRED_CODE,
 } from '@/services/api';
+import { useHdhavenChallenge } from '@/components/HdhavenChallengeDialog';
 import type {
   Resource, PinglianLink, ResourceBinding, XnShare, XnResourceBinding,
   YaLink, YaResourceBinding, FramehdrLink, FramehdrResourceBinding,
   PanfxPost, PanfxResourceBinding, MukakuWpResource, MukakuResourceBinding,
+  St1ResourceBinding,
+  JyingShareItem, JyingResourceBinding,
+  HdhavenShareItem, HdhavenResourceBinding,
 } from '@/types/index';
 
 function fmtDate(iso?: string | null) {
@@ -37,7 +44,11 @@ interface BindDialogProps {
   yaBindings: YaResourceBinding[];
   framehdrBinding: FramehdrResourceBinding | null;
   panfxBinding: PanfxResourceBinding | null;
+  /** 1号站点绑定（一个资源绑定站点上的一条片源） */
+  st1Binding: St1ResourceBinding | null;
   mukakuBindings: MukakuResourceBinding[];
+  jyingBindings: JyingResourceBinding[];
+  hdhavenBindings: HdhavenResourceBinding[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onPinglianBound: (resourceId: string, binding: ResourceBinding) => void;
@@ -50,8 +61,364 @@ interface BindDialogProps {
   onFramehdrUnbound: (resourceId: string) => void;
   onPanfxBound: (resourceId: string, binding: PanfxResourceBinding) => void;
   onPanfxUnbound: (resourceId: string) => void;
+  onSt1Bound: (resourceId: string, binding: St1ResourceBinding) => void;
+  onSt1Unbound: (resourceId: string) => void;
   onMukakuBound: (resourceId: string, binding: MukakuResourceBinding) => void;
   onMukakuUnbound: (resourceId: string, linkId?: number) => void;
+  onJyingBound: (resourceId: string, binding: JyingResourceBinding) => void;
+  onJyingUnbound: (resourceId: string, linkId?: number) => void;
+  onHdhavenBound: (resourceId: string, binding: HdhavenResourceBinding) => void;
+  onHdhavenUnbound: (resourceId: string, slug?: string) => void;
+}
+
+// ─── 聚影标签页内容（只列出该账号在聚影已发布的分享记录，用于绑定） ───
+function JyingPane({
+  resource, jyingBindings, onJyingBound, onJyingUnbound,
+}: Pick<BindDialogProps, 'resource' | 'jyingBindings' | 'onJyingBound' | 'onJyingUnbound'>) {
+  const [shares, setShares] = useState<JyingShareItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [keyword, setKeyword] = useState('');
+  const [bindingId, setBindingId] = useState<number | null>(null);
+  const [unbindingId, setUnbindingId] = useState<number | null>(null);
+
+  const load = useCallback(async (kw = '') => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      setShares(await loadJyingShares(kw));
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      setShares([]);
+      setLoadError(
+        err.code === JYING_EXPIRED_CODE
+          ? '聚影登录已过期，请先到「站点同步」页重新登录'
+          : err.message || '加载聚影发布记录失败'
+      );
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    load('').finally(() => { if (cancelled) return; });
+    return () => { cancelled = true; };
+  }, [load]);
+
+  async function handleBind(item: JyingShareItem) {
+    if (!resource) return;
+    setBindingId(item.id);
+    try {
+      await bindResourceToJying(resource.id, {
+        id: item.id,
+        movie_id: item.movie_id,
+        title: item.title,
+        vod_name: item.movie_title,
+        share_link: item.share_link,
+      });
+      const existing = jyingBindings.find((b) => b.link_id === item.id);
+      onJyingBound(resource.id, {
+        id: existing?.id ?? '',
+        resource_id: resource.id,
+        link_id: item.id,
+        movie_id: item.movie_id,
+        link_title: item.title,
+        vod_name: item.movie_title,
+        pan_label: detectPanName(item.share_link ?? '') || item.resource_type_display || null,
+        created_at: existing?.created_at ?? new Date().toISOString(),
+      });
+      toast.success('绑定聚影发布记录成功，资源更新时将自动同步');
+    } catch { toast.error('绑定失败，请重试'); }
+    finally { setBindingId(null); }
+  }
+
+  async function handleUnbind(linkId: number) {
+    if (!resource) return;
+    setUnbindingId(linkId);
+    try {
+      await unbindResourceFromJying(resource.id, linkId);
+      onJyingUnbound(resource.id, linkId);
+      toast.success('已解绑该条聚影记录');
+    } catch { toast.error('解绑失败'); }
+    finally { setUnbindingId(null); }
+  }
+
+  return (
+    <div className="space-y-3">
+      {jyingBindings.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-muted-foreground">已绑定 {jyingBindings.length} 条聚影发布记录</div>
+          {jyingBindings.map((b) => (
+            <div key={b.link_id} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-muted/40 border border-border text-xs">
+              <div className="min-w-0 flex items-center gap-2">
+                <CheckCircle2 className="h-3.5 w-3.5 text-primary shrink-0" />
+                <div className="min-w-0">
+                  <div className="truncate text-foreground">{b.vod_name || b.link_title || `#${b.link_id}`}</div>
+                  <div className="text-[10px] text-muted-foreground truncate">
+                    {b.pan_label || '未知网盘'} · 条目 #{b.link_id}
+                  </div>
+                </div>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => handleUnbind(b.link_id)}
+                disabled={unbindingId === b.link_id}
+                className="h-7 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 shrink-0 gap-1">
+                {unbindingId === b.link_id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Unlink className="h-3 w-3" />}
+                解绑
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+          <Input
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') load(keyword); }}
+            placeholder="按片名筛选你的聚影发布记录"
+            className="h-8 pl-8 text-xs bg-input border-border"
+          />
+        </div>
+        <Button variant="outline" size="sm" onClick={() => load(keyword)} disabled={loading}
+          className="h-8 text-xs border-border gap-1">
+          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+          筛选
+        </Button>
+      </div>
+
+      {loadError ? (
+        <div className="py-6 text-center text-xs text-destructive">{loadError}</div>
+      ) : loading ? (
+        <div className="flex items-center justify-center py-8 text-muted-foreground text-xs gap-2">
+          <Loader2 className="h-4 w-4 animate-spin" />加载中…
+        </div>
+      ) : shares.length === 0 ? (
+        <div className="py-8 text-center text-xs text-muted-foreground">未找到你的聚影发布记录</div>
+      ) : (
+        <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
+          {shares.map((item) => {
+            const bound = jyingBindings.some((b) => b.link_id === item.id);
+            return (
+              <div key={item.id}
+                className="flex items-start justify-between gap-2 p-2 rounded-lg border border-border bg-card text-xs">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="font-medium text-foreground truncate">{item.movie_title || item.title}</span>
+                    <Badge variant="secondary" className="text-[10px] px-1 py-0">
+                      {item.resource_type_display || item.resource_type || '未知网盘'}
+                    </Badge>
+                    {bound && <Badge className="text-[10px] px-1 py-0 bg-primary/15 text-primary border-0">已绑定</Badge>}
+                  </div>
+                  <div className="mt-0.5 text-[10px] text-muted-foreground truncate">{item.title}</div>
+                  <div className="text-[10px] text-muted-foreground/80 truncate">{item.share_link || '（无链接）'}</div>
+                </div>
+                <Button variant={bound ? 'ghost' : 'outline'} size="sm"
+                  onClick={() => (bound ? handleUnbind(item.id) : handleBind(item))}
+                  disabled={bindingId === item.id || unbindingId === item.id}
+                  className="h-7 text-xs shrink-0 gap-1">
+                  {bindingId === item.id || unbindingId === item.id
+                    ? <Loader2 className="h-3 w-3 animate-spin" />
+                    : bound ? <Unlink className="h-3 w-3" /> : <Link2 className="h-3 w-3" />}
+                  {bound ? '解绑' : '绑定'}
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex items-start gap-2 p-2 rounded-lg bg-muted/40 text-[11px] text-muted-foreground">
+        <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+        <span>此处只列出你账号在聚影<strong>已发布</strong>的分享记录，绑定后资源更新时会自动替换该记录的链接。新增分享请使用「快捷绑定与发布」。</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── 栖影标签页内容（只列出该账号在栖影已发布的分享记录，用于绑定） ───
+function HdhavenPane({
+  resource, hdhavenBindings, onHdhavenBound, onHdhavenUnbound,
+}: Pick<BindDialogProps, 'resource' | 'hdhavenBindings' | 'onHdhavenBound' | 'onHdhavenUnbound'>) {
+  const [shares, setShares] = useState<HdhavenShareItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [keyword, setKeyword] = useState('');
+  const [bindingSlug, setBindingSlug] = useState<string | null>(null);
+  const [unbindingSlug, setUnbindingSlug] = useState<string | null>(null);
+
+  // 站点风控（图形验证码）闭环：命中时弹窗人工识别，验证通过后自动重放原请求
+  const { withChallenge, challengeDialog } = useHdhavenChallenge();
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      // 栖影列表接口无分页/筛选参数，一次取全量，筛选在前端做
+      setShares(await withChallenge(() => loadHdhavenShares()));
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      setShares([]);
+      setLoadError(
+        err.code === HDHAVEN_EXPIRED_CODE
+          ? '栖影登录已过期，请先到「站点同步」页重新登录'
+          : err.message || '加载栖影分享记录失败'
+      );
+    } finally { setLoading(false); }
+  }, [withChallenge]);
+
+  useEffect(() => {
+    let cancelled = false;
+    load().finally(() => { if (cancelled) return; });
+    return () => { cancelled = true; };
+  }, [load]);
+
+  const visibleShares = keyword.trim()
+    ? shares.filter((s) =>
+        `${s.title ?? ''} ${s.media_title ?? ''}`.toLowerCase().includes(keyword.trim().toLowerCase())
+      )
+    : shares;
+
+  const panLabelOf = (panType?: string | null) =>
+    panType ? (PAN_TYPE_LABELS[panType] ?? panType) : '未知网盘';
+
+  async function handleBind(item: HdhavenShareItem) {
+    if (!resource) return;
+    setBindingSlug(item.slug);
+    try {
+      await bindResourceToHdhaven(resource.id, item, item.media_title ?? undefined);
+      const existing = hdhavenBindings.find((b) => b.slug === item.slug);
+      onHdhavenBound(resource.id, {
+        id: existing?.id ?? '',
+        resource_id: resource.id,
+        slug: item.slug,
+        tmdb_id: item.tmdb_id ?? null,
+        media_type: item.media_type ?? null,
+        link_title: item.title ?? null,
+        vod_name: item.media_title ?? null,
+        pan_type: item.pan_type ?? null,
+        pan_label: item.pan_type ? (PAN_TYPE_LABELS[item.pan_type] ?? item.pan_type) : null,
+        created_at: existing?.created_at ?? new Date().toISOString(),
+      });
+      toast.success('绑定栖影分享记录成功，资源更新时将自动同步');
+    } catch { toast.error('绑定失败，请重试'); }
+    finally { setBindingSlug(null); }
+  }
+
+  async function handleUnbind(slug: string) {
+    if (!resource) return;
+    setUnbindingSlug(slug);
+    try {
+      await unbindResourceFromHdhaven(resource.id, slug);
+      onHdhavenUnbound(resource.id, slug);
+      toast.success('已解绑该条栖影记录');
+    } catch { toast.error('解绑失败'); }
+    finally { setUnbindingSlug(null); }
+  }
+
+  return (
+    <div className="space-y-3">
+      {hdhavenBindings.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="text-xs font-medium text-muted-foreground">已绑定 {hdhavenBindings.length} 条栖影分享记录</div>
+          {hdhavenBindings.map((b) => (
+            <div key={b.slug} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-muted/40 border border-border text-xs">
+              <div className="min-w-0 flex items-center gap-2">
+                <CheckCircle2 className="h-3.5 w-3.5 text-primary shrink-0" />
+                <div className="min-w-0">
+                  <div className="truncate text-foreground">{b.vod_name || b.link_title || b.slug}</div>
+                  <div className="text-[10px] text-muted-foreground truncate">
+                    {b.pan_label || panLabelOf(b.pan_type)} · {b.slug}
+                  </div>
+                </div>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => handleUnbind(b.slug)}
+                disabled={unbindingSlug === b.slug}
+                className="h-7 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 shrink-0 gap-1">
+                {unbindingSlug === b.slug ? <Loader2 className="h-3 w-3 animate-spin" /> : <Unlink className="h-3 w-3" />}
+                解绑
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+          <Input
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+            placeholder="按片名筛选你的栖影分享记录"
+            className="h-8 pl-8 text-xs bg-input border-border"
+          />
+        </div>
+        <Button variant="outline" size="sm" onClick={() => load()} disabled={loading}
+          className="h-8 text-xs border-border gap-1">
+          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+          刷新
+        </Button>
+      </div>
+
+      {loadError ? (
+        <div className="py-6 text-center text-xs text-destructive">{loadError}</div>
+      ) : loading && shares.length === 0 ? (
+        <div className="flex items-center justify-center py-8 text-muted-foreground text-xs gap-2">
+          <Loader2 className="h-4 w-4 animate-spin" />加载中…
+        </div>
+      ) : visibleShares.length === 0 ? (
+        <div className="py-8 text-center text-xs text-muted-foreground">
+          {shares.length === 0 ? '未找到你的栖影分享记录' : '没有匹配的分享记录'}
+        </div>
+      ) : (
+        <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
+          {visibleShares.map((item) => {
+            const bound = hdhavenBindings.some((b) => b.slug === item.slug);
+            return (
+              <div key={item.slug}
+                className="flex items-start justify-between gap-2 p-2 rounded-lg border border-border bg-card text-xs">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="font-medium text-foreground truncate">{item.title || '未命名分享'}</span>
+                    <Badge variant="secondary" className="text-[10px] px-1 py-0">
+                      {panLabelOf(item.pan_type)}
+                    </Badge>
+                    {item.share_size && (
+                      <Badge variant="outline" className="text-[10px] px-1 py-0">{item.share_size}</Badge>
+                    )}
+                    {bound && <Badge className="text-[10px] px-1 py-0 bg-primary/15 text-primary border-0">已绑定</Badge>}
+                  </div>
+                  <div className="mt-0.5 text-[10px] text-muted-foreground truncate">
+                    {item.media_type === 'tv' ? '剧集' : '电影'}
+                    {item.media_title ? ` · ${item.media_title}` : ''}
+                    {item.file_count ? ` · ${item.file_count} 个文件` : ''}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground/70 font-mono truncate">{item.slug}</div>
+                </div>
+                <Button variant={bound ? 'ghost' : 'outline'} size="sm"
+                  onClick={() => (bound ? handleUnbind(item.slug) : handleBind(item))}
+                  disabled={bindingSlug === item.slug || unbindingSlug === item.slug}
+                  className="h-7 text-xs shrink-0 gap-1">
+                  {bindingSlug === item.slug || unbindingSlug === item.slug
+                    ? <Loader2 className="h-3 w-3 animate-spin" />
+                    : bound ? <Unlink className="h-3 w-3" /> : <Link2 className="h-3 w-3" />}
+                  {bound ? '解绑' : '绑定'}
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex items-start gap-2 p-2 rounded-lg bg-muted/40 text-[11px] text-muted-foreground">
+        <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+        <span>此处只列出你账号在栖影<strong>已发布</strong>的分享记录，绑定后资源更新时会自动替换该记录的链接（普通用户改动后资源会重新进入审核）。栖影暂未开放「新建分享」接口，新增分享请先在栖影站点发布。</span>
+      </div>
+
+      {/* 风控图形验证码弹窗（命中站点限流时自动弹出） */}
+      {challengeDialog}
+    </div>
+  );
 }
 
 // ─── 盘链标签页内容（一链接一记录：同一部剧的多条网盘记录可分别绑定） ──
@@ -413,6 +780,156 @@ function FramehdrPane({
                     {framehdrBinding ? '换绑' : '绑定'}
                   </Button>
                 )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── 1号站点标签页内容 ────────────────────────────────────────
+function St1Pane({
+  resource, st1Binding, onSt1Bound, onSt1Unbound,
+}: Pick<BindDialogProps, 'resource' | 'st1Binding' | 'onSt1Bound' | 'onSt1Unbound'>) {
+  const [items, setItems] = useState<Array<Record<string, unknown>>>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [keyword, setKeyword] = useState('');
+  const [bindingId, setBindingId] = useState<string | null>(null);
+  const [unbinding, setUnbinding] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    st1MyResources({ pageSize: 50 })
+      .then((r) => { if (!cancelled) setItems(r.items ?? []); })
+      .catch((e) => {
+        if (cancelled) return;
+        setItems([]);
+        const err = e as Error & { code?: string };
+        setLoadError(
+          err.code === ST1_TOKEN_EXPIRED_CODE
+            ? '1号站点令牌已失效，请先到「站点同步」页重新绑定令牌'
+            : err.message || '加载 1号站点片源失败'
+        );
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  /** 站点字段名不确定，做兼容取值 */
+  const pick = (o: Record<string, unknown>, keys: string[]): string => {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === 'string') return v;
+      if (typeof v === 'number') return String(v);
+    }
+    return '';
+  };
+
+  const filtered = items.filter((it) => {
+    const q = keyword.trim().toLowerCase();
+    if (!q) return true;
+    return pick(it, ['title', 'name']).toLowerCase().includes(q);
+  });
+
+  async function handleBind(it: Record<string, unknown>) {
+    if (!resource) return;
+    const remoteId = pick(it, ['id', 'resource_id', 'rid']);
+    if (!remoteId) { toast.error('该片源缺少 id，无法绑定'); return; }
+    setBindingId(remoteId);
+    try {
+      const b = await bindResourceToSt1({
+        resourceId: resource.id,
+        remoteId,
+        title: pick(it, ['title', 'name']) || null,
+        remoteUrl: pick(it, ['pan_url', 'panUrl', 'link', 'url']) || null,
+      });
+      onSt1Bound(resource.id, b);
+      toast.success('绑定 1号站点成功，资源更新时将自动同步');
+    } catch (e) {
+      toast.error('绑定失败：' + ((e as Error).message || '请重试'));
+    } finally { setBindingId(null); }
+  }
+
+  async function handleUnbind() {
+    if (!resource) return;
+    setUnbinding(true);
+    try {
+      await unbindResourceFromSt1(resource.id);
+      onSt1Unbound(resource.id);
+      toast.success('已解绑 1号站点');
+    } catch { toast.error('解绑失败'); }
+    finally { setUnbinding(false); }
+  }
+
+  return (
+    <div className="space-y-3">
+      {st1Binding && (
+        <div className="flex items-center gap-2 p-3 rounded-lg bg-secondary/10 border border-secondary/20">
+          <CheckCircle2 className="h-4 w-4 text-secondary shrink-0" />
+          <div className="flex-1 min-w-0 overflow-hidden">
+            <p className="text-xs font-medium text-foreground truncate leading-snug">
+              已绑定：{st1Binding.title || `#${st1Binding.remote_id}`}
+            </p>
+            <p className="text-[11px] text-muted-foreground truncate mt-0.5 leading-snug">
+              remote_id={st1Binding.remote_id}
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" onClick={handleUnbind} disabled={unbinding}
+            className="h-7 shrink-0 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 gap-1 px-2">
+            {unbinding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Unlink className="h-3.5 w-3.5" />}
+            解绑
+          </Button>
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <Input value={keyword} onChange={(e) => setKeyword(e.target.value)}
+          placeholder="按标题筛选我在 1号站点的片源…" className="h-8 bg-input border-border text-xs" />
+        <span className="text-[11px] text-muted-foreground shrink-0">{filtered.length}/{items.length}</span>
+      </div>
+
+      {loading ? (
+        <div className="py-10 text-center text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin inline mr-1.5" />加载站点片源…
+        </div>
+      ) : loadError ? (
+        <div className="py-6 text-center text-xs text-destructive">{loadError}</div>
+      ) : filtered.length === 0 ? (
+        <div className="py-10 text-center text-sm text-muted-foreground">
+          {keyword ? `未找到「${keyword}」` : '暂无片源：先到「站点同步 → 1号站点」绑定令牌，或发布片源后再来绑定'}
+        </div>
+      ) : (
+        <div className="max-h-56 overflow-y-auto overflow-x-hidden w-full min-w-0 rounded-lg border border-border divide-y divide-border/50">
+          {filtered.map((it, i) => {
+            const remoteId = pick(it, ['id', 'resource_id', 'rid']);
+            const title = pick(it, ['title', 'name']) || `（无标题${remoteId ? ` #${remoteId}` : ''}）`;
+            const link = pick(it, ['pan_url', 'panUrl', 'link', 'url']);
+            const isCurrent = !!st1Binding && remoteId === String(st1Binding.remote_id);
+            return (
+              <div key={remoteId || i}
+                className={`flex items-center gap-2 px-3 py-2.5 transition-colors min-w-0 w-full ${isCurrent ? 'bg-secondary/10' : 'hover:bg-muted/40'}`}>
+                <Tv2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                <div className="flex-1 min-w-0 overflow-hidden">
+                  <p className="text-xs font-medium text-foreground truncate leading-snug">{title}</p>
+                  <p className="text-[11px] text-muted-foreground truncate mt-0.5 leading-snug">
+                    {link || `id=${remoteId}`}
+                  </p>
+                </div>
+                <Button size="sm" variant={isCurrent ? 'ghost' : 'outline'}
+                  disabled={!!bindingId || isCurrent}
+                  onClick={() => handleBind(it)}
+                  className={`h-7 shrink-0 text-xs gap-1 px-2 ${isCurrent
+                    ? 'text-muted-foreground'
+                    : 'border-border text-foreground hover:bg-muted'}`}>
+                  {bindingId === remoteId
+                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    : isCurrent ? '已绑定' : '绑定'}
+                </Button>
               </div>
             );
           })}
@@ -1205,12 +1722,16 @@ function MukakuPane({
 
 // ─── 弹窗入口 ────────────────────────────────────────────────
 export default function BindDialog({
-  resource, pinglianBindings, xnBindings, yaBindings, framehdrBinding, panfxBinding, mukakuBindings, open, onOpenChange,
+  resource, pinglianBindings, xnBindings, yaBindings, framehdrBinding, panfxBinding, st1Binding, mukakuBindings,
+  jyingBindings, hdhavenBindings, open, onOpenChange,
   onPinglianBound, onPinglianUnbound, onXnBound, onXnUnbound, onYaBound, onYaUnbound,
-  onFramehdrBound, onFramehdrUnbound, onPanfxBound, onPanfxUnbound, onMukakuBound, onMukakuUnbound,
+  onFramehdrBound, onFramehdrUnbound, onPanfxBound, onPanfxUnbound, onSt1Bound, onSt1Unbound,
+  onMukakuBound, onMukakuUnbound,
+  onJyingBound, onJyingUnbound, onHdhavenBound, onHdhavenUnbound,
 }: BindDialogProps) {
   const boundCount = pinglianBindings.length + xnBindings.length + yaBindings.length
-    + (framehdrBinding ? 1 : 0) + (panfxBinding ? 1 : 0) + mukakuBindings.length;
+    + (framehdrBinding ? 1 : 0) + (panfxBinding ? 1 : 0) + (st1Binding ? 1 : 0) + mukakuBindings.length
+    + jyingBindings.length + hdhavenBindings.length;
   const hasBound = boundCount > 0;
 
   return (
@@ -1236,7 +1757,9 @@ export default function BindDialog({
         </DialogHeader>
 
         <Tabs defaultValue="pinglian" className="w-full min-w-0">
-          <TabsList className="w-full bg-muted border border-border h-8 mb-1">
+          {/* 9 个站点 tab 在手机宽度一行放不下（不换行时内在宽度约 520px，必然溢出屏幕），
+              所以改成可换行 + 高度自适应：窄屏自动折成两行，桌面端仍是单行 h-8 */}
+          <TabsList className="w-full flex-wrap justify-start h-auto md:h-8 bg-muted border border-border mb-1">
             <TabsTrigger value="pinglian"
               className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               盘链
@@ -1246,11 +1769,6 @@ export default function BindDialog({
               className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               观影
               {xnBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
-            </TabsTrigger>
-            <TabsTrigger value="ya"
-              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
-              鸭影
-              {yaBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
             </TabsTrigger>
             <TabsTrigger value="framehdr"
               className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
@@ -1267,7 +1785,28 @@ export default function BindDialog({
               不太灵
               {mukakuBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
             </TabsTrigger>
+            <TabsTrigger value="jying"
+              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              聚影
+              {jyingBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
+            </TabsTrigger>
+            <TabsTrigger value="hdhaven"
+              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              栖影
+              {hdhavenBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
+            </TabsTrigger>
+            <TabsTrigger value="st1"
+              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
+              1号站点
+              {st1Binding && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
+            </TabsTrigger>
           </TabsList>
+          <TabsContent value="st1" className="w-full min-w-0 mt-0">
+            <St1Pane
+              resource={resource} st1Binding={st1Binding}
+              onSt1Bound={onSt1Bound} onSt1Unbound={onSt1Unbound}
+            />
+          </TabsContent>
           <TabsContent value="pinglian" className="w-full min-w-0 mt-0">
             <PinglianPane
               resource={resource} pinglianBindings={pinglianBindings}
@@ -1302,6 +1841,18 @@ export default function BindDialog({
             <MukakuPane
               resource={resource} mukakuBindings={mukakuBindings}
               onMukakuBound={onMukakuBound} onMukakuUnbound={onMukakuUnbound}
+            />
+          </TabsContent>
+          <TabsContent value="jying" className="w-full min-w-0 mt-0">
+            <JyingPane
+              resource={resource} jyingBindings={jyingBindings}
+              onJyingBound={onJyingBound} onJyingUnbound={onJyingUnbound}
+            />
+          </TabsContent>
+          <TabsContent value="hdhaven" className="w-full min-w-0 mt-0">
+            <HdhavenPane
+              resource={resource} hdhavenBindings={hdhavenBindings}
+              onHdhavenBound={onHdhavenBound} onHdhavenUnbound={onHdhavenUnbound}
             />
           </TabsContent>
         </Tabs>

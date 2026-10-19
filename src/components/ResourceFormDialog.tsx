@@ -18,11 +18,12 @@ import {
   FormLabel,
   FormControl,
   FormMessage,
+  FormDescription,
 } from '@/components/ui/form';
 import { toast } from 'sonner';
 import { Resource } from '@/types/index';
 import { type PanLink, detectPanName } from '@/lib/panUtils';
-import { insertResource } from '@/services/api';
+import { insertResource, RESOURCE_QUOTA_EXCEEDED_CODE } from '@/services/api';
 import { parseResourceText } from '@/lib/parse';
 
 interface ResourceFormDialogProps {
@@ -99,13 +100,16 @@ export default function ResourceFormDialog({
     const validLinks = links.filter((l) => l.url.trim());
     setSubmitting(true);
     try {
+      const episodeCount = Number(values.episode_count) || 0;
       const result = await insertResource({
         name: values.name.trim(),
-        episode_count: Number(values.episode_count) || 0,
+        episode_count: episodeCount,
         link: validLinks[0]?.url ?? '',
         links: validLinks,
         sort_order: 0,
         cover_url: null,
+        // 集数填 0 即视为已完结（需求）：直接进「已完结」面板，对外 API 推送也显示「已完结」
+        is_finished: episodeCount === 0,
       });
       if (result) {
         onAdded(result);
@@ -114,8 +118,10 @@ export default function ResourceFormDialog({
         setLinks([]);
         onOpenChange(false);
       }
-    } catch {
-      toast.error('添加失败，请重试');
+    } catch (err) {
+      const e = err as Error & { code?: string };
+      // 超出资源配额时直接展示服务端给出的额度说明
+      toast.error(e.code === RESOURCE_QUOTA_EXCEEDED_CODE ? e.message : '添加失败，请重试');
     } finally {
       setSubmitting(false);
     }
@@ -184,6 +190,10 @@ export default function ResourceFormDialog({
                       className="h-8 text-sm bg-input border-border focus-visible:ring-primary/40"
                       onChange={(e) => field.onChange(e.target.valueAsNumber || 0)} />
                   </FormControl>
+                  <FormDescription className="text-[11px] leading-relaxed">
+                    填 <b className="text-foreground">0 表示已完结</b>：资源直接进「已完结」面板，对外 API 推送也显示为「已完结」；
+                    填其它集数则按「更新中」处理。
+                  </FormDescription>
                 </FormItem>
               )} />
 

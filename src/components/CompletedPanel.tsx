@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Copy, CheckCheck, CheckSquare, Square, X, AlertCircle } from 'lucide-react';
+import { Copy, CheckCheck, CheckSquare, Square, X, AlertCircle, ImagePlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
@@ -36,27 +36,36 @@ export default function CompletedPanel({ resources, onRemoveFinished, format, on
     setSelectedIds(allSelected ? new Set() : new Set(finished.map((r) => r.id)));
   }
 
-  /** 复制一组资源为图文长图 */
-  async function copyGroup(list: Resource[], label: string) {
+  /**
+   * 复制一组资源。
+   * card = false（默认）：只复制纯文字 —— 粘贴到微信 / QQ / Word 得到可编辑文本；
+   * card = true：复制图文长图（封面 + 文字），适合需要封面的分享场景。
+   */
+  async function copyGroup(list: Resource[], label: string, card = false) {
     if (list.length === 0) {
       toast.info('请先勾选要复制的资源');
       return;
     }
     const text = list.map((r) => formatResource(r, format)).join('\n\n');
-    const { ok, withImage } = await copyCardsToClipboard(
+    const { ok, withImage, reason } = await copyCardsToClipboard(
       list.map((r) => ({
         name: r.name,
         links: filterLinksByFormat(resolveLinks(r.links, r.link ?? ''), format),
         coverUrl: r.cover_url,
       })),
-      text
+      text,
+      card ? 'card' : 'text'
     );
     if (ok) {
-      toast.success(
-        withImage
-          ? `已复制 ${list.length} 条为图文长图（${label}），可直接粘贴到 QQ`
-          : `已复制 ${list.length} 条（${label}）`
-      );
+      if (withImage) {
+        toast.success(`已复制 ${list.length} 条（${label}）：封面 + 标题 + 可点击链接，可直接粘贴到 QQ / 微信`);
+      } else if (!card) {
+        toast.success(`已复制 ${list.length} 条为纯文字（${label}）`);
+      } else if (reason === 'insecure-context') {
+        toast.warning('已复制文字：当前为 HTTP 访问，浏览器禁止写入富文本到剪贴板，改用 HTTPS 访问即可带上封面与可点击链接');
+      } else {
+        toast.success(`已复制 ${list.length} 条（${label}）`);
+      }
     } else {
       toast.error('复制失败，请手动选中文本复制');
     }
@@ -105,11 +114,19 @@ export default function CompletedPanel({ resources, onRemoveFinished, format, on
       {/* 操作栏：全部复制 / 勾选复制 */}
       {finished.length > 0 && (
         <div className="flex items-center justify-between px-4 py-2 border-b border-border/50 shrink-0 bg-muted/20">
-          <Button variant="ghost" size="sm" onClick={() => copyGroup(finished, '全部')}
-            className="h-6 px-2 text-xs text-primary hover:bg-primary/10 gap-1">
-            <Copy className="h-3 w-3" />全部复制
-          </Button>
-          <Button variant="ghost" size="sm" onClick={() => copyGroup(finished.filter((r) => selectedIds.has(r.id)), '勾选')}
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="sm" onClick={() => copyGroup(finished, '全部', true)}
+              title="复制为卡片图（封面 + 资源名 + 网盘链接），可直接粘贴到 QQ / 微信"
+              className="h-6 px-2 text-xs text-primary hover:bg-primary/10 gap-1">
+              <ImagePlus className="h-3 w-3" />全部复制
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => copyGroup(finished, '全部')}
+              title="只复制纯文字，粘贴到任何地方都是可编辑文本"
+              className="h-6 px-2 text-xs text-muted-foreground hover:text-primary hover:bg-primary/10 gap-1">
+              <Copy className="h-3 w-3" />复制文字
+            </Button>
+          </div>
+          <Button variant="ghost" size="sm" onClick={() => copyGroup(finished.filter((r) => selectedIds.has(r.id)), '勾选', true)}
             disabled={selectedIds.size === 0}
             className="h-6 px-2 text-xs text-muted-foreground hover:text-primary hover:bg-primary/10 gap-1 disabled:opacity-40">
             <Copy className="h-3 w-3" />复制勾选({selectedIds.size})
@@ -138,20 +155,10 @@ export default function CompletedPanel({ resources, onRemoveFinished, format, on
                     selected ? 'border-primary/60 ring-1 ring-primary/30' : 'border-border/60 hover:border-primary/30'
                   }`}>
                   <div className="flex items-stretch gap-0">
-                    {/* 勾选区 */}
-                    <button
-                      onClick={() => toggleSelect(resource.id)}
-                      className={`w-8 shrink-0 flex items-center justify-center transition-colors ${
-                        selected ? 'bg-primary/10 text-primary' : 'text-muted-foreground/40 hover:text-primary hover:bg-primary/5'
-                      }`}
-                      aria-label={selected ? '取消选择' : '选择'}
-                    >
-                      {selected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
-                    </button>
-                    {/* 封面：手机 w-16，桌面 w-24 */}
+                    {/* 封面：手机 w-16，桌面 w-24（放最左侧，勾选框已移到操作行末尾） */}
                     {resource.cover_url ? (
                       <div className="w-16 md:w-24 shrink-0 aspect-[2/3] relative overflow-hidden bg-muted">
-                        <img src={resource.cover_url} alt="封面" className="w-full h-full object-cover" />
+                        <img src={resource.cover_url} alt="封面" referrerPolicy="no-referrer" className="w-full h-full object-cover" />
                       </div>
                     ) : null}
                     {/* 信息区 */}
@@ -178,6 +185,19 @@ export default function CompletedPanel({ resources, onRemoveFinished, format, on
                           title="移出已完结">
                           <X className="h-3 w-3" />移出
                         </Button>
+                        {/* 勾选：放在复制按钮之后，封面得以靠左更美观 */}
+                        <button
+                          onClick={() => toggleSelect(resource.id)}
+                          className={`ml-auto h-6 w-6 shrink-0 flex items-center justify-center rounded-md transition-colors ${
+                            selected
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground/40 hover:text-primary hover:bg-primary/5'
+                          }`}
+                          aria-label={selected ? '取消选择' : '选择'}
+                          title={selected ? '取消选择' : '选择'}
+                        >
+                          {selected ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                        </button>
                       </div>
                     </div>
                   </div>

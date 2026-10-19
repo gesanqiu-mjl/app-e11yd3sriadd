@@ -1,5 +1,7 @@
 import { supabase } from '@/db/supabase';
-import { detectPanName } from '@/lib/panUtils';
+import { detectPanName, PAN_TYPE_LABELS } from '@/lib/panUtils';
+// 站点凭据云端留档（加密存储）：会话失效后可自动重新登录
+import { saveSiteCredential } from '@/lib/siteCredentials';
 import {
   Resource,
   ChangeHistory,
@@ -8,24 +10,95 @@ import {
   AdminHistory,
   UserRole,
   InviteCode,
+  ApiKey,
   PinglianBinding,
   PinglianLink,
+  PinglianCaptcha,
   ResourceBinding,
   UpdatedItem,
   LoginConfig,
   LOGIN_CONFIG_DEFAULTS,
+  SubscriptionSource,
+  SubscriptionSourceInput,
+  AdminResourceSource,
+  Tutorial,
 } from '@/types/index';
 
+/**
+ * 取当前登录用户 id（读本地 session，**不发网络请求**）。
+ *
+ * 为什么不用 auth.getUser()：它会额外打一次 /auth/v1/user 网络请求 ——
+ * 手机网络抖动、切后台再回来时，这一步就会抛 "Failed to fetch"，
+ * 最终表现为整页「加载资源列表失败，请刷新重试」。
+ * 改用本地 session 后不再依赖额外网络往返；权限不受影响：
+ * 数据库 RLS 仍然只返回当前用户自己的数据。
+ */
+export async function currentUserId(): Promise<string> {
+  const { data } = await supabase.auth.getSession();
+  return data.session?.user?.id ?? '';
+}
+
 export async function fetchResources(): Promise<Resource[]> {
-  const { data: { user } } = await supabase.auth.getUser();
+  const uid = await currentUserId();
+  if (!uid) return [];
   const { data, error } = await supabase
     .from('resources')
     .select('*')
-    .eq('owner_id', user?.id ?? '')
+    .eq('owner_id', uid)
     .order('sort_order', { ascending: true })
     .order('created_at', { ascending: false });
   if (error) throw error;
   return Array.isArray(data) ? data : [];
+}
+
+/** 取单条资源的简要信息（订阅里回显「已绑定的资源」，避免拉全量资源） */
+export async function fetchResourceBrief(
+  id: string
+): Promise<{ id: string; name: string; episode_count: number } | null> {
+  const { data, error } = await supabase
+    .from('resources')
+    .select('id, name, episode_count')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw error;
+  return (data as { id: string; name: string; episode_count: number } | null) ?? null;
+}
+
+/** 服务端（订阅转存）改了资源后登记的待推送任务 */
+export interface ResourceSyncTask {
+  id: string;
+  resource_id: string;
+  resource_name: string;
+  reason: string;
+  created_at: string;
+}
+
+/**
+ * 取待推送任务：订阅在服务端更新了资源（集数等）后登记，
+ * 服务端 worker（resource-sync-worker）每分钟会无人值守补推；
+ * 这里作为兜底（worker 未部署/某站点失败时）在资源管理页打开时再补推一次。
+ * 已被 worker 抢占（5 分钟内）的任务跳过，避免两边重复推送同一变更。
+ */
+export async function fetchResourceSyncQueue(): Promise<ResourceSyncTask[]> {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user?.id) return [];
+  const staleBefore = new Date(Date.now() - 5 * 60_000).toISOString();
+  const { data, error } = await supabase
+    .from('resource_sync_queue')
+    .select('id, resource_id, resource_name, reason, created_at')
+    .eq('user_id', user.id)
+    .or(`claimed_at.is.null,claimed_at.lt.${staleBefore}`)
+    .order('created_at', { ascending: true })
+    .limit(20);
+  if (error) throw error;
+  return Array.isArray(data) ? (data as ResourceSyncTask[]) : [];
+}
+
+/** 推送完成后清掉任务（失败的不要清，下次再补推） */
+export async function clearResourceSyncQueue(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const { error } = await supabase.from('resource_sync_queue').delete().in('id', ids);
+  if (error) throw error;
 }
 
 export async function updateResourceSortOrders(
@@ -55,6 +128,61 @@ export async function updateResourceCover(
   return data;
 }
 
+const COVER_PUBLIC_MARKER = '/storage/v1/object/public/covers/';
+
+/**
+ * 把「任何来源的 covers 公开地址」重写为当前前端配置的公开地址。
+ *
+ * 边缘函数（cover-import）跑在容器网络里，它的 SUPABASE_URL 是内网地址
+ * （如 http://kong:8000），直接存进库浏览器根本打不开；自建环境下还会因为
+ * http/https 不一致被 Mixed Content 拦截。这里统一按 key 重新拼一次，
+ * 保证入库的始终是可访问的公开地址（由 VITE_SUPABASE_URL 决定协议与域名）。
+ */
+function normalizeCoverUrl(url: string): string | null {
+  const idx = url.indexOf(COVER_PUBLIC_MARKER);
+  if (idx === -1) return null;
+  const key = decodeURIComponent(url.slice(idx + COVER_PUBLIC_MARKER.length));
+  return supabase.storage.from('covers').getPublicUrl(key).data.publicUrl;
+}
+
+/**
+ * 将外站封面下载后导入本应用 covers 存储桶，返回本应用自有公开 URL。
+ * 站点片库返回的封面多为外站绝对地址，其中一部分不返回 CORS 头，
+ * 浏览器端无法直接下载，且绘制到 canvas 合成分享卡片时会被污染。
+ * 因此统一交给 cover-import 边缘函数在服务端抓取落桶。
+ * 导入失败时返回 null，调用方回退为原始外站 URL。
+ */
+export async function importCoverFromUrl(
+  resourceId: string,
+  remoteUrl: string
+): Promise<string | null> {
+  try {
+    // 已是自有存储桶地址，无需重复导入（原样返回，历史数据由回填脚本统一迁移）
+    if (remoteUrl.includes(COVER_PUBLIC_MARKER)) return remoteUrl;
+
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return null;
+
+    const res = await fetch(
+      `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/cover-import`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ url: remoteUrl, resourceId }),
+      }
+    );
+    const data = await res.json().catch(() => null);
+    if (!res.ok || data?.success === false || !data?.url) return null;
+    // 函数返回的是内网地址，按 key 重拼为前端可访问的公开地址
+    return normalizeCoverUrl(data.url as string) ?? (data.url as string);
+  } catch {
+    return null;
+  }
+}
+
 export async function updateResourceField(
   id: string,
   field: string,
@@ -72,13 +200,93 @@ export async function updateResourceField(
   return data;
 }
 
+// ============ 资源配额（非管理员上限，可被管理员按账号调整） ============
+
+/** 非管理员账号的「默认」资源条数上限；管理员可在「用户管理 → 额度设置」按账号单独调整 */
+export const MAX_RESOURCES_PER_USER = 200;
+
+/** 超出资源配额时抛出的错误码，前端据此给出明确提示 */
+export const RESOURCE_QUOTA_EXCEEDED_CODE = 'RESOURCE_QUOTA_EXCEEDED';
+
+/** 按账号解析资源上限：profiles.max_resources 是正数就用它，否则回落到默认值 */
+export function resolveResourceLimit(maxResources: number | null | undefined): number {
+  return typeof maxResources === 'number' && maxResources > 0 ? maxResources : MAX_RESOURCES_PER_USER;
+}
+
+/** 资源配额不足的错误（带 code，便于调用方区别于其他失败原因） */
+function resourceQuotaError(limit: number, used: number, incoming: number): Error & { code: string } {
+  const remain = Math.max(limit - used, 0);
+  const err = new Error(
+    `该账号最多可持有 ${limit} 条资源：当前已有 ${used} 条，本次新增 ${incoming} 条，仅可再添加 ${remain} 条`
+  ) as Error & { code: string };
+  err.code = RESOURCE_QUOTA_EXCEEDED_CODE;
+  return err;
+}
+
+/**
+ * 校验资源配额：管理员不限；非管理员按「已持有条数 + 本次新增条数」不得超过账号额度。
+ * 额度取自 profiles.max_resources（管理员可调），为空时用默认 200。
+ * 配额不足时抛出带 RESOURCE_QUOTA_EXCEEDED_CODE 的错误。
+ */
+async function ensureResourceQuota(userId: string, incoming: number): Promise<void> {
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role, max_resources')
+    .eq('id', userId)
+    .maybeSingle();
+  // 查不到角色时按普通用户处理，避免绕过限制
+  if (profile?.role === 'admin') return;
+
+  const limit = resolveResourceLimit(profile?.max_resources);
+
+  const { count, error } = await supabase
+    .from('resources')
+    .select('id', { count: 'exact', head: true })
+    .eq('owner_id', userId);
+  if (error) throw error;
+
+  const used = count ?? 0;
+  if (used + incoming > limit) throw resourceQuotaError(limit, used, incoming);
+}
+
+/** 查询当前用户的资源配额使用情况，供前端提前提示（管理员 isAdmin=true，不限制） */
+export async function fetchResourceQuota(): Promise<{ isAdmin: boolean; used: number; limit: number }> {
+  const uid = await currentUserId();
+  if (!uid) return { isAdmin: false, used: 0, limit: MAX_RESOURCES_PER_USER };
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role, max_resources')
+    .eq('id', uid)
+    .maybeSingle();
+  if (profile?.role === 'admin') return { isAdmin: true, used: 0, limit: MAX_RESOURCES_PER_USER };
+
+  const limit = resolveResourceLimit(profile?.max_resources);
+
+  const { count, error } = await supabase
+    .from('resources')
+    .select('id', { count: 'exact', head: true })
+    .eq('owner_id', uid);
+  if (error) throw error;
+  return { isAdmin: false, used: count ?? 0, limit };
+}
+
 export async function insertResource(
   resource: Omit<Resource, 'id' | 'created_at' | 'updated_at' | 'owner_id' | 'link_status' | 'link_checked_at'>
 ): Promise<Resource | null> {
   const { data: { user } } = await supabase.auth.getUser();
+  // 非管理员配额校验（管理员不限）
+  if (user?.id) await ensureResourceQuota(user.id, 1);
+  const episodeCount = Number(resource.episode_count) || 0;
   const { data, error } = await supabase
     .from('resources')
-    .insert({ ...resource, owner_id: user?.id })
+    .insert({
+      ...resource,
+      episode_count: episodeCount,
+      // 集数填 0 即视为已完结：直接进「已完结」面板，对外 API 推送也显示「已完结」
+      is_finished: episodeCount === 0 ? true : resource.is_finished === true,
+      owner_id: user?.id,
+    })
     .select()
     .maybeSingle();
   if (error) throw error;
@@ -90,6 +298,8 @@ export async function insertResources(
 ): Promise<Resource[]> {
   if (items.length === 0) return [];
   const { data: { user } } = await supabase.auth.getUser();
+  // 非管理员配额校验（管理员不限）
+  if (user?.id) await ensureResourceQuota(user.id, items.length);
   const withOwner = items.map((it) => ({ ...it, owner_id: user?.id }));
   const { data, error } = await supabase.from('resources').insert(withOwner).select();
   if (error) throw error;
@@ -106,35 +316,89 @@ export async function deleteResource(id: string): Promise<void> {
   if (error) throw error;
 }
 
-/** 检测指定资源的链接是否失效，返回每个资源的检测结果 */
+/** 单个资源的云盘链接检测结果 */
+export interface LinkCheckResult {
+  id: string;
+  valid: boolean;
+  status: 'valid' | 'partial' | 'invalid';
+  checkedAt: string;
+  linkResults: Array<{ url: string; valid: boolean }>;
+}
+
+/** 链接检测整体结果：某几批失败时仍返回其余批次的结果，由调用方提示 */
+export interface CheckLinksOutcome {
+  results: LinkCheckResult[];
+  /** 失败的批次数（外站过慢/超时等），>0 表示结果不完整 */
+  failedChunks: number;
+  totalChunks: number;
+  /** 首条错误信息 */
+  lastError?: string;
+}
+
+/**
+ * 单次提交给 check-links 的资源条数上限：边缘函数需逐条访问外站
+ * （光鸭一条链接就要 3 次串行请求，函数内并发仅 5），一次提交过多会超出
+ * 函数/网关耗时上限，前端因此分片提交并汇总结果。
+ */
+const CHECK_LINKS_CHUNK = 20;
+
+/** 链接检测单次请求超时：外站响应普遍偏慢，比通用代理超时放宽到 60s */
+const CHECK_LINKS_TIMEOUT_MS = 60000;
+
+/**
+ * 检测指定资源的云盘链接是否失效（分片提交，避免整次请求超时）。
+ *
+ * 单片失败不会让整次检测失败：已完成批次的结果（服务端也已回写）照常返回，
+ * 仅当所有批次都失败时才抛错。
+ */
 export async function checkLinks(
-  resourceIds: string[]
-): Promise<
-  Array<{
-    id: string;
-    valid: boolean;
-    status: 'valid' | 'partial' | 'invalid';
-    checkedAt: string;
-    linkResults: Array<{ url: string; valid: boolean }>;
-  }>
-> {
+  resourceIds: string[],
+  onProgress?: (done: number, total: number) => void
+): Promise<CheckLinksOutcome> {
   const { data: sessionData } = await supabase.auth.getSession();
   if (!sessionData?.session) throw new Error('请先登录');
-  const res = await fetchWithRetry(
-    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/check-links`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${sessionData.session.access_token}`,
-      },
-      body: JSON.stringify({ resource_ids: resourceIds }),
-    },
-    { retriable: true } // 链接检测为幂等读操作，可自动重试
-  );
-  const data = await parseJsonSafe(res);
-  if (!res.ok || !data) throw new Error(data?.error || `链接检测失败（HTTP ${res.status}）`);
-  return Array.isArray(data.results) ? data.results : [];
+
+  const ids = resourceIds.filter(Boolean);
+  const results: LinkCheckResult[] = [];
+  const totalChunks = Math.ceil(ids.length / CHECK_LINKS_CHUNK);
+  let failedChunks = 0;
+  let succeededChunks = 0;
+  let lastError = '';
+  onProgress?.(0, ids.length);
+
+  for (let i = 0; i < ids.length; i += CHECK_LINKS_CHUNK) {
+    const chunk = ids.slice(i, i + CHECK_LINKS_CHUNK);
+    try {
+      const res = await fetchWithRetry(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/check-links`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sessionData.session.access_token}`,
+          },
+          body: JSON.stringify({ resource_ids: chunk }),
+        },
+        // 链接检测为幂等读操作，可重试；但超时不重试，避免整体耗时成倍增长
+        { retriable: true, timeoutMs: CHECK_LINKS_TIMEOUT_MS, retryOnTimeout: false }
+      );
+      const data = await parseJsonSafe(res);
+      if (!res.ok || !data) throw new Error(data?.error || `链接检测失败（HTTP ${res.status}）`);
+      if (Array.isArray(data.results)) results.push(...data.results);
+      succeededChunks += 1;
+    } catch (err) {
+      failedChunks += 1;
+      lastError = (err as Error).message || '链接检测失败';
+    }
+    onProgress?.(Math.min(i + chunk.length, ids.length), ids.length);
+  }
+
+  // 全部批次都失败：抛出错误由调用方提示（如网络中断、链接失效等）
+  if (succeededChunks === 0 && failedChunks > 0) {
+    throw new Error(lastError || '链接检测失败');
+  }
+
+  return { results, failedChunks, totalChunks, lastError: lastError || undefined };
 }
 
 /** 设置/取消资源的已完结标记 */
@@ -187,8 +451,9 @@ export async function fetchHistory(
  * dayOffset: 0=今天, 1=昨天, 2=前天
  */
 export async function fetchUpdatedItems(dayOffset = 0): Promise<UpdatedItem[]> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return [];
+  // 读本地 session（不发网络请求），避免手机端多一次可能失败的网络往返
+  const uid = await currentUserId();
+  if (!uid) return [];
 
   // 计算所选日期的本地起止时间，转为 UTC ISO
   const now = new Date();
@@ -198,7 +463,7 @@ export async function fetchUpdatedItems(dayOffset = 0): Promise<UpdatedItem[]> {
   const { data, error } = await supabase
     .from('change_history')
     .select('*, resources!change_history_resource_id_fkey(*)')
-    .eq('user_id', user.id)
+    .eq('user_id', uid)
     .gte('changed_at', start.toISOString())
     .lte('changed_at', end.toISOString())
     .order('changed_at', { ascending: false })
@@ -269,6 +534,128 @@ export async function fetchAllResources(): Promise<AdminResource[]> {
   });
 }
 
+// ============ 资源导入导出 ============
+
+/** 导入/导出使用的外部交换格式：不含 id / owner，便于跨环境迁移 */
+export interface ResourceExportItem {
+  name: string;
+  episode_count: number;
+  link: string;
+  links: Array<{ url: string; pan_name?: string }>;
+  cover_url: string | null;
+  is_finished: boolean;
+  sort_order: number;
+  link_status: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** 导出包结构（与旧环境导出文件保持一致，可直接互相导入） */
+export interface ResourceExportBundle {
+  version: string;
+  app: string;
+  export_time: string;
+  scope: string;
+  scope_label: string;
+  total_count: number;
+  with_covers_count: number;
+  resources: ResourceExportItem[];
+}
+
+/** 按范围（全部 / 更新中 / 已完结）把资源组装成导出包 */
+export function buildResourceExport(
+  resources: Resource[],
+  scope: 'all' | 'updating' | 'finished'
+): ResourceExportBundle {
+  const list = resources.filter((r) =>
+    scope === 'all' ? true : scope === 'finished' ? r.is_finished : !r.is_finished
+  );
+  return {
+    version: '1.0',
+    app: 'resource-tracker',
+    export_time: new Date().toISOString(),
+    scope,
+    scope_label:
+      scope === 'all'
+        ? '全部资源 (更新中+已完结)'
+        : scope === 'finished'
+          ? '已完结资源'
+          : '更新中资源',
+    total_count: list.length,
+    with_covers_count: list.filter((r) => !!r.cover_url).length,
+    resources: list.map((r) => ({
+      name: r.name,
+      episode_count: r.episode_count ?? 0,
+      link: r.link ?? '',
+      links: Array.isArray(r.links) ? r.links : [],
+      cover_url: r.cover_url ?? null,
+      is_finished: !!r.is_finished,
+      sort_order: r.sort_order ?? 0,
+      link_status: r.link_status ?? 'unknown',
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+    })),
+  };
+}
+
+/**
+ * 批量导入资源（归当前登录用户）。
+ * 原文件里的封面多指向旧环境（如 backend.miaoda.online），在新环境可能已失效，
+ * 因此会尝试用 cover-import 抓取后落到本应用 covers 桶；失败则保留原地址，不阻断导入。
+ */
+export async function importResources(
+  items: ResourceExportItem[],
+  onProgress?: (done: number, total: number) => void
+): Promise<{ inserted: number; failed: number; errors: string[] }> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+
+  // 导入前整体校验配额：超出时直接拒绝，避免导入一半才发现（管理员不限）
+  await ensureResourceQuota(userData.user.id, items.length);
+
+  const BATCH = 20;
+  let inserted = 0;
+  let failed = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < items.length; i += BATCH) {
+    const batch = items.slice(i, i + BATCH).map((r) => ({
+      name: r.name || '未命名资源',
+      episode_count: Number(r.episode_count) || 0,
+      link: r.link || '',
+      links: (Array.isArray(r.links) ? r.links : []) as Resource['links'],
+      cover_url: r.cover_url ?? null,
+      is_finished: !!r.is_finished,
+      sort_order: Number(r.sort_order) || 0,
+    }));
+
+    let rows: Resource[] = [];
+    try {
+      rows = await insertResources(batch);
+      inserted += rows.length;
+    } catch (e) {
+      failed += batch.length;
+      errors.push((e as Error).message);
+      onProgress?.(Math.min(i + BATCH, items.length), items.length);
+      continue;
+    }
+
+    // 封面重新落桶：仅处理非本应用存储桶的地址
+    for (const row of rows) {
+      const url = row.cover_url;
+      if (!url || url.includes('/storage/v1/object/public/covers/')) continue;
+      try {
+        const local = await importCoverFromUrl(row.id, url);
+        if (local) await updateResourceCover(row.id, local);
+      } catch { /* 单张封面失败不影响导入 */ }
+    }
+
+    onProgress?.(Math.min(i + BATCH, items.length), items.length);
+  }
+
+  return { inserted, failed, errors };
+}
+
 // 全部修改历史（含用户名）
 export async function fetchAllHistory(
   startDate?: string,
@@ -329,14 +716,23 @@ export async function fetchInviteCodes(): Promise<InviteCode[]> {
   return Array.isArray(data) ? data : [];
 }
 
-/** 管理员生成一个新邀请码 */
-export async function createInviteCode(membershipDays: number): Promise<InviteCode | null> {
+/**
+ * 管理员生成一个新邀请码。
+ * isSpecial=true 时生成「特殊邀请码」：永久有效（membership_days=-1），
+ * 用它注册的账号只能使用订阅功能、只能订阅管理员维护的订阅源、最多 10 个订阅。
+ */
+export async function createInviteCode(membershipDays: number, isSpecial = false): Promise<InviteCode | null> {
   const code = makeCode();
   const { data: session } = await supabase.auth.getSession();
   const createdBy = session?.session?.user?.id ?? null;
   const { data, error } = await supabase
     .from('invite_codes')
-    .insert({ code, created_by: createdBy, membership_days: membershipDays })
+    .insert({
+      code,
+      created_by: createdBy,
+      membership_days: isSpecial ? -1 : membershipDays,
+      is_special: isSpecial,
+    })
     .select()
     .maybeSingle();
   if (error) throw error;
@@ -352,16 +748,40 @@ export async function revokeInviteCode(id: string): Promise<void> {
   if (error) throw error;
 }
 
-/** 验证邀请码是否有效（注册前客户端乐观检查） */
+/**
+ * 验证邀请码是否有效（注册前客户端乐观检查）。
+ * 走 SECURITY DEFINER 函数：匿名访客已无 invite_codes 表读取权限，
+ * 服务端只回传布尔值，不再暴露码值 / 创建者 / 记录条数。
+ */
 export async function validateInviteCode(code: string): Promise<boolean> {
-  const { data } = await supabase
-    .from('invite_codes')
-    .select('id')
-    .eq('code', code.toUpperCase())
-    .eq('is_revoked', false)
-    .is('used_by', null)
-    .maybeSingle();
-  return !!data;
+  const { data, error } = await supabase.rpc('check_invite_code', {
+    p_code: code.toUpperCase(),
+  });
+  if (error) throw error;
+  return data === true;
+}
+
+/** 邀请码状态：ok 可用 / used 已被使用 / revoked 已被撤销 / invalid 不存在 */
+export type InviteCodeStatus = 'ok' | 'used' | 'revoked' | 'invalid';
+
+/**
+ * 校验邀请码并返回具体原因（注册页据此给出可定位的提示）。
+ * 走 check_invite_code_status（SECURITY DEFINER，只回状态不回码值）；
+ * 老库若还是缺这个函数（PGRST202），自动退回布尔版 check_invite_code。
+ */
+export async function checkInviteCode(code: string): Promise<InviteCodeStatus> {
+  const { data, error } = await supabase.rpc('check_invite_code_status', {
+    p_code: code.toUpperCase(),
+  });
+  if (error) {
+    if (/PGRST202|does not exist|Could not find the function/i.test(error.message ?? '')) {
+      const ok = await validateInviteCode(code);
+      return ok ? 'ok' : 'invalid';
+    }
+    throw error;
+  }
+  const s = String(data ?? 'invalid');
+  return (s === 'ok' || s === 'used' || s === 'revoked' ? s : 'invalid');
 }
 
 /** 原子消费邀请码（注册完成后调用，SECURITY DEFINER RPC） */
@@ -372,6 +792,95 @@ export async function consumeInviteCode(code: string, userId: string): Promise<b
   });
   if (error) throw error;
   return data === true;
+}
+
+/**
+ * 管理员设置某用户的「订阅数量上限」。
+ * limit 传 null 表示按账号类型取默认（订阅专用 10 / 普通 80；订阅专用账号 null 仍是「不限」）。
+ * 特权列由数据库触发器保护：只有管理员能改（普通用户改会被直接拒绝）。
+ */
+export async function updateProfileSubscriptionLimit(id: string, limit: number | null): Promise<void> {
+  const { error } = await supabase
+    .from('profiles')
+    .update({ max_subscriptions: limit })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+/**
+ * 管理员设置某账号的额度（资源条数 / 订阅条数）。
+ * 传 undefined 表示「这一次不改这一项」；传 null 表示恢复默认：
+ *   · maxResources      null → 默认 200（管理员账号本身不受限）
+ *   · maxSubscriptions  null → 订阅专用账号=不限、普通账号=默认 80
+ * 特权列由数据库触发器保护：只有管理员能改。
+ */
+export async function updateProfileQuota(
+  id: string,
+  quota: { maxResources?: number | null; maxSubscriptions?: number | null }
+): Promise<void> {
+  const patch: Record<string, number | null> = {};
+  if (quota.maxResources !== undefined) patch.max_resources = quota.maxResources;
+  if (quota.maxSubscriptions !== undefined) patch.max_subscriptions = quota.maxSubscriptions;
+  if (Object.keys(patch).length === 0) return;
+  const { error } = await supabase.from('profiles').update(patch).eq('id', id);
+  if (error) throw error;
+}
+
+// ============ 订阅源管理（管理员维护；受限账号只能从这里选订阅链接） ============
+
+/**
+ * 读取订阅源列表。
+ * includeInactive=false（默认，订阅页选源用）只返回已启用的；
+ * includeInactive=true（管理后台）返回全部，便于编辑停用的源。
+ */
+export async function fetchSubscriptionSources(includeInactive = false): Promise<SubscriptionSource[]> {
+  let q = supabase
+    .from('subscription_sources')
+    .select('*')
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: false });
+  if (!includeInactive) q = q.eq('is_active', true);
+  const { data, error } = await q;
+  if (error) throw error;
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * 受限账号：读取管理员「资源管理」中**更新中**资源的网盘链接（一个资源可能有多条：光鸭 + 夸克），
+ * 供「订阅转存」的选择订阅源弹窗使用。非管理员且非「订阅专用」账号调用会得到空列表。
+ */
+export async function fetchAdminResourceSources(): Promise<AdminResourceSource[]> {
+  const { data, error } = await supabase.rpc('admin_resource_sources');
+  if (error) throw error;
+  return Array.isArray(data) ? (data as AdminResourceSource[]) : [];
+}
+
+/** 管理员新增订阅源 */
+export async function createSubscriptionSource(input: SubscriptionSourceInput): Promise<SubscriptionSource | null> {
+  const { data, error } = await supabase.from('subscription_sources').insert(input).select().maybeSingle();
+  if (error) {
+    if (/duplicate key/i.test(error.message)) throw new Error('该订阅源地址已存在，请勿重复添加');
+    throw error;
+  }
+  return data;
+}
+
+/** 管理员修改订阅源 */
+export async function updateSubscriptionSource(
+  id: string,
+  patch: Partial<SubscriptionSourceInput>
+): Promise<void> {
+  const { error } = await supabase.from('subscription_sources').update(patch).eq('id', id);
+  if (error) {
+    if (/duplicate key/i.test(error.message)) throw new Error('该订阅源地址已存在，请勿重复添加');
+    throw error;
+  }
+}
+
+/** 管理员删除订阅源 */
+export async function deleteSubscriptionSource(id: string): Promise<void> {
+  const { error } = await supabase.from('subscription_sources').delete().eq('id', id);
+  if (error) throw error;
 }
 
 // ============ 会员管理 ============
@@ -385,10 +894,166 @@ export async function updateProfileMembership(
   const expiresAt = days === -1 || days === 0
     ? null
     : new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+  // 会员到期会被数据库定时任务自动禁用（status → disabled）；
+  // 这里只要把会员时间改到「有效」（永久或未来），就同时恢复启用，
+  // 省得管理员续了会员还得再手动点一次「启用」。（days = 0 表示清空/立即到期，不动状态）
+  const patch: { membership_expires_at: string | null; status?: string } = {
+    membership_expires_at: expiresAt,
+  };
+  if (days !== 0) patch.status = 'active';
   const { error } = await supabase
     .from('profiles')
-    .update({ membership_expires_at: expiresAt })
+    .update(patch)
     .eq('id', id);
+  if (error) throw error;
+}
+
+/**
+ * 管理员自定义设置用户会员到期时间（直接指定具体时刻）。
+ * iso 传 null 表示永久 / 无期限；传 ISO 字符串表示该时刻到期。
+ * 与按天数计算的 updateProfileMembership 互补，用于精确控制（如「到月底」「到某日 23:59」）。
+ */
+export async function setProfileMembershipExpiry(
+  id: string,
+  iso: string | null
+): Promise<void> {
+  // 同上：把到期时间设成「永久 / 未来」时同时恢复启用（普通账号到期会被自动禁用）
+  const patch: { membership_expires_at: string | null; status?: string } = {
+    membership_expires_at: iso,
+  };
+  if (iso === null || new Date(iso).getTime() > Date.now()) patch.status = 'active';
+  const { error } = await supabase
+    .from('profiles')
+    .update(patch)
+    .eq('id', id);
+  if (error) throw error;
+}
+
+// ============ 批量发帖权限（管理员授予） ============
+
+/**
+ * 管理员为用户开通批量发帖权限（months 个自然月后到期）。
+ * months <= 0 表示关闭权限（到期时间置空 = 未开通）。
+ */
+export async function updateProfileBatchPost(id: string, months: number): Promise<void> {
+  let expiresAt: string | null = null;
+  if (months > 0) {
+    const d = new Date();
+    d.setMonth(d.getMonth() + months);
+    expiresAt = d.toISOString();
+  }
+  const { error } = await supabase
+    .from('profiles')
+    .update({ batch_post_expires_at: expiresAt })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+/**
+ * 管理员直接指定批量发帖权限到期时刻。
+ * iso 传 null 表示关闭权限（未开通）；传 ISO 字符串表示该时刻到期。
+ */
+export async function setProfileBatchPostExpiry(id: string, iso: string | null): Promise<void> {
+  const { error } = await supabase
+    .from('profiles')
+    .update({ batch_post_expires_at: iso })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+// ============ 订阅功能权限（管理员授予/收回） ============
+
+/**
+ * 管理员开关某用户的「订阅功能」权限。
+ * enabled=true 开通；false 关闭（关闭后该用户将无法使用订阅转存相关功能，定时任务也会跳过其订阅）。
+ * 管理员自身始终可用，不受此开关影响。
+ */
+export async function updateProfileSubscription(id: string, enabled: boolean): Promise<void> {
+  const { error } = await supabase
+    .from('profiles')
+    .update({ subscriptions_enabled: enabled })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+export type ProfileFeatureKey = 'can_resources' | 'can_site_sync' | 'can_shortlink' | 'can_subscriptions';
+
+/** 管理员：按功能给账号开通/关闭（资源管理 / 站点同步 / 短链管理 / 订阅转存） */
+export async function updateProfileFeature(
+  id: string,
+  feature: ProfileFeatureKey,
+  enabled: boolean
+): Promise<void> {
+  const { error } = await supabase
+    .from('profiles')
+    .update({ [feature]: enabled })
+    .eq('id', id);
+  if (error) throw error;
+}
+
+/**
+ * 管理员：批量给多个账号开通/关闭功能（用户管理里勾选后使用）。
+ * 勾了「订阅转存」时同步老字段 subscriptions_enabled，保证两处开关显示一致。
+ * 返回实际更新的行数。
+ */
+export async function updateProfilesFeatureBulk(
+  ids: string[],
+  features: ProfileFeatureKey[],
+  enabled: boolean
+): Promise<number> {
+  const list = ids.filter(Boolean);
+  if (list.length === 0 || features.length === 0) return 0;
+  const patch: Record<string, boolean> = {};
+  for (const f of features) patch[f] = enabled;
+  if (features.includes('can_subscriptions')) patch.subscriptions_enabled = enabled;
+
+  let updated = 0;
+  // 分批（每批 200 个 id），避免 URL/语句过长
+  for (let i = 0; i < list.length; i += 200) {
+    const chunk = list.slice(i, i + 200);
+    const { error, count } = await supabase
+      .from('profiles')
+      .update(patch, { count: 'exact' })
+      .in('id', chunk);
+    if (error) throw error;
+    updated += count ?? chunk.length;
+  }
+  return updated;
+}
+
+/**
+ * 个人中心：修改「我自己的」资料（用户名 / 头像地址）。
+ * 依赖 RLS「Users can update their own profile」——普通用户只能改自己这一行；
+ * 角色、会员、功能权限等特权列由触发器拦截，改不动。
+ */
+export async function updateMyProfile(
+  userId: string,
+  patch: { username?: string; avatar_url?: string | null }
+): Promise<void> {
+  const { error } = await supabase.from('profiles').update(patch).eq('id', userId);
+  if (error) {
+    // 用户名唯一约束冲突
+    if ((error as { code?: string }).code === '23505') {
+      throw new Error('该用户名已被占用，换一个试试');
+    }
+    throw error;
+  }
+}
+
+/** 用户名格式校验（与注册保持一致：字母 / 数字 / 下划线） */
+export function validateUsername(name: string): string | null {
+  const v = name.trim();
+  if (!v) return '用户名不能为空';
+  if (!/^[a-zA-Z0-9_]{2,20}$/.test(v)) return '用户名仅支持字母、数字、下划线，长度 2-20 位';
+  return null;
+}
+
+/**
+ * 管理员：删除账号（连同该账号名下的资源/订阅/绑定等数据）。
+ * 实际删除走服务端函数 admin_delete_user（内部校验调用者必须是管理员，且不能删自己）。
+ */
+export async function deleteUserAccount(id: string): Promise<void> {
+  const { error } = await supabase.rpc('admin_delete_user', { p_user_id: id });
   if (error) throw error;
 }
 
@@ -424,6 +1089,12 @@ export async function saveLoginConfig(
 export const COOKIE_EXPIRED_CODE = 'PINGLIAN_COOKIE_EXPIRED';
 /** 盘链绑定在站点已失效（v4 改版后旧 link_id 不存在且无法自动迁移），需解绑重绑 */
 export const PINGLIAN_LINK_NOT_FOUND_CODE = 'PINGLIAN_LINK_NOT_FOUND';
+/**
+ * 图形验证码错误 / 已过期。
+ * 站点 2026-09-27 起登录新增图形验证码（先 GET /api/auth/captcha 再带 captcha_id/captcha_code 登录），
+ * 服务端命中验证码错误时返回该 code，前端据此自动换一张验证码。
+ */
+export const PINGLIAN_CAPTCHA_ERROR_CODE = 'PINGLIAN_CAPTCHA_ERROR';
 
 /** 查询当前用户盘链绑定信息 */
 export async function getPinglianBinding(): Promise<PinglianBinding | null> {
@@ -438,8 +1109,35 @@ export async function getPinglianBinding(): Promise<PinglianBinding | null> {
   return data;
 }
 
-/** 账号密码登录并绑定盘链（服务端模拟登录，密码不落库） */
-export async function loginPinglian(username: string, password: string): Promise<void> {
+/**
+ * 获取盘链图形验证码（登录前置步骤）。
+ * 返回 id（登录时作为 captcha_id 提交）+ base64 图片 + 有效期秒数（站点默认 300s，一次性使用）。
+ */
+export async function fetchPinglianCaptcha(): Promise<PinglianCaptcha> {
+  try {
+    const data = await callPanlinksProxy<{ data?: PinglianCaptcha }>('captcha');
+    const captcha = data.data;
+    if (!captcha?.id || !captcha?.image) throw new Error('获取图形验证码失败，请稍后重试');
+    return captcha;
+  } catch (e) {
+    const msg = (e as Error).message || '';
+    // 线上函数仍是旧版本时，会走到旧版的「未知 action」分支
+    if (/不支持的 action/i.test(msg)) {
+      throw new Error(
+        '盘链代理函数尚未更新（缺少 captcha 接口）：请先部署 supabase/functions/panlinks-proxy'
+      );
+    }
+    throw e;
+  }
+}
+
+/** 账号密码 + 图形验证码登录并绑定盘链（服务端模拟登录，密码不落库） */
+export async function loginPinglian(
+  username: string,
+  password: string,
+  captchaId: string,
+  captchaCode: string
+): Promise<void> {
   const { data: userData } = await supabase.auth.getUser();
   if (!userData?.user) throw new Error('请先登录');
   const res = await fetchWithRetry(
@@ -450,14 +1148,54 @@ export async function loginPinglian(username: string, password: string): Promise
         Authorization: `Bearer ${(await supabase.auth.getSession()).data.session?.access_token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ username: username.trim(), password }),
+      body: JSON.stringify({
+        username: username.trim(),
+        password,
+        captcha_id: captchaId,
+        captcha_code: captchaCode.trim(),
+      }),
     },
     { retriable: false } // 登录写操作不重试，仅带超时
   );
   const data = await parseJsonSafe(res);
   if (!res.ok || !data || data.success === false) {
-    throw new Error(data?.message || data?.error || `盘链登录失败（HTTP ${res.status}），请检查账号密码`);
+    const err = new Error(
+      data?.message || data?.error || `盘链登录失败（HTTP ${res.status}），请检查账号密码`
+    ) as Error & { code?: string };
+    if (data?.code) err.code = data.code;
+    throw err;
   }
+  // 云端留档（该站点重登需要图形验证码，巡检时会提示手动处理）
+  await saveSiteCredential({ site: 'pinglian', username: username.trim(), password });
+}
+
+/**
+ * 备用绑定通道：直接粘贴浏览器里的整串 Cookie。
+ * 站点登录已启用图形验证码，若代理函数尚未更新（取不到验证码），
+ * 可在浏览器登录 pinglian.lol 后复制 Cookie（含 HttpOnly 的 admin_session）直接绑定；
+ * pinglian_sessions 有「用户可写自己行」的 RLS 策略，故无需经过边缘函数。
+ */
+export async function bindPinglianByCookie(
+  cookie: string,
+  username?: string,
+  remark = ''
+): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  const now = new Date().toISOString();
+  const { error } = await supabase.from('pinglian_sessions').upsert(
+    {
+      user_id: userData.user.id,
+      username: username?.trim() || null,
+      cookie: cookie.trim(),
+      remark: remark.trim(),
+      status: 'active',
+      last_check_at: now,
+      updated_at: now,
+    },
+    { onConflict: 'user_id' }
+  );
+  if (error) throw error;
 }
 
 /** 解绑盘链 */
@@ -495,11 +1233,12 @@ async function fetchWithTimeout(
 /**
  * 带重试的 fetch：仅幂等请求（retriable）在网络失败/超时/5xx/429 时自动重试 2 次。
  * 写操作（新增/编辑/删除）不重试，避免重复提交。
+ * retryOnTimeout=false 时超时不再重试（用于本身耗时较长的接口，避免整体耗时成倍增长）。
  */
 async function fetchWithRetry(
   url: string,
   init: RequestInit,
-  opts: { retriable?: boolean; timeoutMs?: number } = {}
+  opts: { retriable?: boolean; timeoutMs?: number; retryOnTimeout?: boolean } = {}
 ): Promise<Response> {
   const retries = 2;
   let lastErr: unknown = null;
@@ -513,12 +1252,9 @@ async function fetchWithRetry(
       return res;
     } catch (e) {
       lastErr = e;
-      if (!opts.retriable || attempt >= retries) {
-        throw new Error(
-          e instanceof Error && e.name === 'AbortError'
-            ? '请求超时，请稍后重试'
-            : '网络连接异常，请稍后重试'
-        );
+      const aborted = e instanceof Error && e.name === 'AbortError';
+      if (!opts.retriable || attempt >= retries || (aborted && opts.retryOnTimeout === false)) {
+        throw new Error(aborted ? '请求超时，请稍后重试' : '网络连接异常，请稍后重试');
       }
       await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
     }
@@ -580,7 +1316,7 @@ export async function loadPanLinks(): Promise<PinglianLink[]> {
   return data.data?.list ?? [];
 }
 
-/** 新增盘链资源 */
+/** 新增盘链资源（返回站点新建的链接记录 ID，用于落地本地「资源 × 网盘记录」绑定） */
 export async function addPanLink(params: {
   link_title: string;
   link_url: string;
@@ -588,8 +1324,8 @@ export async function addPanLink(params: {
   pan_type?: string;
   vod_id?: number;
   note?: string;
-}): Promise<void> {
-  await callPanlinksProxy('add', {
+}): Promise<{ linkId: number | null }> {
+  const res = await callPanlinksProxy<{ data?: { id?: number | string } }>('add', {
     link_title: params.link_title,
     link_url: params.link_url,
     link_password: params.link_password ?? '',
@@ -597,6 +1333,9 @@ export async function addPanLink(params: {
     vod_id: params.vod_id ?? 0,
     note: params.note ?? '',
   });
+  const id = res?.data?.id;
+  const num = Number(id);
+  return { linkId: id != null && Number.isFinite(num) ? num : null };
 }
 
 /** 修改/更新盘链资源（返回站点响应；旧 ID 失效时服务端会自动迁移并返回新 ID） */
@@ -619,11 +1358,152 @@ export async function updatePanLink(params: {
 }
 
 /** 服务端搜索自己的盘链发布记录（突破 list 单页 200 条上限） */
+/** 盘链：可同步群组列表（对接文档 §二 /api/chat-groups/share-targets） */
+export interface PinglianShareGroup {
+  id: string;
+  name: string;
+  is_official?: boolean;
+  selectable?: boolean;
+  hint?: string | null;
+}
+
+export async function pinglianShareTargets(): Promise<{
+  groups: PinglianShareGroup[];
+  official?: unknown;
+}> {
+  // 代理回传的是站点原始 JSON（{success,data:{groups:[...]}}），这里做兼容unwrap
+  const r = await callPanlinksProxy<{
+    groups?: unknown;
+    official?: unknown;
+    data?: unknown;
+  }>('share-targets');
+  const pickArray = (v: unknown): Array<Record<string, unknown>> => {
+    if (Array.isArray(v)) return v as Array<Record<string, unknown>>;
+    if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      for (const k of ['groups', 'list', 'items', 'chat_groups', 'data']) {
+        if (Array.isArray(o[k])) return o[k] as Array<Record<string, unknown>>;
+      }
+      for (const val of Object.values(o)) {
+        if (Array.isArray(val)) return val as Array<Record<string, unknown>>;
+      }
+    }
+    return [];
+  };
+  const raw = pickArray(r?.data).length ? pickArray(r?.data) : pickArray(r);
+  const d = (r?.data ?? {}) as Record<string, unknown>;
+  return {
+    groups: raw
+      .filter((g) => g && g.id != null)
+      .map((g) => ({
+        id: String(g.id),
+        name: String(g.name ?? g.title ?? `群组 ${g.id}`),
+        is_official: !!(g.is_official ?? g.official),
+        selectable: g.selectable === undefined ? true : !!g.selectable,
+        hint: (g.hint ?? null) as string | null,
+      })),
+    official: r?.official ?? d.official,
+  };
+}
+
+/** 盘链：「同时发送到群组」设置（存在 pinglian_sessions，代理会在每次 add/update 后自动发送） */
+export async function getPinglianGroupPref(): Promise<{ enabled: boolean; ids: string[] }> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return { enabled: false, ids: [] };
+  const { data } = await supabase
+    .from('pinglian_sessions')
+    .select('sync_group_enabled, sync_group_ids')
+    .eq('user_id', userData.user.id)
+    .maybeSingle();
+  return {
+    enabled: !!data?.sync_group_enabled,
+    ids: ((data?.sync_group_ids ?? []) as string[]).map(String),
+  };
+}
+
+export async function savePinglianGroupPref(params: { enabled: boolean; ids: string[] }): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  const { error } = await supabase
+    .from('pinglian_sessions')
+    .update({
+      sync_group_enabled: params.enabled,
+      sync_group_ids: params.ids.map(String),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', userData.user.id);
+  if (error) throw error;
+}
+
 export async function searchPanLinks(keyword: string): Promise<PinglianLink[]> {
   const data = await callPanlinksProxy<{ data?: { list?: PinglianLink[] } }>('search', undefined, {
     query: { keyword },
   });
   return data.data?.list ?? [];
+}
+
+/** 盘链「全站片源库」检索项（对应 GET /api/videos 的 data.list 元素） */
+export interface PinglianVideoSource {
+  id: number;
+  title: string;
+  cover?: string | null;
+  year?: string | null;
+  remarks?: string | null;
+  type_name?: string | null;
+}
+
+/** 盘链片库检索结果：在 PinglianLink 基础上补充片库专有的展示字段 */
+export type PinglianLibraryItem = PinglianLink & {
+  video_year: string | null;
+  video_remarks: string | null;
+  video_type: string | null;
+};
+
+/**
+ * 检索盘链「全站片源库」：GET /api/videos?search=（文档 §2.1）
+ *
+ * 与 searchPanLinks 的区别（易混淆，务必注意）：
+ *  - searchPanLinks  → /api/videos/links?search=  查「我的链接」，只返回当前账号发布过的网盘记录
+ *  - 本函数          → /api/videos?search=        查站点全站片库，返回片源条目（含站点 video_id）
+ * 用途：先选中片源拿到 video_id，再调 addPanLink 在该片源下发布网盘分享。
+ *
+ * 返回项按 PinglianLink 结构映射，以复用既有的选中/发布链路：
+ * id 恒为 0（片库条目不是链接记录）、video_id 为站点片源 ID、url 恒为空串
+ * （片库条目本身不含网盘地址，需绑定后再由站点侧关联）。
+ *
+ * 注意：该接口需登录态（实测匿名返回 401），调用前必须先绑定盘链账号。
+ */
+export async function searchPinglianLibrary(keyword: string): Promise<PinglianLibraryItem[]> {
+  const kw = keyword.trim();
+  if (!kw) return [];
+  const data = await callPanlinksProxy<{ data?: { list?: PinglianVideoSource[] } }>(
+    'videos',
+    undefined,
+    { query: { search: kw, page_size: '50' } }
+  );
+  return (data.data?.list ?? []).map((v) => ({
+    id: 0,
+    video_id: Number(v.id),
+    source_link_id: null,
+    user_id: 0,
+    username: null,
+    title: v.title ?? '',
+    url: '',
+    password: null,
+    pan_type: 'others',
+    note: null,
+    is_active: true,
+    is_system: false,
+    is_verified: false,
+    created_at: null,
+    updated_at: null,
+    video_title: v.title ?? null,
+    video_cover: v.cover ?? null,
+    // 以下为片库补充展示字段，供列表渲染使用
+    video_year: v.year ?? null,
+    video_remarks: v.remarks ?? null,
+    video_type: v.type_name ?? null,
+  }));
 }
 
 /** 删除盘链资源 */
@@ -714,6 +1594,8 @@ export async function bindXnCookie(cookie: string, remark = ''): Promise<void> {
     updated_at: new Date().toISOString(),
   });
   if (error) throw error;
+  // 云端加密留档（该站点仅支持 Cookie，失效时需人工更新）
+  await saveSiteCredential({ site: 'xn', cookie });
 }
 
 /** 解绑观影站点 */
@@ -813,6 +1695,69 @@ export async function delXnShare(id: string): Promise<void> {
   await callXnProxy('del', {}, { id });
 }
 
+/** 观影小牛站内搜索联想项（GET /res/search_suggest，裸数组响应，无 {code,data} 包裹） */
+export interface XnSearchItem {
+  title: string;
+  /** 资源短码 ID —— 发布分享时作为 binds[][id]，须与 dir 配对使用 */
+  id: string;
+  year?: number | string;
+  /** 中文类型，如「剧集」「动漫」 */
+  type?: string;
+  /** 资源类型：mv 电影 / tv 剧集 / ac 动漫 */
+  dir: string;
+  ename?: string;
+  score?: string;
+  /** 站点封面地址（搜索接口不返回封面，由 dir + id 推导，见 xnCoverUrl） */
+  cover?: string;
+}
+
+/**
+ * 观影片库封面地址规律：https://s.tutu.pm/img/{dir}/{id}/384.avif
+ * （站点 /res/search_suggest 本身不返回任何封面字段，实测按此规则可稳定取到图）
+ */
+export function xnCoverUrl(dir?: string, id?: string): string | undefined {
+  if (!dir || !id) return undefined;
+  return `https://s.tutu.pm/img/${dir}/${id}/384.avif`;
+}
+
+/**
+ * 观影片库站内搜索联想（片源查询）。
+ * 对应 GET /res/search_suggest?q=，返回裸数组。
+ * 返回项的 dir + id 即发布分享时 binds[][dir] / binds[][id] 的取值来源。
+ * 注意：该接口需登录态（实测无 Cookie 时返回空 body），须先绑定观影站点 Cookie。
+ */
+export async function searchXnVideos(keyword: string): Promise<XnSearchItem[]> {
+  const q = keyword.trim();
+  if (!q) return [];
+  const data = await callXnProxy<XnSearchItem[]>('search', { q });
+  return (Array.isArray(data) ? data : []).map((it) => ({
+    ...it,
+    cover: xnCoverUrl(it.dir, it.id),
+  }));
+}
+
+/**
+ * 发布网盘分享到观影小牛（POST /res/pan/add，form-urlencoded）。
+ * binds 必填且至少 1 个（站点强制要求），取值来自 searchXnVideos 的 dir + id。
+ */
+export async function addXnShare(params: {
+  title: string;
+  panurl: string;
+  panpw?: string;
+  is?: number;
+  binds: { dir: string; id: string }[];
+}): Promise<{ shareId: string | null }> {
+  const res = await callXnProxy<{ data?: { share_id?: string | null } }>('add', {}, {
+    title: params.title,
+    panurl: params.panurl,
+    panpw: params.panpw ?? '',
+    is: params.is ?? 1,
+    binds: params.binds,
+  });
+  const sid = res?.data?.share_id;
+  return { shareId: sid ? String(sid) : null };
+}
+
 // ============ 资源 × 观影站点绑定 ============
 
 /** 查询当前用户所有资源的观影站点绑定 */
@@ -827,10 +1772,11 @@ export async function fetchXnResourceBindings(): Promise<import('@/types/index')
   return (data ?? []).map(({ resources: _r, ...rest }) => rest) as import('@/types/index').XnResourceBinding[];
 }
 
-/** 将资源绑定到观影站点分享（支持一个资源绑定多条，按分享短码去重） */
+/** 将资源绑定到观影站点分享（支持一个资源绑定多条，按分享短码去重）
+ *  仅用到 id / title / url，故用 Pick 收窄，便于发布成功后直接落库 */
 export async function bindResourceToXnShare(
   resourceId: string,
-  share: import('@/types/index').XnShare
+  share: Pick<import('@/types/index').XnShare, 'id' | 'title' | 'url'>
 ): Promise<void> {
   const { error } = await supabase.from('xn_resource_bindings').upsert({
     resource_id: resourceId,
@@ -896,6 +1842,8 @@ export async function bindYaAccount(
   if (!username.trim() || !password.trim()) throw new Error('请填写鸭影臻藏站点账号和密码');
   // 服务端用账号密码登录鸭影臻藏并写入 token
   await callYaFn<{ bound: boolean }>('login', { username: username.trim(), password: password.trim(), remark });
+  // 云端留档：token 失效且 refresh 失败时可自动重新登录
+  await saveSiteCredential({ site: 'ya', username: username.trim(), password: password.trim() });
 }
 
 /** 解绑鸭影臻藏 */
@@ -944,16 +1892,16 @@ async function callYaFn<T = unknown>(
 /** 搜索鸭影臻藏片源（包含匹配，返回资源链接列表，每条附带所属剧集名 video_title；精确匹配结果置顶） */
 export async function searchYaVideos(
   title: string,
-  opts: { category?: string; limit?: number } = {}
+  opts: { category?: string; limit?: number; includeNoLink?: boolean } = {}
 ): Promise<import('@/types/index').YaLink[]> {
   type RawLink = { id?: number; link_id?: number; name?: string | null; url?: string | null; extract_code?: string | null; drive_type?: string | null; drive_label?: string | null; updated_at?: string | null; created_at?: string | null };
   const data = await callYaFn<{
     found?: boolean;
     /** 旧结构：精确匹配单 video */
-    video?: { id?: number; title?: string; category?: string };
+    video?: { id?: number; title?: string; category?: string; cover_url?: string | null };
     links?: RawLink[];
     /** 新结构：包含匹配多 video，精确匹配置顶 */
-    videos?: { video?: { id?: number; title?: string; category?: string }; links?: RawLink[] }[];
+    videos?: { video?: { id?: number; title?: string; category?: string; cover_url?: string | null }; links?: RawLink[] }[];
   }>('searchVideos', {
     title,
     ...(opts.category ? { category: opts.category } : {}),
@@ -969,7 +1917,28 @@ export async function searchYaVideos(
     const videoTitle = g.video?.title ?? null;
     const videoId = g.video?.id ?? 0;
     const videoCategory = g.video?.category ?? null;
+    const videoCover = g.video?.cover_url ?? null;
     const rawLinks: RawLink[] = Array.isArray(g.links) ? g.links : [];
+    if (rawLinks.length === 0) {
+      // 片源存在、但本人尚未在其下发布过链接。
+      // includeNoLink（发布/寻源场景）需要把它作为「发布目标」展示出来；
+      // 绑定场景则忽略（没有可绑定的 link_id）。
+      if (!opts.includeNoLink) return [];
+      return [{
+        id: 0,
+        name: null,
+        url: null,
+        extract_code: null,
+        drive_type: null,
+        drive_label: null,
+        video_title: videoTitle,
+        video_id: videoId,
+        video_category: videoCategory,
+        video_cover: videoCover,
+        updated_at: null,
+        created_at: null,
+      }];
+    }
     return rawLinks.map((l) => ({
       id: l.link_id ?? l.id ?? 0,
       name: l.name ?? null,
@@ -980,6 +1949,7 @@ export async function searchYaVideos(
       video_title: videoTitle,
       video_id: videoId,
       video_category: videoCategory,
+      video_cover: videoCover,
       updated_at: l.updated_at ?? null,
       created_at: l.created_at ?? null,
     }));
@@ -1054,8 +2024,11 @@ export async function bindResourceToYa(
     link_id: linkId,
     link_title: link.name ?? null,
     vod_name: link.video_title ?? null,
-    // 优先 drive_label，其次 URL 反查（避免 drive_type='others' 掩盖真实网盘类型），最后降级到 drive_type
-    pan_label: link.drive_label || detectPanName(link.url ?? '') || link.drive_type || null,
+    // 网盘名以 URL 识别为准：本地链接的 pan_name 同样由 detectPanName 生成，
+    // 同源才能保证同步时匹配得上。站点侧的 drive_label / drive_type 仅作兜底 ——
+    // 鸭影对光鸭云盘只返回 drive_type='others'，直接采用会导致
+    // 「资源中没有『others』类型的链接，未同步该条片源」。
+    pan_label: detectPanName(link.url ?? '') || link.drive_label || link.drive_type || null,
   }, { onConflict: 'resource_id,link_id' });
   if (error) throw error;
   return { link_id: linkId };
@@ -1111,6 +2084,106 @@ export async function yaAddResource(params: {
   });
 }
 
+/** 积分抽奖：count 次数、cost 单次消耗积分（以鸭影站点当前规则为准） */
+export async function yaDraw(
+  count = 1,
+  cost: number
+): Promise<{ limit: number; used: number; remaining: number; prizes: Array<{ id: string; name: string; points: number }> }> {
+  return callYaFn('draw', { count, cost });
+}
+
+/** 幸运抽签：每日限一次，消耗 15 积分，返回抽签码 */
+export async function yaBuyLuckyTicket(): Promise<string> {
+  return callYaFn('buyLuckyTicket', {});
+}
+
+/** 抽签池状态：当前期号、参与人数、我的号码、状态与最近开奖结果 */
+export async function yaGetLuckyDraw(): Promise<{
+  period: number;
+  pool_count: number;
+  max_participants: number;
+  my_ticket: string | null;
+  status: 'open' | 'full' | 'drawn';
+  last_result: Record<string, unknown> | null;
+}> {
+  return callYaFn('luckyDraw', {});
+}
+
+/** 查询片源与本人提交的有效资源链接（link_id 用于订阅 / 修改定位） */
+export async function yaSearchMyVideos(params: {
+  title: string;
+  category?: string;
+  limit?: number;
+}): Promise<{
+  found: boolean;
+  video: Record<string, unknown> | null;
+  links: Array<{
+    link_id: number;
+    name: string | null;
+    url: string;
+    drive_type: string | null;
+    drive_label: string | null;
+    extract_code: string | null;
+    click_count: number;
+  }>;
+}> {
+  return callYaFn('searchMyVideos', params);
+}
+
+/** 订阅资源：优先用 linkId 精确定位，也可按片源名模糊匹配（可能返回候选让你二选一） */
+export async function yaSubscribeLink(params: {
+  linkId?: number;
+  title?: string;
+  category?: string;
+  keyword?: string;
+  active?: boolean;
+}): Promise<Record<string, unknown>> {
+  return callYaFn('subscribeLink', params);
+}
+
+/** 取消订阅（linkId 或片源名） */
+export async function yaUnsubscribeLink(params: { linkId?: number; title?: string }): Promise<{
+  success: boolean;
+  link_id?: number;
+  deleted?: number;
+  message?: string;
+}> {
+  return callYaFn('unsubscribeLink', params);
+}
+
+/** 我的订阅列表 */
+export async function yaListSubscriptions(params: {
+  activeOnly?: boolean;
+  limit?: number;
+} = {}): Promise<{ success: boolean; total: number; list: Array<Record<string, unknown>> }> {
+  return callYaFn('listSubscriptions', params);
+}
+
+/** 拉取订阅更新通知（自动同步完成后产生；formatted 可直接展示） */
+export async function yaGetSubscriptionNotifications(params: {
+  limit?: number;
+  onlyUnread?: boolean;
+  markRead?: boolean;
+  since?: string;
+} = {}): Promise<{
+  success: boolean;
+  unread_count: number;
+  returned: number;
+  marked_read: number;
+  list: Array<Record<string, unknown>>;
+  formatted?: string;
+}> {
+  return callYaFn('getSubscriptionNotifications', params);
+}
+
+/** 标记通知已读（ids 批量 或 all=true） */
+export async function yaMarkNotificationsRead(params: {
+  ids?: number[];
+  all?: boolean;
+}): Promise<{ success: boolean; marked: number; message?: string }> {
+  return callYaFn('markNotificationsRead', params);
+}
+
 // ============ 帧影站点（framehdr.com）同步 ============
 
 export const FRAMEHDR_COOKIE_EXPIRED_CODE = 'COOKIE_EXPIRED';
@@ -1127,19 +2200,6 @@ export async function getFramehdrBinding(): Promise<import('@/types/index').Fram
     .maybeSingle();
   if (error) throw error;
   return data;
-}
-
-export async function bindFramehdrCookie(cookie: string, remark = ''): Promise<void> {
-  const { data: userData } = await supabase.auth.getUser();
-  if (!userData?.user) throw new Error('请先登录');
-  const { error } = await supabase.from('framehdr_sessions').upsert({
-    user_id: userData.user.id,
-    cookie: cookie.trim(),
-    status: 'active',
-    remark: remark.trim() || null,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: 'user_id' });
-  if (error) throw error;
 }
 
 export async function unbindFramehdr(): Promise<void> {
@@ -1168,7 +2228,7 @@ async function callFramehdrProxy<T = unknown>(
       Authorization: `Bearer ${sessionData.session.access_token}`,
     },
     body: JSON.stringify(body),
-  }, { retriable: action === 'list' });
+  }, { retriable: ['list', 'search', 'resource_list', 'login_status'].includes(action) });
   const data = await parseJsonSafe(res);
   if (!res.ok || !data || data?.success === false) {
     const msg = data?.error || `请求失败（HTTP ${res.status}）`;
@@ -1193,6 +2253,55 @@ export async function loadFramehdrLinks(
   return data.links ?? [];
 }
 
+/** 帧影片库检索结果项（search.php 解析 / resource_list.php 原样） */
+export interface FramehdrSearchItem {
+  id: number;
+  title: string;
+  cover?: string | null;
+  year?: number | string | null;
+  category_slug?: string | null;
+  douban_rating?: number | string | null;
+}
+
+/** 帧影片库关键词检索（search.php SSR → 结构化，接口文档 §2.2） */
+export async function searchFramehdrResources(keyword: string): Promise<FramehdrSearchItem[]> {
+  const q = keyword.trim();
+  if (!q) return [];
+  const data = await callFramehdrProxy<{ list?: FramehdrSearchItem[] }>('search', { q });
+  return data.list ?? [];
+}
+
+/** 帧影片库分页列表（resource_list.php 公开 JSON，接口文档 §2.1） */
+export async function loadFramehdrResourceList(
+  category = 'all',
+  year = 'all',
+  page = 1
+): Promise<{ resources: FramehdrSearchItem[]; totalResources: number }> {
+  const data = await callFramehdrProxy<{
+    resources?: FramehdrSearchItem[];
+    totalResources?: number;
+  }>('resource_list', { category, year, page: String(page) });
+  return { resources: data.resources ?? [], totalResources: data.totalResources ?? 0 };
+}
+
+/** 向帧影指定片源发布网盘分享链接（/user/add_link.php，接口文档 §3.2） */
+export async function addFramehdrLink(params: {
+  resourceId: number | string;
+  url: string;
+  name?: string;
+  password?: string;
+  description?: string;
+}): Promise<{ link_id?: number | null; message?: string }> {
+  return callFramehdrProxy('add', {}, {
+    resource_id: params.resourceId,
+    url: params.url,
+    ...(params.name ? { name: params.name } : {}),
+    ...(params.password ? { password: params.password } : {}),
+    ...(params.description ? { description: params.description } : {}),
+  });
+}
+
+/** 编辑帧影站点已发布链接 */
 export async function editFramehdrLink(params: {
   id: number;
   name?: string;
@@ -1212,9 +2321,22 @@ export async function deleteFramehdrLink(id: number): Promise<void> {
   await callFramehdrProxy('del', {}, { id });
 }
 
+/** 帧影登录状态：锁定情况与剩余尝试次数（接口文档 §1.3） */
+export async function getFramehdrLoginStatus(): Promise<{
+  is_locked?: boolean;
+  attempts_left?: number;
+}> {
+  const data = await callFramehdrProxy<{ data?: { is_locked?: boolean; attempts_left?: number } }>(
+    'login_status'
+  );
+  return data.data ?? {};
+}
+
 /** 帧影账号密码登录绑定（推荐方式）：服务端模拟登录并保存会话，密码不落库 */
 export async function loginFramehdr(username: string, password: string): Promise<void> {
   await callFramehdrProxy('login', {}, { username, password });
+  // 云端留档（加密）：会话失效后可自动重新登录
+  await saveSiteCredential({ site: 'framehdr', username: username.trim(), password });
 }
 
 /** 查询当前用户所有资源的帧影站点绑定 */
@@ -1239,7 +2361,7 @@ export async function bindResourceToFramehdr(
     link_id: link.id,
     link_title: link.title ?? null,
     drive_name: link.drive_name ?? null,
-  });
+  }, { onConflict: 'resource_id' });
   if (error) throw error;
 }
 
@@ -1301,6 +2423,8 @@ export async function bindPanfxCookie(cookie: string, remark = ''): Promise<void
     updated_at: new Date().toISOString(),
   }, { onConflict: 'user_id' });
   if (error) throw error;
+  // 云端加密留档（该站点仅支持 Cookie，失效时需人工更新）
+  await saveSiteCredential({ site: 'panfx', cookie: cookie.trim() });
 }
 
 export async function unbindPanfx(): Promise<void> {
@@ -1490,6 +2614,97 @@ export async function deleteAnnouncement(id: string): Promise<void> {
 }
 
 
+// ============ 首页图文教程 ============
+
+/** 把 jsonb 字段规整成 string[]，容忍历史脏数据 */
+function toImageList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x): x is string => typeof x === 'string' && x.trim() !== '');
+}
+
+function normalizeTutorial(row: Record<string, unknown>): Tutorial {
+  return {
+    id: String(row.id ?? ''),
+    title: String(row.title ?? ''),
+    content: String(row.content ?? ''),
+    images: toImageList(row.images),
+    is_active: Boolean(row.is_active),
+    sort_order: Number(row.sort_order ?? 0),
+    created_at: String(row.created_at ?? ''),
+    updated_at: String(row.updated_at ?? ''),
+  };
+}
+
+/** 前台：读取所有启用的教程（按 sort_order、创建时间升序） */
+export async function fetchActiveTutorials(): Promise<Tutorial[]> {
+  const { data, error } = await supabase
+    .from('tutorials')
+    .select('*')
+    .eq('is_active', true)
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: true })
+    .limit(100);
+  if (error) throw error;
+  return (Array.isArray(data) ? data : []).map(normalizeTutorial);
+}
+
+/** 管理员：读取全部教程（含已停用） */
+export async function fetchAllTutorials(): Promise<Tutorial[]> {
+  const { data, error } = await supabase
+    .from('tutorials')
+    .select('*')
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  return (Array.isArray(data) ? data : []).map(normalizeTutorial);
+}
+
+export interface TutorialInput {
+  title: string;
+  content: string;
+  images: string[];
+  is_active?: boolean;
+  sort_order?: number;
+}
+
+/** 管理员：新增教程 */
+export async function createTutorial(input: TutorialInput): Promise<Tutorial | null> {
+  const { data, error } = await supabase
+    .from('tutorials')
+    .insert({
+      title: input.title.trim(),
+      content: input.content,
+      images: input.images,
+      is_active: input.is_active ?? true,
+      sort_order: input.sort_order ?? 0,
+    })
+    .select()
+    .maybeSingle();
+  if (error) throw error;
+  return data ? normalizeTutorial(data) : null;
+}
+
+/** 管理员：更新教程 */
+export async function updateTutorial(id: string, patch: Partial<TutorialInput>): Promise<void> {
+  const payload: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (patch.title !== undefined) payload.title = patch.title.trim();
+  if (patch.content !== undefined) payload.content = patch.content;
+  if (patch.images !== undefined) payload.images = patch.images;
+  if (patch.is_active !== undefined) payload.is_active = patch.is_active;
+  if (patch.sort_order !== undefined) payload.sort_order = patch.sort_order;
+
+  const { error } = await supabase.from('tutorials').update(payload).eq('id', id);
+  if (error) throw error;
+}
+
+/** 管理员：删除教程 */
+export async function deleteTutorial(id: string): Promise<void> {
+  const { error } = await supabase.from('tutorials').delete().eq('id', id);
+  if (error) throw error;
+}
+
+
 // ============ 不太灵站点（web3.mukaku.com / MUKAKU）同步 ============
 
 export const MUKAKU_TOKEN_EXPIRED_CODE = 'MUKAKU_TOKEN_EXPIRED';
@@ -1553,6 +2768,8 @@ export async function bindMukaku(params: {
   key: string;
 }): Promise<void> {
   await callMukakuProxy('login', {}, params);
+  // 云端留档（该站点重登需要图形验证码，巡检时会提示手动处理）
+  await saveSiteCredential({ site: 'mukaku', username: params.username.trim(), password: params.password });
 }
 
 /** 解绑不太灵站点 */
@@ -1761,3 +2978,889 @@ export async function syncResourceToMukaku(params: {
   });
 }
 
+// ============ 聚影站点同步（www.jying.top） ============
+
+export const JYING_EXPIRED_CODE = 'JYING_COOKIE_EXPIRED';
+export const JYING_NOT_BOUND_CODE = 'JYING_NOT_BOUND';
+
+type JyingShareRow = import('@/types/index').JyingShareItem;
+
+/** 统一调用聚影代理 Edge Function */
+async function callJyingProxy<T = unknown>(
+  action: string,
+  body?: Record<string, unknown>,
+  opts: { timeoutMs?: number; query?: Record<string, string> } = {}
+): Promise<T> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  if (!sessionData?.session) throw new Error('请先登录');
+
+  const qs = new URLSearchParams({ action });
+  if (opts.query) {
+    for (const [k, v] of Object.entries(opts.query)) qs.set(k, v);
+  }
+  const init: RequestInit = {
+    method: body ? 'POST' : 'GET',
+    headers: {
+      Authorization: `Bearer ${sessionData.session.access_token}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  };
+  const res = await fetchWithRetry(
+    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/jying-proxy?${qs.toString()}`,
+    init,
+    { retriable: !body, timeoutMs: opts.timeoutMs } // GET 读操作可安全重试
+  );
+  const data = await parseJsonSafe(res);
+  if (!res.ok || !data || data.success === false) {
+    if (data?.code === JYING_EXPIRED_CODE || data?.code === JYING_NOT_BOUND_CODE) {
+      const err = new Error(data.error || data.message || '聚影请求失败');
+      (err as Error & { code: string }).code = data.code;
+      throw err;
+    }
+    throw new Error(data?.error || data?.message || `请求失败（HTTP ${res.status}）`);
+  }
+  return data as T;
+}
+
+/** 查询当前用户聚影绑定信息 */
+export async function getJyingBinding(): Promise<import('@/types/index').JyingBinding | null> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return null;
+  const { data, error } = await supabase
+    .from('jying_sessions')
+    .select('status, username, last_check_at, remark, updated_at')
+    .eq('user_id', userData.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * 向站点复检聚影会话：站点侧仍有效时会把本地状态恢复为 active。
+ *
+ * 用于「本地被标记为失效、但站点侧其实仍可用」的情况（例如上一次是误判的
+ * 403/网络抖动），避免用户被卡在「登录已失效」而无法发布；确实失效则保持不变。
+ */
+export async function revalidateJyingSession(): Promise<import('@/types/index').JyingBinding | null> {
+  try {
+    await callJyingProxy('status');
+  } catch {
+    // 站点确实失效：保持现状，由界面提示重新登录
+  }
+  return getJyingBinding();
+}
+
+/** 账号密码登录并绑定聚影（服务端模拟登录，密码不落库） */
+export async function loginJying(username: string, password: string): Promise<void> {
+  await callJyingProxy(
+    'login',
+    { username: username.trim(), password },
+    { timeoutMs: 45000 }
+  );
+  // 云端留档（加密）：会话失效后可自动重新登录
+  await saveSiteCredential({ site: 'jying', username: username.trim(), password });
+}
+
+/** 解绑聚影 */
+export async function unbindJying(): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  const { error } = await supabase
+    .from('jying_sessions')
+    .delete()
+    .eq('user_id', userData.user.id);
+  if (error) throw error;
+}
+
+/** 查询聚影「我的分享」记录（扁平化：资源条目维度，可直接用于绑定） */
+export async function loadJyingShares(keyword = ''): Promise<JyingShareRow[]> {
+  const kw = keyword.trim();
+  const data = await callJyingProxy<{ data?: { list?: JyingShareRow[] } }>(
+    'my_shares',
+    undefined,
+    {
+      query: kw ? { q: kw, page_size: '20' } : { page_size: '10' },
+      timeoutMs: 60000, // 需逐个影片取资源条目，放大超时
+    }
+  );
+  return data.data?.list ?? [];
+}
+
+/** 聚影全站片库检索 */
+export async function searchJyingMovies(keyword: string): Promise<import('@/types/index').JyingMovie[]> {
+  const data = await callJyingProxy<{ data?: { results?: import('@/types/index').JyingMovie[] } }>(
+    'search_movies',
+    undefined,
+    { query: { q: keyword.trim(), page_size: '20' } }
+  );
+  return data.data?.results ?? [];
+}
+
+/** 修改聚影分享链接（站点为差量接口，仅提交 share_link） */
+export async function updateJyingShareLink(linkId: number, shareLink: string): Promise<void> {
+  await callJyingProxy('update', { link_id: linkId, share_link: shareLink }, { timeoutMs: 45000 });
+}
+
+/** 在聚影指定影片下新增分享记录（网盘类型由站点按链接自动识别，无需传入） */
+export async function addJyingResource(params: {
+  movieId: number;
+  shareLink: string;
+  description?: string;
+  extractionCode?: string;
+}): Promise<{ id: number; movieId: number; movieTitle: string | null; panLabel: string | null }> {
+  const data = await callJyingProxy<{
+    data?: {
+      resource?: {
+        id?: number;
+        movie_id?: number;
+        movie_title?: string;
+        type?: string;
+        type_key?: string;
+      };
+    };
+  }>(
+    'add',
+    {
+      movie_id: params.movieId,
+      share_link: params.shareLink,
+      ...(params.description ? { description: params.description } : {}),
+      ...(params.extractionCode ? { extraction_code: params.extractionCode } : {}),
+    },
+    { timeoutMs: 45000 }
+  );
+  const r = data.data?.resource ?? {};
+  return {
+    id: Number(r.id ?? 0),
+    movieId: Number(r.movie_id ?? params.movieId),
+    movieTitle: r.movie_title ?? null,
+    // 站点返回的 type 为网盘中文名（如「光鸭云盘」）
+    panLabel: r.type ?? null,
+  };
+}
+
+/** 查询当前用户所有资源的聚影绑定关系 */
+export async function fetchJyingResourceBindings(): Promise<
+  import('@/types/index').JyingResourceBinding[]
+> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return [];
+  const { data, error } = await supabase
+    .from('jying_resource_bindings')
+    .select('id, resource_id, link_id, movie_id, link_title, vod_name, pan_label, created_at, resources!inner(owner_id)')
+    .eq('resources.owner_id', userData.user.id);
+  if (error) throw error;
+  return (data ?? []).map(({ resources: _r, ...rest }) => rest) as import(
+    '@/types/index'
+  ).JyingResourceBinding[];
+}
+
+/** 将资源绑定到聚影分享条目 */
+export async function bindResourceToJying(
+  resourceId: string,
+  share: {
+    id: number;
+    movie_id?: number | null;
+    title?: string | null;
+    vod_name?: string | null;
+    share_link?: string | null;
+    pan_label?: string | null;
+  }
+): Promise<void> {
+  const { error } = await supabase.from('jying_resource_bindings').upsert(
+    {
+      resource_id: resourceId,
+      link_id: share.id,
+      movie_id: share.movie_id ?? null,
+      link_title: share.title ?? null,
+      vod_name: share.vod_name ?? null,
+      // 网盘名以本地 URL 识别为准：与资源链接的 pan_name 同源，同步时才能匹配上
+      pan_label: detectPanName(share.share_link ?? '') || share.pan_label || null,
+    },
+    { onConflict: 'resource_id,link_id' }
+  );
+  if (error) throw error;
+}
+
+/** 解除资源与聚影的绑定（传 linkId 解绑单条，不传解绑全部） */
+export async function unbindResourceFromJying(resourceId: string, linkId?: number): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  let q = supabase.from('jying_resource_bindings').delete().eq('resource_id', resourceId);
+  if (linkId != null) q = q.eq('link_id', linkId);
+  const { error } = await q;
+  if (error) throw error;
+}
+
+/** 同步资源更新到聚影（替换分享链接） */
+export async function syncResourceToJying(params: {
+  linkId: number;
+  panUrl: string;
+}): Promise<void> {
+  await updateJyingShareLink(params.linkId, params.panUrl);
+}
+
+// ============ 栖影 HDHaven 站点同步（hdhaven.com） ============
+
+export const HDHAVEN_EXPIRED_CODE = 'HDHAVEN_COOKIE_EXPIRED';
+export const HDHAVEN_NOT_BOUND_CODE = 'HDHAVEN_NOT_BOUND';
+/** 账号开启两步验证，登录需要 6 位动态码 */
+export const HDHAVEN_TOTP_REQUIRED_CODE = 'HDHAVEN_TOTP_REQUIRED';
+/** 命中站点风控图形验证码门（请求过频），需人工完成验证后重试 */
+export const HDHAVEN_CHALLENGE_REQUIRED_CODE = 'HDHAVEN_CHALLENGE_REQUIRED';
+
+type HdhavenShare = import('@/types/index').HdhavenShareItem;
+type HdhavenTmdb = import('@/types/index').HdhavenTmdbItem;
+
+/**
+ * 统一调用栖影代理 Edge Function。
+ * 栖影是 httpOnly 会话 Cookie 鉴权，凭据只存在服务端，前端只拿结果。
+ */
+async function callHdhavenProxy<T = unknown>(
+  action: string,
+  body?: Record<string, unknown>,
+  opts: { timeoutMs?: number; query?: Record<string, string> } = {}
+): Promise<T> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  if (!sessionData?.session) throw new Error('请先登录');
+
+  const qs = new URLSearchParams({ action });
+  if (opts.query) {
+    for (const [k, v] of Object.entries(opts.query)) qs.set(k, v);
+  }
+  const init: RequestInit = {
+    method: body ? 'POST' : 'GET',
+    headers: {
+      Authorization: `Bearer ${sessionData.session.access_token}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  };
+  const res = await fetchWithRetry(
+    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/hdhaven-proxy?${qs.toString()}`,
+    init,
+    // 读操作可安全重试；写操作不重试，避免重复提交
+    { retriable: !body, timeoutMs: opts.timeoutMs ?? 45000 }
+  );
+  const data = await parseJsonSafe(res);
+  if (!res.ok || !data || data.success === false) {
+    const code = data?.code as string | undefined;
+    if (code) {
+      const err = new Error(data.error || data.message || '栖影请求失败') as Error & { code?: string };
+      err.code = code;
+      throw err;
+    }
+    throw new Error(data?.error || data?.message || `请求失败（HTTP ${res.status}）`);
+  }
+  return data as T;
+}
+
+/** 查询当前用户栖影绑定信息 */
+export async function getHdhavenBinding(): Promise<import('@/types/index').HdhavenBinding | null> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return null;
+  const { data, error } = await supabase
+    .from('hdhaven_sessions')
+    .select('status, username, user_number, last_check_at, remark, updated_at')
+    .eq('user_id', userData.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * 向站点复检栖影会话：站点侧仍有效时会把本地状态恢复为 active。
+ * 用于「本地被标记为失效、但站点侧其实仍可用」的情况。
+ */
+export async function revalidateHdhavenSession(): Promise<import('@/types/index').HdhavenBinding | null> {
+  try {
+    await callHdhavenProxy('status');
+  } catch {
+    // 站点确实失效：保持现状，由界面提示重新登录
+  }
+  return getHdhavenBinding();
+}
+
+/** 账号密码登录并绑定栖影（服务端模拟登录并保存 httpOnly 会话，密码不落库） */
+export async function loginHdhaven(
+  username: string,
+  password: string,
+  totpCode?: string
+): Promise<void> {
+  await callHdhavenProxy(
+    'login',
+    {
+      username: username.trim(),
+      password,
+      ...(totpCode?.trim() ? { totp_code: totpCode.trim() } : {}),
+    },
+    { timeoutMs: 60000 }
+  );
+  // 云端留档（加密）：会话失效后可自动重新登录；开启两步验证的账号会提示手动处理
+  await saveSiteCredential({ site: 'hdhaven', username: username.trim(), password });
+}
+
+/**
+ * 用浏览器会话 Cookie 绑定栖影。
+ * 站点 2026-10 起在登录接口加了 Cloudflare Turnstile 人机验证，服务端账号密码登录已不可行；
+ * 其余接口不校验人机验证、只认会话 Cookie，因此改为「浏览器登录一次 → 粘贴 Cookie」。
+ */
+export async function bindHdhavenCookie(cookie: string): Promise<void> {
+  await callHdhavenProxy('bindCookie', { cookie: cookie.trim() }, { timeoutMs: 60000 });
+}
+
+/** 解绑栖影 */
+export async function unbindHdhaven(): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  const { error } = await supabase
+    .from('hdhaven_sessions')
+    .delete()
+    .eq('user_id', userData.user.id);
+  if (error) throw error;
+}
+
+/** 我的分享记录（站点无分页/筛选，一次返回全量） */
+export async function loadHdhavenShares(): Promise<HdhavenShare[]> {
+  const data = await callHdhavenProxy<{ data?: HdhavenShare[] }>('my_shares', undefined, {
+    timeoutMs: 60000,
+  });
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+/** 单条分享详情（含当前分享链接 url / 提取码 / 文件列表） */
+export async function getHdhavenShareDetail(slug: string): Promise<HdhavenShare | null> {
+  const data = await callHdhavenProxy<{ data?: HdhavenShare }>('detail', undefined, {
+    query: { slug },
+    timeoutMs: 45000,
+  });
+  return data.data ?? null;
+}
+
+/** 片源检索（TMDB，中文可直接搜） */
+export async function searchHdhavenTmdb(keyword: string): Promise<HdhavenTmdb[]> {
+  const data = await callHdhavenProxy<{ data?: HdhavenTmdb[] }>('search_tmdb', undefined, {
+    query: { q: keyword },
+    timeoutMs: 45000,
+  });
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+/** 按 TMDB ID 查询站内资源（片源查询） */
+export async function fetchHdhavenResources(
+  mediaType: string,
+  tmdbId: string
+): Promise<HdhavenShare[]> {
+  const data = await callHdhavenProxy<{ data?: HdhavenShare[] }>('resources', undefined, {
+    query: { media_type: mediaType, tmdb_id: tmdbId },
+    timeoutMs: 45000,
+  });
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+/**
+ * 更新栖影分享链接。
+ * 栖影的 update 是「全量字段回写」语义，服务端会先取原值再合并，仅替换链接，
+ * 避免未提交字段被清空；普通用户改动后资源会重新进入审核。
+ */
+export async function updateHdhavenShareLink(params: {
+  slug: string;
+  url: string;
+  panType?: string;
+  accessCode?: string;
+  /** 站点分享标题（一般传本地资源名 / 已更新标题）；不传或为空则沿用站点现值 */
+  title?: string;
+  /** 按资源名称解析出的属性（分辨率/来源/字幕/集数范围），只有非空字段才覆盖站点现值 */
+  meta?: import('@/lib/hdhavenMeta').HdhavenShareMeta;
+}): Promise<void> {
+  await callHdhavenProxy(
+    'update',
+    {
+      slug: params.slug,
+      url: params.url,
+      ...(params.panType ? { pan_type: params.panType } : {}),
+      ...(params.accessCode ? { access_code: params.accessCode } : {}),
+      ...(params.title?.trim() ? { title: params.title.trim() } : {}),
+      ...(params.meta
+        ? {
+            ...(params.meta.video_resolution.length
+              ? { video_resolution: params.meta.video_resolution }
+              : {}),
+            ...(params.meta.source.length ? { source: params.meta.source } : {}),
+            ...(params.meta.subtitle_language.length
+              ? { subtitle_language: params.meta.subtitle_language }
+              : {}),
+            ...(params.meta.subtitle_type.length
+              ? { subtitle_type: params.meta.subtitle_type }
+              : {}),
+            ...(params.meta.episode_range ? { episode_range: params.meta.episode_range } : {}),
+          }
+        : {}),
+    },
+    // 服务端要「详情 → 解析链接 → 回写」三步，且带限速，放宽超时
+    { timeoutMs: 120000 }
+  );
+}
+
+/** 读取本用户全部栖影绑定关系 */
+export async function fetchHdhavenResourceBindings(): Promise<
+  import('@/types/index').HdhavenResourceBinding[]
+> {
+  const { data, error } = await supabase
+    .from('hdhaven_resource_bindings')
+    .select('*, resources!inner(owner_id)')
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return (Array.isArray(data) ? data : []) as unknown as import('@/types/index').HdhavenResourceBinding[];
+}
+
+/** 建立资源与栖影分享条目的绑定 */
+export async function bindResourceToHdhaven(
+  resourceId: string,
+  share: HdhavenShare,
+  vodName?: string
+): Promise<void> {
+  const { error } = await supabase.from('hdhaven_resource_bindings').upsert(
+    {
+      resource_id: resourceId,
+      slug: share.slug,
+      tmdb_id: share.tmdb_id ?? null,
+      media_type: share.media_type ?? null,
+      link_title: share.title ?? null,
+      vod_name: vodName ?? share.media_title ?? null,
+      pan_type: share.pan_type ?? null,
+      // 网盘中文名用于展示；同步匹配以 pan_type 为主（panUtils 里有别名映射）
+      pan_label: share.pan_type ? (PAN_TYPE_LABELS[share.pan_type] ?? share.pan_type) : null,
+    },
+    { onConflict: 'resource_id,slug' }
+  );
+  if (error) throw error;
+}
+
+/** 解除资源与栖影的绑定（传 slug 解绑单条，不传解绑全部） */
+export async function unbindResourceFromHdhaven(resourceId: string, slug?: string): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  let q = supabase.from('hdhaven_resource_bindings').delete().eq('resource_id', resourceId);
+  if (slug) q = q.eq('slug', slug);
+  const { error } = await q;
+  if (error) throw error;
+}
+
+/** 同步资源更新到栖影（替换分享链接） */
+export async function syncResourceToHdhaven(params: {
+  slug: string;
+  panUrl: string;
+  panType?: string;
+  accessCode?: string;
+  /** 本地资源名称（含「更新至第N集」修正）：作为站点分享标题同步过去 */
+  title?: string;
+  /** 按资源名称解析出的属性，非空字段才覆盖站点现值 */
+  meta?: import('@/lib/hdhavenMeta').HdhavenShareMeta;
+}): Promise<void> {
+  await updateHdhavenShareLink({
+    slug: params.slug,
+    url: params.panUrl,
+    panType: params.panType,
+    accessCode: params.accessCode,
+    title: params.title,
+    meta: params.meta,
+  });
+}
+
+// ---------- 风控图形验证码（接口文档 §5） ----------
+
+/**
+ * 取栖影风控图形验证码（命中 SCRAPE_CHALLENGE_REQUIRED 后调用）。
+ * 图片已由服务端带会话取回并内联为 data URL，前端可直接渲染。
+ */
+export async function fetchHdhavenChallenge(): Promise<import('@/types/index').HdhavenChallenge> {
+  const data = await callHdhavenProxy<{ data?: import('@/types/index').HdhavenChallenge }>(
+    'challenge',
+    {},
+    { timeoutMs: 30000 }
+  );
+  const challenge = data.data;
+  if (!challenge?.id || !challenge?.image) throw new Error('获取栖影验证码失败，请稍后重试');
+  return challenge;
+}
+
+/** 提交风控验证码（图片中的 5 位字符）；验证通过后由调用方重放原请求 */
+export async function submitHdhavenChallenge(id: string, answer: string): Promise<void> {
+  await callHdhavenProxy('verify', { id, answer }, { timeoutMs: 30000 });
+}
+
+// ---------- 新建分享（投稿） ----------
+
+/**
+ * 新建栖影分享（站点影视详情页「我来分享」所用的 POST /api/resources，接口文档未收录）。
+ * 服务端会用 inspect-link 自动识别网盘类型并补齐体积/画质/文件名等字段；
+ * 返回新建条目的 slug，便于立即建立「资源 × 栖影分享」绑定，后续改链自动同步。
+ * 注意：普通用户投稿后条目会先进入审核（review_status=pending）。
+ */
+export async function createHdhavenShare(params: {
+  tmdbId: string;
+  mediaType: string;
+  url: string;
+  title?: string;
+  panType?: string;
+  accessCode?: string;
+  remark?: string;
+  /** 按资源名称解析出的投稿属性（分辨率/来源/字幕/集数范围），服务端优先采用 */
+  meta?: import('@/lib/hdhavenMeta').HdhavenShareMeta;
+}): Promise<{ slug: string; panType: string; title: string }> {
+  const data = await callHdhavenProxy<{
+    data?: { slug?: string; pan_type?: string; title?: string };
+  }>(
+    'create_share',
+    {
+      tmdb_id: params.tmdbId,
+      media_type: params.mediaType,
+      url: params.url,
+      title: params.title,
+      pan_type: params.panType,
+      access_code: params.accessCode,
+      remark: params.remark,
+      ...(params.meta
+        ? {
+            video_resolution: params.meta.video_resolution,
+            source: params.meta.source,
+            subtitle_language: params.meta.subtitle_language,
+            subtitle_type: params.meta.subtitle_type,
+            episode_range: params.meta.episode_range,
+          }
+        : {}),
+    },
+    // 服务端内部会先调 inspect-link 解析网盘，耗时较长
+    { timeoutMs: 120000 }
+  );
+  return {
+    slug: data.data?.slug ?? '',
+    panType: data.data?.pan_type ?? '',
+    title: data.data?.title ?? '',
+  };
+}
+
+/** 用 slug 直接建立栖影绑定（投稿/发布成功后无需再回查站点列表） */
+export async function bindResourceToHdhavenBySlug(params: {
+  resourceId: string;
+  slug: string;
+  linkTitle?: string | null;
+  vodName?: string | null;
+  panType?: string | null;
+  /** movie / tv：同步时用于判断是否提交「集数范围」 */
+  mediaType?: string | null;
+}): Promise<void> {
+  const { error } = await supabase.from('hdhaven_resource_bindings').upsert(
+    {
+      resource_id: params.resourceId,
+      slug: params.slug,
+      tmdb_id: null,
+      media_type: params.mediaType ?? null,
+      link_title: params.linkTitle ?? null,
+      vod_name: params.vodName ?? null,
+      pan_type: params.panType ?? null,
+      pan_label: params.panType ? (PAN_TYPE_LABELS[params.panType] ?? params.panType) : null,
+    },
+    { onConflict: 'resource_id,slug' }
+  );
+  if (error) throw error;
+}
+
+// ============ API 管理（管理员创建开放接口密钥） ============
+
+/** 开放接口基地址：调用方用 API Key 读取资源（更新中 / 已完结） */
+export const RESOURCE_API_BASE = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/resource-api`;
+
+/** 生成开放接口密钥：rk_ + 40 位随机串（大小写字母 + 数字） */
+export function makeApiKey(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = new Uint8Array(40);
+  crypto.getRandomValues(bytes);
+  return `rk_${Array.from(bytes, (b) => chars[b % chars.length]).join('')}`;
+}
+
+/** 管理员：读取全部 API Key（按创建时间倒序） */
+export async function fetchApiKeys(): Promise<ApiKey[]> {
+  const { data, error } = await supabase
+    .from('api_keys')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  return Array.isArray(data) ? (data as ApiKey[]) : [];
+}
+
+/**
+ * 管理员：创建 API Key（expiresAt 传 null 表示永久有效）
+ * ownerId 为密钥归属账号：范围 owner 时接口只返回该账号自己的资源，因此必填。
+ * scope='all' 用于「订阅入库通知」：一个密钥即可查询所有账号的入库记录（资源类接口仍只看归属账号）。
+ */
+export async function createApiKey(params: {
+  name: string;
+  ownerId: string;
+  remark?: string | null;
+  expiresAt?: string | null;
+  scope?: 'owner' | 'all';
+}): Promise<ApiKey | null> {
+  if (!params.ownerId) throw new Error('请选择密钥归属账号');
+  const { data: session } = await supabase.auth.getSession();
+  const { data, error } = await supabase
+    .from('api_keys')
+    .insert({
+      name: params.name.trim() || '未命名应用',
+      api_key: makeApiKey(),
+      remark: params.remark?.trim() || null,
+      expires_at: params.expiresAt ?? null,
+      owner_id: params.ownerId,
+      scope: params.scope ?? 'owner',
+      created_by: session?.session?.user?.id ?? null,
+    })
+    .select()
+    .maybeSingle();
+  if (error) throw error;
+  return (data as ApiKey | null) ?? null;
+}
+
+/** 管理员：更新 API Key（名称 / 备注 / 启停 / 有效期） */
+export async function updateApiKey(
+  id: string,
+  patch: Partial<Pick<ApiKey, 'name' | 'remark' | 'is_active' | 'expires_at'>>
+): Promise<void> {
+  const { error } = await supabase.from('api_keys').update(patch).eq('id', id);
+  if (error) throw error;
+}
+
+/** 管理员：删除 API Key（删除后立即失效，不可恢复） */
+export async function deleteApiKey(id: string): Promise<void> {
+  const { error } = await supabase.from('api_keys').delete().eq('id', id);
+  if (error) throw error;
+}
+
+// ============ 1号站点（开放 API · 用户自填 pat_ 令牌）同步 ============
+//
+// 与其它站点的区别：不需要账密/Cookie，用户到 1号站点「开放API」标签生成令牌（明文只显示一次），
+// 粘贴到本系统绑定即可。站点接口基地址为 <站点>/api/open，鉴权 Authorization: Bearer pat_…
+
+export const ST1_TOKEN_EXPIRED_CODE = 'ST1_TOKEN_EXPIRED';
+
+const ST1_FN_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/st1-proxy`;
+
+/** 本人在 1号站点的绑定信息（不含令牌明文） */
+export async function getSt1Binding(): Promise<import('@/types/index').St1Binding | null> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return null;
+  const { data, error } = await supabase
+    .from('st1_sessions')
+    .select('base_url, username, default_category_id, status, last_error, last_check_at')
+    .eq('user_id', userData.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+/** 统一调 st1-proxy；失败时把站点错误码挂到 Error 上（供失效判定用） */
+async function callSt1Proxy<T = unknown>(action: string, body: Record<string, unknown> = {}): Promise<T> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  if (!sessionData?.session) throw new Error('请先登录');
+  const res = await fetch(`${ST1_FN_URL}?action=${encodeURIComponent(action)}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${sessionData.session.access_token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json().catch(() => ({}))) as { error?: string; code?: string; data?: unknown };
+  if (!res.ok || data?.error) {
+    const e = new Error(data?.error || `1号站点请求失败（HTTP ${res.status}）`) as Error & { code?: string };
+    e.code = data?.code;
+    throw e;
+  }
+  return (data?.data ?? data) as T;
+}
+
+/** 绑定/更新：先由代理 GET /profile 校验令牌，成功才落库（站点地址已内置，不必传） */
+export async function bindSt1Credential(params: {
+  /** 站点地址已由服务端内置，通常不需要传 */
+  baseUrl?: string;
+  token: string;
+  defaultCategoryId?: string | null;
+}): Promise<{ username: string | null }> {
+  const r = await callSt1Proxy<{ username: string | null }>('bind', {
+    ...(params.baseUrl ? { baseUrl: params.baseUrl.trim() } : {}),
+    token: params.token.trim(),
+    defaultCategoryId: params.defaultCategoryId ?? null,
+  });
+  // 云端加密留档：便于「站点同步」页统一展示/巡检（令牌型不自动重登，失效需用户重新生成）
+  await saveSiteCredential({ site: 'st1', username: r?.username ?? '', token: params.token.trim() });
+  return { username: r?.username ?? null };
+}
+
+export async function unbindSt1(): Promise<void> {
+  await callSt1Proxy('unbind');
+}
+
+/** 巡检：令牌是否还有效（顺带刷新站点用户名与状态） */
+export async function checkSt1(): Promise<{ username: string | null }> {
+  return await callSt1Proxy<{ username: string | null }>('status');
+}
+
+/**
+ * 取站点图形验证码（SVG 文本）。
+ * 站点把验证码与当前会话绑定，所以代理会把这一步建立的 Cookie 暂存下来，登录时必须紧接着调用 login。
+ */
+export async function st1Captcha(baseUrl?: string): Promise<{ svg: string }> {
+  return await callSt1Proxy<{ svg: string }>('captcha', baseUrl ? { baseUrl: baseUrl.trim() } : {});
+}
+
+/** 用站点账号密码 + 图形验证码登录（站点内部会话；与开放 API 令牌相互独立） */
+export async function st1Login(params: {
+  /** 站点地址已由服务端内置，通常不需要传 */
+  baseUrl?: string;
+  username: string;
+  password: string;
+  captcha: string;
+}): Promise<{ username: string | null }> {
+  const r = await callSt1Proxy<{ username: string | null }>('login', {
+    ...(params.baseUrl ? { baseUrl: params.baseUrl.trim() } : {}),
+    username: params.username.trim(),
+    password: params.password,
+    captcha: params.captcha.trim(),
+  });
+  // 云端加密留档：验证码站点无法自动重登，留档用于「站点同步」页统一展示
+  await saveSiteCredential({ site: 'st1', username: params.username.trim(), password: params.password });
+  return r;
+}
+
+/** 站点信息（地址由服务端内置，用户不需要填写） */
+export async function st1SiteInfo(): Promise<{ baseUrl: string | null; builtin: boolean }> {
+  return await callSt1Proxy<{ baseUrl: string | null; builtin: boolean }>('site');
+}
+
+/** 站点上的「我发布的片源」列表（用于登录后展示与编辑） */
+export interface St1RemoteItem {
+  [key: string]: unknown;
+}
+
+export async function st1MyResources(params: { keyword?: string; pageSize?: number } = {}): Promise<{
+  me: { id?: string; username?: string; nickname?: string };
+  items: St1RemoteItem[];
+  scanned: number;
+  filtered: boolean;
+  sample_keys: string[];
+}> {
+  return await callSt1Proxy('list_mine', params as Record<string, unknown>);
+}
+
+/** 站点登录态自检（GET /api/me） */
+export async function st1Me(): Promise<{ username: string | null }> {
+  return await callSt1Proxy<{ username: string | null }>('me');
+}
+
+/** 站点分类列表（发布片源时选默认分类） */
+export async function st1Categories(): Promise<unknown> {
+  return await callSt1Proxy('categories');
+}
+
+/** 站点 PT 规格标签 */
+export async function st1PtTags(): Promise<unknown> {
+  return await callSt1Proxy('pt_tags');
+}
+
+/** 站点片源列表（按关键词搜索，用于确认某个资源是否已发布） */
+export async function searchSt1Resources(params: {
+  keyword?: string;
+  page?: number;
+  pageSize?: number;
+  category?: string;
+} = {}): Promise<unknown> {
+  return await callSt1Proxy('search', params as Record<string, unknown>);
+}
+
+/** 发布片源到 1号站点；带 resourceId 时会回写「资源 ↔ 片源」绑定，之后变更自动 PATCH */
+export async function publishSt1Resource(params: {
+  resourceId?: string;
+  title: string;
+  panUrl: string;
+  panCode?: string;
+  content?: string;
+  categoryId?: string | null;
+  tags?: string[];
+  ptTagIds?: Array<string | number>;
+}): Promise<unknown> {
+  return await callSt1Proxy('publish', params as unknown as Record<string, unknown>);
+}
+
+/** 局部更新已发布的片源（标题 / 云盘地址等） */
+export async function updateSt1Resource(params: {
+  resourceId?: string;
+  remoteId?: string;
+  title?: string;
+  panUrl?: string;
+  panCode?: string;
+  content?: string;
+  categoryId?: string | null;
+}): Promise<unknown> {
+  return await callSt1Proxy('update', params as unknown as Record<string, unknown>);
+}
+
+/** 更新默认发布分类（只改本地绑定记录，不下发站点） */
+export async function setSt1DefaultCategory(id: string | null): Promise<void> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  const { error } = await supabase
+    .from('st1_sessions')
+    .update({ default_category_id: id })
+    .eq('user_id', userData.user.id);
+  if (error) throw error;
+}
+
+/**
+ * 把本地资源绑定到「站点上已存在的片源」（不新建片源，只建立同步关系）。
+ * 绑定后资源变更会由服务端 resource-sync-worker 自动 PATCH 到该片源。
+ */
+export async function bindResourceToSt1(params: {
+  resourceId: string;
+  remoteId: string;
+  title?: string | null;
+  remoteUrl?: string | null;
+}): Promise<import('@/types/index').St1ResourceBinding> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) throw new Error('请先登录');
+  const { data, error } = await supabase
+    .from('st1_resource_bindings')
+    .upsert({
+      user_id: userData.user.id,
+      resource_id: params.resourceId,
+      remote_id: params.remoteId,
+      title: params.title ?? null,
+      remote_url: params.remoteUrl ?? null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'resource_id' })
+    .select('*')
+    .single();
+  if (error) throw error;
+  return data as import('@/types/index').St1ResourceBinding;
+}
+
+/** 解除与 1号站图片源的绑定（不影响站点上已发布的内容） */
+export async function unbindResourceFromSt1(resourceId: string): Promise<void> {
+  const { error } = await supabase
+    .from('st1_resource_bindings')
+    .delete()
+    .eq('resource_id', resourceId);
+  if (error) throw error;
+}
+
+/** 本地资源在 1号站点的发布绑定（有绑定才能用 PATCH 同步） */
+export async function getSt1ResourceBindings(): Promise<import('@/types/index').St1ResourceBinding[]> {
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return [];
+  const { data, error } = await supabase
+    .from('st1_resource_bindings')
+    .select('*')
+    .eq('user_id', userData.user.id);
+  if (error) throw error;
+  return Array.isArray(data) ? (data as import('@/types/index').St1ResourceBinding[]) : [];
+}

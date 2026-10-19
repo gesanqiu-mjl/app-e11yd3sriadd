@@ -1,5 +1,7 @@
 /* stylelint-disable */
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap');
+/* 字体：不再引入 Google Fonts（境外依赖 + 会迫使 CSP 放开 style-src/font-src），
+   改为本地优先字体栈，见 tailwind.config.js 的 fontFamily：
+   Noto Sans SC / Noto Serif SC → PingFang SC、Microsoft YaHei、Songti SC → 系统默认 */
 
 @tailwind base;
 @tailwind components;
@@ -9,93 +11,93 @@
   :root {
     --radius: 0.75rem;
 
-    --background: 43 33% 95%;
-    --foreground: 150 8% 13%;
+    --background: 210 40% 96%;
+    --foreground: 222 47% 11%;
 
     --card: 0 0% 100%;
-    --card-foreground: 150 8% 13%;
+    --card-foreground: 222 47% 11%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 150 8% 13%;
+    --popover-foreground: 222 47% 11%;
 
-    --primary: 162 33% 27%;
+    --primary: 221 83% 53%;
     --primary-foreground: 0 0% 100%;
 
-    --secondary: 163 24% 38%;
+    --secondary: 215 25% 42%;
     --secondary-foreground: 0 0% 100%;
 
-    --muted: 42 35% 89%;
-    --muted-foreground: 33 6% 36%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
 
-    --accent: 17 88% 40%;
+    --accent: 221 83% 46%;
     --accent-foreground: 0 0% 100%;
 
-    --destructive: 0 72% 45%;
+    --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
 
-    --border: 43 27% 82%;
-    --input: 43 22% 80%;
-    --ring: 162 33% 27%;
+    --border: 214 32% 91%;
+    --input: 214 32% 94%;
+    --ring: 221 83% 53%;
 
-    --chart-1: 162 33% 27%;
-    --chart-2: 17 88% 40%;
-    --chart-3: 38 80% 45%;
-    --chart-4: 163 24% 38%;
-    --chart-5: 10 60% 50%;
+    --chart-1: 221 83% 53%;
+    --chart-2: 199 89% 48%;
+    --chart-3: 262 83% 58%;
+    --chart-4: 215 25% 42%;
+    --chart-5: 173 80% 40%;
 
-    --sidebar-background: 43 33% 91%;
-    --sidebar-foreground: 150 8% 13%;
-    --sidebar-primary: 162 33% 27%;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 222 47% 11%;
+    --sidebar-primary: 221 83% 53%;
     --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 42 35% 85%;
-    --sidebar-accent-foreground: 150 8% 13%;
-    --sidebar-border: 43 27% 80%;
-    --sidebar-ring: 162 33% 27%;
+    --sidebar-accent: 214 95% 93%;
+    --sidebar-accent-foreground: 221 83% 45%;
+    --sidebar-border: 214 32% 91%;
+    --sidebar-ring: 221 83% 53%;
 
-    --shadow-card: 0 1px 2px 0 hsl(150 8% 13% / 0.06);
-    --shadow-hover: 0 6px 16px 0 hsl(162 33% 27% / 0.12);
-    --gradient-primary: linear-gradient(135deg, hsl(162 33% 27%), hsl(163 24% 38%));
-    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(43 33% 97%));
+    --shadow-card: 0 1px 2px 0 hsl(222 47% 11% / 0.05);
+    --shadow-hover: 0 6px 16px 0 hsl(221 83% 53% / 0.12);
+    --gradient-primary: linear-gradient(135deg, hsl(221 83% 53%), hsl(199 89% 48%));
+    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(210 40% 98%));
     --gradient-background: none;
   }
 
   .dark {
-    --background: 43 33% 95%;
-    --foreground: 150 8% 13%;
+    --background: 210 40% 96%;
+    --foreground: 222 47% 11%;
     --card: 0 0% 100%;
-    --card-foreground: 150 8% 13%;
+    --card-foreground: 222 47% 11%;
     --popover: 0 0% 100%;
-    --popover-foreground: 150 8% 13%;
-    --primary: 162 33% 27%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 221 83% 53%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 163 24% 38%;
+    --secondary: 215 25% 42%;
     --secondary-foreground: 0 0% 100%;
-    --muted: 42 35% 89%;
-    --muted-foreground: 33 6% 36%;
-    --accent: 17 88% 40%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 221 83% 46%;
     --accent-foreground: 0 0% 100%;
-    --destructive: 0 72% 45%;
+    --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
-    --border: 43 27% 82%;
-    --input: 43 22% 80%;
-    --ring: 162 33% 27%;
-    --chart-1: 162 33% 27%;
-    --chart-2: 17 88% 40%;
-    --chart-3: 38 80% 45%;
-    --chart-4: 163 24% 38%;
-    --chart-5: 10 60% 50%;
-    --sidebar-background: 43 33% 91%;
-    --sidebar-foreground: 150 8% 13%;
-    --sidebar-primary: 162 33% 27%;
+    --border: 214 32% 91%;
+    --input: 214 32% 94%;
+    --ring: 221 83% 53%;
+    --chart-1: 221 83% 53%;
+    --chart-2: 199 89% 48%;
+    --chart-3: 262 83% 58%;
+    --chart-4: 215 25% 42%;
+    --chart-5: 173 80% 40%;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 222 47% 11%;
+    --sidebar-primary: 221 83% 53%;
     --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 42 35% 85%;
-    --sidebar-accent-foreground: 150 8% 13%;
-    --sidebar-border: 43 27% 80%;
-    --sidebar-ring: 162 33% 27%;
-    --shadow-card: 0 1px 2px 0 hsl(150 8% 13% / 0.06);
-    --shadow-hover: 0 6px 16px 0 hsl(162 33% 27% / 0.12);
-    --gradient-primary: linear-gradient(135deg, hsl(162 33% 27%), hsl(163 24% 38%));
-    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(43 33% 97%));
+    --sidebar-accent: 214 95% 93%;
+    --sidebar-accent-foreground: 221 83% 45%;
+    --sidebar-border: 214 32% 91%;
+    --sidebar-ring: 221 83% 53%;
+    --shadow-card: 0 1px 2px 0 hsl(222 47% 11% / 0.05);
+    --shadow-hover: 0 6px 16px 0 hsl(221 83% 53% / 0.12);
+    --gradient-primary: linear-gradient(135deg, hsl(221 83% 53%), hsl(199 89% 48%));
+    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(210 40% 98%));
     --gradient-background: none;
   }
 }
@@ -109,11 +111,35 @@
 
   html {
     font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    /* iOS：横竖屏切换 / 输入框聚焦时不要自动放大字号 */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
   }
 
   body {
     @apply bg-background text-foreground;
     font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    min-height: 100dvh;
+  }
+
+  /* 手机端专用兜底：任何一处横向溢出都不让整页能左右拖动。
+     用 clip 而不是 hidden —— hidden 会生成滚动容器，导致 sticky 顶栏/表头失效。
+     仅 <md 生效，PC 端滚动行为保持原样 */
+  @media (max-width: 767px) {
+    body {
+      overflow-x: clip;
+    }
+  }
+
+  /* 触屏设备专用：去掉点击时的灰色高亮块（保留可点反馈由组件自身负责） */
+  @media (hover: none) {
+    * {
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* 触屏没有 hover：公告跑马灯改为「按住即停」，方便看清内容 */
+    .animate-marquee:active {
+      animation-play-state: paused;
+    }
   }
 
   .font-serif {

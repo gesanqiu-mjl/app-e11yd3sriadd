@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, CloudIcon } from 'lucide-react';
+import { Plus, Trash2, CloudIcon, Link2, Loader2 } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -13,6 +13,7 @@ import { toast } from 'sonner';
 import { Resource } from '@/types/index';
 import { type PanLink, detectPanName } from '@/lib/panUtils';
 import { updateResourceField, recordChange } from '@/services/api';
+import { createShortLink, shortLinkUrl } from '@/services/shortlinks';
 import { FIELD_LABELS } from '@/types/index';
 
 interface ManageLinksDialogProps {
@@ -30,6 +31,8 @@ export default function ManageLinksDialog({
 }: ManageLinksDialogProps) {
   const [links, setLinks] = useState<PanLink[]>([]);
   const [saving, setSaving] = useState(false);
+  /** 正在生成短链的链接下标 */
+  const [shorteningIdx, setShorteningIdx] = useState<number | null>(null);
 
   useEffect(() => {
     if (!open || !resource) return;
@@ -61,6 +64,35 @@ export default function ManageLinksDialog({
 
   function removeLink(idx: number) {
     setLinks((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  /**
+   * 为这条网盘链接生成中转短链并复制。
+   * 分享短链后，「短链统计」页能看到点击量 / 独立访客 / 来源渠道。
+   */
+  async function makeShortLink(idx: number) {
+    const l = links[idx];
+    const url = (l?.url ?? '').trim();
+    if (!url) { toast.error('请先填写链接'); return; }
+    if (!/^https?:\/\//i.test(url)) { toast.error('链接需要以 http(s):// 开头'); return; }
+    setShorteningIdx(idx);
+    try {
+      const link = await createShortLink({
+        title: resource?.name ?? url,
+        targetUrl: url,
+        panName: l.pan_name ?? null,
+        resourceId: resource?.id ?? null,
+        // 默认用「随机短码」形态：6 位，分享出去最短（要"路径与原链一致"可在短链页手动选择）
+        codeMode: 'short',
+      });
+      const short = shortLinkUrl(link.code, link.channel);
+      await navigator.clipboard.writeText(short).catch(() => undefined);
+      toast.success('短链已生成并复制到剪贴板');
+    } catch (e) {
+      toast.error('生成短链失败：' + ((e as Error).message || ''));
+    } finally {
+      setShorteningIdx(null);
+    }
   }
 
   async function handleSave() {
@@ -124,9 +156,19 @@ export default function ManageLinksDialog({
                         {l.pan_name}
                       </Badge>
                     )}
+                    <Button variant="ghost" size="sm"
+                      disabled={shorteningIdx === idx || !l.url.trim()}
+                      onClick={() => void makeShortLink(idx)}
+                      title="生成中转短链（可统计点击量与来源渠道）"
+                      className="h-5 ml-auto shrink-0 gap-1 px-1.5 text-[10px] text-muted-foreground hover:text-primary hover:bg-primary/10">
+                      {shorteningIdx === idx
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : <Link2 className="h-3 w-3" />}
+                      短链
+                    </Button>
                     <Button variant="ghost" size="icon"
                       onClick={() => removeLink(idx)}
-                      className="h-5 w-5 ml-auto shrink-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10">
+                      className="h-5 w-5 shrink-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10">
                       <Trash2 className="h-3 w-3" />
                     </Button>
                   </div>

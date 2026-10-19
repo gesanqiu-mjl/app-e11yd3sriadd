@@ -19,7 +19,9 @@ const App: React.FC = () => {
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </RouteGuard>
-        <Toaster />
+        {/* mobileOffset：手机端底部有固定的底部导航（56px + 安全区），
+            提示条抬高显示，避免被导航栏压住看不到 */}
+        <Toaster mobileOffset={{ bottom: '4.5rem' }} />
       </AuthProvider>
     </Router>
   );

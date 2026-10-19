@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Copy, Trash2, CheckCheck, AlertCircle, ImagePlus, Download, AlertTriangle, Loader2, CheckSquare, Square } from 'lucide-react';
+import { Copy, Trash2, CheckCheck, AlertCircle, ImagePlus, Download, AlertTriangle, Loader2, CheckSquare, Square, History } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
@@ -15,6 +15,8 @@ interface UpdatedPanelProps {
   onFormatChange: (f: DisplayFormat) => void;
   dayOffset: number;
   onDayOffsetChange: (offset: number) => void;
+  /** 打开「查看历史」弹窗（按钮放在日期切换行，紧跟「前天」之后） */
+  onOpenHistory?: () => void;
   loading?: boolean;
 }
 
@@ -31,6 +33,7 @@ export default function UpdatedPanel({
   onFormatChange,
   dayOffset,
   onDayOffsetChange,
+  onOpenHistory,
   loading = false,
 }: UpdatedPanelProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -49,27 +52,36 @@ export default function UpdatedPanel({
     setSelectedIds(allSelected ? new Set() : new Set(items.map((i) => i.resource.id)));
   }
 
-  /** 复制一组资源为图文长图 */
-  async function copyGroup(list: UpdatedItem[], label: string) {
+  /**
+   * 复制一组资源。
+   * card = false（默认）：只复制纯文字 —— 粘贴到微信 / QQ / Word 得到可编辑文本；
+   * card = true：复制图文长图（封面 + 文字），适合需要封面的分享场景。
+   */
+  async function copyGroup(list: UpdatedItem[], label: string, card = false) {
     if (list.length === 0) {
       toast.info('请先勾选要复制的资源');
       return;
     }
     const text = list.map((item) => formatResource(item.resource, format)).join('\n\n');
-    const { ok, withImage } = await copyCardsToClipboard(
+    const { ok, withImage, reason } = await copyCardsToClipboard(
       list.map((item) => {
         const r = item.resource;
         const links = filterLinksByFormat(resolveLinks(r.links, r.link ?? ''), format);
         return { name: r.name, links, coverUrl: r.cover_url };
       }),
-      text
+      text,
+      card ? 'card' : 'text'
     );
     if (ok) {
-      toast.success(
-        withImage
-          ? `已复制 ${list.length} 条为图文长图（${label}），可直接粘贴到 QQ`
-          : `已复制 ${list.length} 条（${label}）`
-      );
+      if (withImage) {
+        toast.success(`已复制 ${list.length} 条（${label}）：封面 + 标题 + 可点击链接，可直接粘贴到 QQ / 微信`);
+      } else if (!card) {
+        toast.success(`已复制 ${list.length} 条为纯文字（${label}）`);
+      } else if (reason === 'insecure-context') {
+        toast.warning('已复制文字：当前为 HTTP 访问，浏览器禁止写入富文本到剪贴板，改用 HTTPS 访问即可带上封面与可点击链接');
+      } else {
+        toast.success(`已复制 ${list.length} 条（${label}）`);
+      }
     } else {
       toast.error('复制失败，请手动选中文本复制');
     }
@@ -77,7 +89,7 @@ export default function UpdatedPanel({
 
   /** 复制单条：封面 + 资源信息合成为一张卡片图，粘贴到 QQ 图文俱全 */
   async function copyItem(item: UpdatedItem) {
-    await copyGroup([item], '单条');
+    await copyGroup([item], '单条', true);
   }
 
   /** 手机端：生成卡片图片并通过 Web Share API 分享或直接下载 */
@@ -170,6 +182,19 @@ export default function UpdatedPanel({
               </Button>
             );
           })}
+          {/* 查看历史：从左侧工具栏移到这里，紧跟「前天」之后 */}
+          {onOpenHistory && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onOpenHistory}
+              title="查看资源修改历史"
+              className="h-6 px-2 text-xs gap-1 text-muted-foreground hover:text-foreground hover:bg-muted shrink-0"
+            >
+              <History className="h-3 w-3" />
+              查看历史
+            </Button>
+          )}
           {loading && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground ml-1" />}
         </div>
       </div>
@@ -177,13 +202,21 @@ export default function UpdatedPanel({
       {/* 操作栏 */}
       {items.length > 0 && (
         <div className="flex items-center justify-between px-4 py-2 border-b border-border/50 shrink-0 bg-muted/20">
-          <Button variant="ghost" size="sm" onClick={() => copyGroup(items, '全部')}
-            className="h-6 px-2 text-xs text-primary hover:bg-primary/10 gap-1">
-            <Copy className="h-3 w-3" />全部复制
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="sm" onClick={() => copyGroup(items, '全部', true)}
+              title="复制为卡片图（封面 + 资源名 + 网盘链接），可直接粘贴到 QQ / 微信"
+              className="h-6 px-2 text-xs text-primary hover:bg-primary/10 gap-1">
+              <ImagePlus className="h-3 w-3" />全部复制
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => copyGroup(items, '全部')}
+              title="只复制纯文字，粘贴到任何地方都是可编辑文本"
+              className="h-6 px-2 text-xs text-muted-foreground hover:text-primary hover:bg-primary/10 gap-1">
+              <Copy className="h-3 w-3" />复制文字
+            </Button>
+          </div>
           <div className="flex items-center gap-1">
             <Button variant="ghost" size="sm"
-              onClick={() => copyGroup(items.filter((i) => selectedIds.has(i.resource.id)), '勾选')}
+              onClick={() => copyGroup(items.filter((i) => selectedIds.has(i.resource.id)), '勾选', true)}
               disabled={selectedIds.size === 0}
               className="h-6 px-2 text-xs text-muted-foreground hover:text-primary hover:bg-primary/10 gap-1 disabled:opacity-40">
               <Copy className="h-3 w-3" />复制勾选({selectedIds.size})
@@ -222,21 +255,12 @@ export default function UpdatedPanel({
                   {hasCover ? (
                     /* === 有封面：勾选 + 图片 + 信息并排 === */
                     <div className="flex gap-0">
-                      {/* 勾选区 */}
-                      <button
-                        onClick={() => toggleSelect(item.resource.id)}
-                        className={`w-8 shrink-0 flex items-center justify-center transition-colors ${
-                          selected ? 'bg-primary/10 text-primary' : 'text-muted-foreground/40 hover:text-primary hover:bg-primary/5'
-                        }`}
-                        aria-label={selected ? '取消选择' : '选择'}
-                      >
-                        {selected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
-                      </button>
-                      {/* 封面图：手机 w-16，桌面 w-24 */}
+                      {/* 封面图：手机 w-16，桌面 w-24（放最左侧，勾选框已移到操作行末尾） */}
                       <div className="w-16 md:w-24 shrink-0 aspect-[2/3] relative overflow-hidden bg-muted">
                         <img
                           src={item.resource.cover_url!}
                           alt="封面"
+                          referrerPolicy="no-referrer"
                           className="w-full h-full object-cover"
                         />
                       </div>
@@ -273,6 +297,19 @@ export default function UpdatedPanel({
                             onClick={() => shareCardItem(item)}>
                             <Download className="h-3 w-3" />保存图片
                           </Button>
+                          {/* 勾选：放在复制按钮之后，封面得以靠左更美观 */}
+                          <button
+                            onClick={() => toggleSelect(item.resource.id)}
+                            className={`ml-auto h-6 w-6 shrink-0 flex items-center justify-center rounded-md transition-colors ${
+                              selected
+                                ? 'bg-primary/10 text-primary'
+                                : 'text-muted-foreground/40 hover:text-primary hover:bg-primary/5'
+                            }`}
+                            aria-label={selected ? '取消选择' : '选择'}
+                            title={selected ? '取消选择' : '选择'}
+                          >
+                            {selected ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                          </button>
                         </div>
                         {/* 站点同步失败提示（不纳入复制范围） */}
                         {item.syncErrors && item.syncErrors.length > 0 && (
@@ -290,16 +327,6 @@ export default function UpdatedPanel({
                   ) : (
                     /* === 无封面：纯文字卡片 === */
                     <div className="flex items-stretch gap-0">
-                      {/* 勾选区 */}
-                      <button
-                        onClick={() => toggleSelect(item.resource.id)}
-                        className={`w-8 shrink-0 flex items-center justify-center transition-colors ${
-                          selected ? 'bg-primary/10 text-primary' : 'text-muted-foreground/40 hover:text-primary hover:bg-primary/5'
-                        }`}
-                        aria-label={selected ? '取消选择' : '选择'}
-                      >
-                        {selected ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />}
-                      </button>
                       <div className="flex-1 min-w-0 p-3 pr-8">
                       <div className="flex items-center gap-1.5 mb-2">
                         <ImagePlus className="h-3 w-3 text-muted-foreground/40" />
@@ -321,6 +348,21 @@ export default function UpdatedPanel({
                         onClick={() => copyItem(item)} title="复制此条">
                         <Copy className="h-3 w-3" />
                       </Button>
+                      {/* 勾选：移到操作行末尾（与有封面的卡片保持一致） */}
+                      <div className="mt-2 flex items-center justify-end">
+                        <button
+                          onClick={() => toggleSelect(item.resource.id)}
+                          className={`h-6 w-6 shrink-0 flex items-center justify-center rounded-md transition-colors ${
+                            selected
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground/40 hover:text-primary hover:bg-primary/5'
+                          }`}
+                          aria-label={selected ? '取消选择' : '选择'}
+                          title={selected ? '取消选择' : '选择'}
+                        >
+                          {selected ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                        </button>
+                      </div>
                       {/* 站点同步失败提示（不纳入复制范围） */}
                       {item.syncErrors && item.syncErrors.length > 0 && (
                         <div className="mt-1.5 flex flex-col gap-0.5">
