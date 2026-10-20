@@ -306,47 +306,73 @@ function failWith(r: Exclude<ApiResult, { ok: true }>): Response {
 
 // ---------- token 存取 ----------
 
-async function loadAccessToken(
+/** 令牌提前多久判定为过期：留出余量，避免请求发出瞬间刚好失效 */
+const REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+/** 用 SITE_CRED_KEY 做对称加密（与 site_credentials 同一套 RPC） */
+async function encryptSecret(
   appClient: ReturnType<typeof createClient>,
-  userId: string
-): Promise<string | null> {
-  if (!CRED_KEY) {
-    throw new Error("服务端未配置 SITE_CRED_KEY，无法解密栖影授权（联系管理员）");
-  }
-  const { data } = await appClient
-    .from("hdhaven_sessions")
-    .select("access_token_enc")
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (!data?.access_token_enc) return null;
-  const { data: plain, error } = await appClient.rpc("site_secret_decrypt", {
-    p_enc: data.access_token_enc,
+  plain: string
+): Promise<string> {
+  const { data, error } = await appClient.rpc("site_secret_encrypt", {
+    p_plain: plain,
     p_key: CRED_KEY,
   });
-  if (error || !plain) {
-    console.error("hdhaven token decrypt failed", error);
-    return null;
-  }
-  return String(plain);
+  if (error || !data) throw new Error("加密栖影授权失败，请稍后重试");
+  return String(data);
 }
 
+/** 仅更新令牌相关列（续期时用）：不碰 username / authorized_at 等授权快照 */
+async function storeTokens(
+  appClient: ReturnType<typeof createClient>,
+  args: { userId: string; token: string; refreshToken?: string | null; expiresIn?: number | null }
+): Promise<void> {
+  const patch: Record<string, unknown> = {
+    access_token_enc: await encryptSecret(appClient, args.token),
+    token_type: "Bearer",
+    updated_at: new Date().toISOString(),
+  };
+  // 站点可能轮换 refresh_token，没返回新值就沿用旧的
+  if (args.refreshToken) {
+    patch.refresh_token_enc = await encryptSecret(appClient, args.refreshToken);
+  }
+  const expiresIn = Number(args.expiresIn ?? 0);
+  if (expiresIn > 0) {
+    patch.token_expires_at = new Date(Date.now() + expiresIn * 1000).toISOString();
+  }
+  await appClient.from("hdhaven_sessions").update(patch).eq("user_id", args.userId);
+}
+
+/** 首次授权：全量写入会话快照 */
 async function saveAccessToken(
   appClient: ReturnType<typeof createClient>,
-  args: { userId: string; token: string; scope?: string; userNumber?: number | null; username?: string }
+  args: {
+    userId: string;
+    token: string;
+    refreshToken?: string | null;
+    expiresIn?: number | null;
+    scope?: string;
+    userNumber?: number | null;
+    username?: string;
+  }
 ): Promise<void> {
-  const { data: enc, error } = await appClient.rpc("site_secret_encrypt", {
-    p_plain: args.token,
-    p_key: CRED_KEY,
-  });
-  if (error || !enc) throw new Error("加密栖影授权失败，请稍后重试");
+  if (!CRED_KEY) throw new Error("服务端未配置 SITE_CRED_KEY（联系管理员）");
+
+  const enc = await encryptSecret(appClient, args.token);
+  const refreshEnc = args.refreshToken
+    ? await encryptSecret(appClient, args.refreshToken)
+    : null;
+  const expiresIn = Number(args.expiresIn ?? 0);
 
   const now = new Date().toISOString();
   await appClient.from("hdhaven_sessions").upsert(
     {
       user_id: args.userId,
-      // cookie 列为已废弃字段，这里保持空串；token 只走 access_token_enc
+      // cookie 列为已废弃字段，这里保持空串；令牌只走 access_token_enc
       cookie: "",
-      access_token_enc: String(enc),
+      access_token_enc: enc,
+      refresh_token_enc: refreshEnc,
+      token_expires_at: expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
       token_type: "Bearer",
       scope: args.scope ?? null,
       user_number: args.userNumber ?? null,
@@ -358,6 +384,102 @@ async function saveAccessToken(
     },
     { onConflict: "user_id" }
   );
+}
+
+async function loadAccessToken(
+  appClient: ReturnType<typeof createClient>,
+  userId: string
+): Promise<string | null> {
+  if (!CRED_KEY) {
+    throw new Error("服务端未配置 SITE_CRED_KEY，无法解密栖影授权（联系管理员）");
+  }
+  const { data } = await appClient
+    .from("hdhaven_sessions")
+    .select("access_token_enc, refresh_token_enc, token_expires_at")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!data?.access_token_enc) return null;
+
+  const decrypt = async (enc: string): Promise<string | null> => {
+    const { data: plain, error } = await appClient.rpc("site_secret_decrypt", {
+      p_enc: enc,
+      p_key: CRED_KEY,
+    });
+    if (error || !plain) {
+      console.error("hdhaven token decrypt failed", error);
+      return null;
+    }
+    return String(plain);
+  };
+
+  const accessToken = await decrypt(data.access_token_enc);
+  if (!accessToken) return null;
+
+  // 没有到期时间 = 早期授权数据，先直接用；被站点撤销时由 401 兜底提示重新授权
+  const expiresAt = data.token_expires_at ? new Date(data.token_expires_at).getTime() : 0;
+  if (!expiresAt || Date.now() + REFRESH_SKEW_MS < expiresAt) return accessToken;
+
+  const refreshToken = data.refresh_token_enc ? await decrypt(data.refresh_token_enc) : null;
+  if (!refreshToken) return accessToken;
+  return (await refreshTokenVia(appClient, userId, refreshToken)) ?? accessToken;
+}
+
+/**
+ * 用 refresh_token 续期。
+ * 失败返回 null：交由上层沿用旧 token，若站点已撤销则会走 401 → 提示重新授权。
+ */
+async function refreshTokenVia(
+  appClient: ReturnType<typeof createClient>,
+  userId: string,
+  refreshToken: string
+): Promise<string | null> {
+  try {
+    const form = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+    });
+    if (CLIENT_SECRET) form.set("client_secret", CLIENT_SECRET);
+
+    const res = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+        "X-HDHaven-App-Key": APP_KEY,
+      },
+      body: form.toString(),
+      signal: AbortSignal.timeout(20000),
+    });
+    const text = await res.text();
+    const tj = parseJsonSafe<{
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      error?: string;
+      error_description?: string;
+      message?: string;
+      data?: { access_token?: string; refresh_token?: string; expires_in?: number };
+    }>(text);
+
+    const accessToken = tj?.access_token ?? tj?.data?.access_token ?? "";
+    if (!res.ok || !accessToken) {
+      console.error("hdhaven refresh failed", res.status, text.slice(0, 300));
+      return null;
+    }
+
+    await storeTokens(appClient, {
+      userId,
+      token: accessToken,
+      // 站点轮换了 refresh_token 就用新的，没返回则沿用旧的
+      refreshToken: tj?.refresh_token ?? tj?.data?.refresh_token ?? refreshToken,
+      expiresIn: tj?.expires_in ?? tj?.data?.expires_in ?? 0,
+    });
+    return accessToken;
+  } catch (e) {
+    console.error("hdhaven refresh threw", e);
+    return null;
+  }
 }
 
 /** 我的分享：按页聚合（每页 50），超过 MAX_PAGES 则截断，避免一次烧掉大量日额度 */
@@ -511,12 +633,20 @@ Deno.serve(async (req) => {
       // 兼容两种返回形态：{access_token,...} 或 {success,data:{access_token,...}}
       const tj = parseJsonSafe<{
         access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
         scope?: string;
         user_number?: number;
         error?: string;
         error_description?: string;
         message?: string;
-        data?: { access_token?: string; scope?: string; user_number?: number };
+        data?: {
+          access_token?: string;
+          refresh_token?: string;
+          expires_in?: number;
+          scope?: string;
+          user_number?: number;
+        };
       }>(tokenText);
       const accessToken = tj?.access_token ?? tj?.data?.access_token ?? "";
       if (!tokenRes.ok || !accessToken) {
@@ -549,6 +679,9 @@ Deno.serve(async (req) => {
       await saveAccessToken(appClient, {
         userId: me.id,
         token: accessToken,
+        // 站点文档明确会返回 refresh_token / expires_in：前者用于自动续期，后者决定续期时机
+        refreshToken: tj?.refresh_token ?? tj?.data?.refresh_token ?? null,
+        expiresIn: tj?.expires_in ?? tj?.data?.expires_in ?? 0,
         scope,
         userNumber,
         username: nickname,
