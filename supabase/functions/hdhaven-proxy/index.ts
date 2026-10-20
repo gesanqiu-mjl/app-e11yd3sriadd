@@ -72,7 +72,13 @@ const CLIENT_SECRET = Deno.env.get("HDHAVEN_CLIENT_SECRET") ?? "";
 /** X-HDHaven-App-Key：文档中称为「应用凭证」，默认与应用编号相同。 */
 const APP_KEY = Deno.env.get("HDHAVEN_APP_KEY") ?? CLIENT_ID;
 /** 回调地址必须与站点侧登记一致（未登记时站点会弹窗让用户确认地址）。 */
-const REDIRECT_URI = Deno.env.get("HDHAVEN_REDIRECT_URI") ?? "https://guangya.xyz.hr/sync";
+/**
+ * 回调地址必须与站点侧登记的值**完全一致**（OAuth 规范要求精确匹配，不做前缀匹配）。
+ * 站点应用里登记的是站点根路径，所以授权成功后浏览器会带着 code+state 回到首页，
+ * 由前端 App 全局层统一接住并换 token（见 src/hooks/use-hdhaven-oauth-callback.ts）。
+ * 若日后在站点改成别的地址，这里同步改即可。
+ */
+const REDIRECT_URI = Deno.env.get("HDHAVEN_REDIRECT_URI") ?? "https://guangya.xyz.hr";
 /** 留空 = 站点已批准的全部权限。 */
 const SCOPE = Deno.env.get("HDHAVEN_SCOPE") ?? "";
 /** access_token 加密密钥；与其他站点凭据同一套，仅存在于环境变量。 */

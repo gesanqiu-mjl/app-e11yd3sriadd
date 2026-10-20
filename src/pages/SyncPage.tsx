@@ -41,7 +41,7 @@ import {
   updateJyingShareLink, JYING_EXPIRED_CODE, revalidateJyingSession,
   getHdhavenBinding, unbindHdhaven, loadHdhavenShares, getHdhavenShareDetail,
   updateHdhavenShareLink, revalidateHdhavenSession,
-  startHdhavenOAuth, finishHdhavenOAuth, loadHdhavenQuota, checkinHdhaven,
+  startHdhavenOAuth, loadHdhavenQuota, checkinHdhaven,
   HDHAVEN_EXPIRED_CODE, HDHAVEN_RATE_LIMITED_CODE,
   // 1号站点（开放 API 令牌型 + 站点账号登录）
   getSt1Binding, bindSt1Credential, unbindSt1, checkSt1,
@@ -3526,42 +3526,11 @@ function HdhavenTab() {
     }
   }
 
-  /** 授权回调：站点把 code + state 送回本页，这里换 token（服务端完成 PKCE 校验）后清理地址栏 */
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get('code');
-    const state = params.get('state');
-    const oauthError = params.get('error');
-    const clearParams = () => {
-      ['code', 'state', 'error', 'error_description'].forEach((k) => params.delete(k));
-      const qs = params.toString();
-      window.history.replaceState(
-        {},
-        '',
-        `${window.location.pathname}${qs ? `?${qs}` : ''}`
-      );
-    };
-
-    if (oauthError) {
-      toast.error(`栖影授权未完成：${params.get('error_description') || oauthError}`);
-      clearParams();
-      return;
-    }
-    if (!code || !state) return;
-
-    let cancelled = false;
-    (async () => {
-      try {
-        await finishHdhavenOAuth({ code, state });
-        if (!cancelled) toast.success('栖影授权成功，资源更新时将自动同步');
-      } catch (e) {
-        if (!cancelled) toast.error((e as Error).message || '授权失败，请重新发起授权');
-      } finally {
-        if (!cancelled) { clearParams(); loadBinding(); }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [loadBinding]);
+  /**
+   * 授权回调不在本页处理：站点登记的回调地址是站点根路径，会带着 code/state 回到首页，
+   * 由 App 全局层的 useHdhavenOAuthCallback 统一接住，换完 token 再跳回本页。
+   * （本页挂载时会自动 loadBinding，用户看到的仍是最新绑定状态。）
+   */
 
   /** 查询额度余量（每分钟 60 次；每日按等级/会员，签到与 /me 不计入） */
   const loadQuota = useCallback(async () => {
