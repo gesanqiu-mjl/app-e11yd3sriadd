@@ -451,6 +451,39 @@ export default function SubscribePage() {
     return [...groups.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh'));
   }, [ownerResources, srcQuery]);
 
+  // ---------- 手机端「网盘驱动」：一次只展示一个网盘 ----------
+  /**
+   * 手机上 5 张网盘卡片纵向铺开太长，且卡片里的授权说明是长句，
+   * 单列也会把卡片撑出屏幕右边界（用户实机反馈）。
+   * 改成：胶囊选择器 + 单卡片 + 左右滑动/点击切换，只占一个卡片的高度。
+   * 桌面端仍用原来的多列网格。
+   */
+  const [panFocus, setPanFocus] = useState<PanKey>(
+    () => PAN_KEYS.find((p) => !LOCKED_PANS[p]) ?? PAN_KEYS[0],
+  );
+  /** 手势：记录手指按下时的横坐标，抬手时与移动前的差值决定是否切换 */
+  const panTouchX = useRef<number | null>(null);
+  const panTouchY = useRef<number | null>(null);
+  /** 已经横向拖动过就不触发点击，避免滑动结束误绑定 */
+  const panSwiped = useRef(false);
+
+  /** 相邻网盘切换（dir: 1 下一个 / -1 上一个，首尾循环） */
+  function panStep(dir: 1 | -1) {
+    setPanFocus((prev) => {
+      const i = PAN_KEYS.indexOf(prev);
+      const next = (i + dir + PAN_KEYS.length) % PAN_KEYS.length;
+      return PAN_KEYS[next];
+    });
+  }
+
+  /** 切换到指定网盘；若该网盘刚被绑定成功，停在原地别跳走 */
+  function panJump(pan: PanKey) {
+    if (panSwiped.current) return;
+    setPanFocus(pan);
+  }
+
+  const panFocusIndex = PAN_KEYS.indexOf(panFocus);
+
   // 校准结果
   const [probeTarget, setProbeTarget] = useState<PanKey | null>(null);
   const [probeUrl, setProbeUrl] = useState('');
@@ -1285,8 +1318,9 @@ export default function SubscribePage() {
               光鸭扫码授权（自动续期），夸克与百度扫码或粘贴登录 Cookie，UC 粘贴 Cookie；迅雷云盘正在适配中，暂未开放。凭据在服务端加密存储，前端不可见
             </span>
           </div>
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-            {PAN_KEYS.map((pan) => {
+          {/* 卡片渲染抽成函数：手机端（单卡轮播）与桌面端（多列网格）共用同一份 */}
+          {(() => {
+            const renderCard = (pan: PanKey) => {
               const acc = panOf(pan);
               const meta = PAN_META[pan];
               const ok = acc?.status === 'active';
@@ -1294,7 +1328,7 @@ export default function SubscribePage() {
               return (
                 <div
                   key={pan}
-                  className={`flex flex-col rounded-xl border p-3 transition-all ${
+                  className={`flex w-full min-w-0 flex-col rounded-xl border p-3 transition-all ${
                     locked
                       ? 'border-border bg-muted/20'
                       : ok
@@ -1364,7 +1398,7 @@ export default function SubscribePage() {
                       )}
                     </div>
                   ) : (
-                    <p className="mt-1.5 line-clamp-2 text-[10.5px] leading-snug text-muted-foreground">
+                    <p className="mt-1.5 line-clamp-3 break-words text-[10.5px] leading-snug text-muted-foreground">
                       {locked
                         ? `${locked}：该网盘暂未开放，解锁后再显示绑定方式。`
                         : pan === 'guangya'
@@ -1379,7 +1413,8 @@ export default function SubscribePage() {
                     </p>
                   )}
 
-                  <div className="mt-auto flex items-center gap-1 pt-2">
+                  {/* 操作按钮：允许换行（flex-wrap），避免窄屏横向溢出 */}
+                  <div className="mt-auto flex flex-wrap items-center gap-1 pt-2">
                     {locked ? (
                       <Button
                         size="sm" variant="outline" disabled
@@ -1476,8 +1511,104 @@ export default function SubscribePage() {
                   </div>
                 </div>
               );
-            })}
-          </div>
+            };
+
+            /** 胶囊选择器：手机上换网盘的入口（横向可滑动，避免按钮换行占多行） */
+            const panChips = (
+              <div className="-mx-1 flex snap-x snap-mandatory gap-1.5 overflow-x-auto px-1 pb-1 md:hidden">
+                {PAN_KEYS.map((pan) => {
+                  const acc = panOf(pan);
+                  const ok = acc?.status === 'active';
+                  const locked = LOCKED_PANS[pan];
+                  const active = pan === panFocus;
+                  return (
+                    <button
+                      key={pan}
+                      type="button"
+                      onClick={() => panJump(pan)}
+                      className={`flex shrink-0 snap-start items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] transition-colors ${
+                        active
+                          ? 'border-primary bg-primary/10 font-medium text-primary'
+                          : 'border-border bg-background text-muted-foreground'
+                      }`}
+                    >
+                      {locked
+                        ? <Lock className="h-3 w-3" />
+                        : ok
+                          ? <CheckCircle2 className="h-3 w-3 text-primary" />
+                          : acc
+                            ? <AlertCircle className="h-3 w-3 text-destructive" />
+                            : <CircleDashed className="h-3 w-3 opacity-60" />}
+                      <span className="whitespace-nowrap">{PAN_LABELS[pan]}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+
+            return (
+              <>
+                {/* 手机端：一次只展示一个网盘 */}
+                <div className="md:hidden">
+                  {panChips}
+
+                  <div
+                    className="mt-2"
+                    onTouchStart={(e) => {
+                      panTouchX.current = e.touches[0].clientX;
+                      panTouchY.current = e.touches[0].clientY;
+                      panSwiped.current = false;
+                    }}
+                    onTouchEnd={(e) => {
+                      const x0 = panTouchX.current;
+                      const y0 = panTouchY.current;
+                      panTouchX.current = null;
+                      panTouchY.current = null;
+                      if (x0 == null || y0 == null) return;
+                      const dx = e.changedTouches[0].clientX - x0;
+                      const dy = e.changedTouches[0].clientY - y0;
+                      // 横向位移要明显大于纵向，否则会把页面滚动误判成切卡片
+                      if (Math.abs(dx) < 45 || Math.abs(dx) <= Math.abs(dy)) return;
+                      panSwiped.current = true;
+                      panStep(dx < 0 ? 1 : -1);
+                    }}
+                  >
+                    {renderCard(panFocus)}
+                  </div>
+
+                  {/* 左右切换 + 序号：不用纯滑动也能翻页 */}
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => panStep(-1)}
+                      className="h-7 gap-1 px-2 text-[11px] text-muted-foreground"
+                    >
+                      <ChevronLeft className="h-3 w-3" />
+                      上一个
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">
+                      {panFocusIndex + 1} / {PAN_KEYS.length}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => panStep(1)}
+                      className="h-7 gap-1 px-2 text-[11px] text-muted-foreground"
+                    >
+                      下一个
+                      <ChevronRight className="h-3 w-3" />
+                    </Button>
+                  </div>
+                </div>
+
+                {/* 桌面端：原来的多列网格 */}
+                <div className="hidden gap-3 md:grid md:grid-cols-2 lg:grid-cols-3">
+                  {PAN_KEYS.map((pan) => renderCard(pan))}
+                </div>
+              </>
+            );
+          })()}
         </div>
 
         {/* 订阅源 */}
