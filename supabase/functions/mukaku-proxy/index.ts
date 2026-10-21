@@ -469,24 +469,63 @@ Deno.serve(async (req) => {
       }
 
       case "delete": {
-        const id = Number(passthrough.id ?? body.id ?? 0);
-        if (!id) return json({ error: "缺少 id" }, 400);
-        const check = await callApi("/getUserWpList", {
-          params: { page: 1 },
-          token: tk,
-        });
-        const items = (check.data as { items?: Array<{ id?: number }> } | null)?.items ?? [];
-        if (items.length && !items.some((it) => Number(it.id) === id)) {
+        const rawIds = Array.isArray(body.ids)
+          ? body.ids
+          : [passthrough.id ?? body.id ?? 0];
+        const ids = [...new Set(rawIds.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0))];
+        if (!ids.length) return json({ error: "缺少 id" }, 400);
+
+        // 归属校验：站点「我的发布」是分页返回的（实测 227 条 / 12 页，每页 20 条），
+        // 原实现只翻第 1 页，导致第 2 页之后的资源被误判成「不属于你」而删不掉。
+        // 这里一次把列表翻完，收集全部自有 ID；ids 传多个时只需翻一次页，批量删除时省大量请求。
+        const owned = new Set<number>();
+        const MAX_PAGES = 60;
+        let page = 1;
+        let totalPages = 1;
+        do {
+          const check = await callApi("/getUserWpList", { params: { page }, token: tk });
+          const d = check.data as {
+            items?: Array<{ id?: number }>;
+            pageInfo?: { totalPage?: number };
+          } | null;
+          (d?.items ?? []).forEach((it) => {
+            if (it?.id != null) owned.add(Number(it.id));
+          });
+          totalPages = Number(d?.pageInfo?.totalPage ?? page);
+          page += 1;
+        } while (page <= totalPages && page <= MAX_PAGES);
+
+        const targets = ids.filter((i) => owned.has(i));
+        const notOwned = ids.filter((i) => !owned.has(i));
+
+        if (!targets.length) {
           result = {
             code: 500,
-            message: "该资源不在你的发布列表中（或不在当前页），未执行删除",
+            message: `该资源不在你的发布列表中，未执行删除（共拉取 ${owned.size} 条自有记录）`,
             data: null,
             raw: "",
             parseOk: true,
           };
           break;
         }
-        result = await callApi("/delWpResource", { params: { id }, token: tk });
+
+        const deleted: number[] = [];
+        const failed: number[] = [];
+        for (const i of targets) {
+          const r = await callApi("/delWpResource", { params: { id: i }, token: tk });
+          if (r.code === 200) deleted.push(i);
+          else failed.push(i);
+        }
+        result = {
+          code: 200,
+          message:
+            `已删除 ${deleted.length} 条` +
+            (failed.length ? `，失败 ${failed.length} 条` : "") +
+            (notOwned.length ? `，${notOwned.length} 条不属于当前账号已跳过` : ""),
+          data: { deleted, failed, notOwned },
+          raw: "",
+          parseOk: true,
+        };
         break;
       }
 
