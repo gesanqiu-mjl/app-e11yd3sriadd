@@ -1387,8 +1387,13 @@ function ResourceTable({
     syncToSite(updatedResource);
   }
 
+  // 根容器必须是 flex-1 + min-h-0。
+  // 之前写的是 h-full —— 在 HomePage 的 flex column 里，h-full 不扣除上方 banner
+  // 与 gap，自身高度会顶出父容器，再被 overflow-hidden 裁掉底部，
+  // 表现为「最后一个资源只显示一半」（手机端卡片列表与桌面端表格都复现）。
+  // min-h-0 允许收缩到内容高度以下，内部两端的 overflow-auto 才会正确滚动。
   return (
-    <div className="flex flex-col gap-2 md:gap-3 h-full">
+    <div className="flex flex-col gap-2 md:gap-3 flex-1 min-h-0">
       {/* Tab 切换：更新中 / 已完结。
           手机端（<md）＝设计稿的分段控件（选中浅蓝底 + 蓝字）；
           桌面端（md+）＝ **完全保持原有下划线样式**，PC 展示不变 */}
