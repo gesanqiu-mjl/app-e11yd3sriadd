@@ -4,6 +4,7 @@ import {
   Power, PowerOff, FlaskConical, AlertCircle, Copy, CheckCheck, Link2, Download,
   Folder, FolderOpen, Search, X, Layers, QrCode, Sparkles,
   CheckCircle2, CircleDashed, ShieldCheck, Unlink, Lock,
+  Crown, ChevronLeft, ChevronRight,
 } from 'lucide-react';
 import AppLayout from '@/components/layouts/AppLayout';
 import PageMeta from '@/components/common/PageMeta';
@@ -41,8 +42,11 @@ import {
 } from '@/services/subscriptions';
 import {
   fetchResourceBrief, fetchResources, fetchSubscriptionSources, fetchAdminResourceSources,
+  fetchSourceOwners, fetchSourceOwnerResources,
 } from '@/services/api';
-import type { Resource, SubscriptionSource, AdminResourceSource } from '@/types/index';
+import type {
+  Resource, SubscriptionSource, AdminResourceSource, SourceOwner, SourceOwnerResource,
+} from '@/types/index';
 
 const PAN_KEYS: PanKey[] = ['guangya', 'quark', 'baidu', 'xunlei', 'uc', 'p123'];
 
@@ -387,6 +391,65 @@ export default function SubscribePage() {
   }, [resSources, srcQuery]);
   /** 资源总数（不受搜索框影响，用于文案） */
   const resSourceTotal = useMemo(() => new Set(resSources.map((s) => s.resource_id)).size, [resSources]);
+
+  // ---------- 源主（Source Owner）----------
+  /**
+   * 源主的「更新中」资源也会出现在内置订阅源里。
+   * 多位源主时先展示源主列表，点进去看该源主的资源，再选具体资源订阅。
+   * 特殊邀请码账号（subOnly）在数据库层就被挡住，这两个接口会返回空数组。
+   */
+  const [owners, setOwners] = useState<SourceOwner[]>([]);
+  const [ownersLoading, setOwnersLoading] = useState(false);
+  /** 选中的源主；为 null 时展示源主列表 */
+  const [ownerPicked, setOwnerPicked] = useState<SourceOwner | null>(null);
+  const [ownerResources, setOwnerResources] = useState<SourceOwnerResource[]>([]);
+  const [ownerResLoading, setOwnerResLoading] = useState(false);
+
+  async function loadOwners() {
+    if (ownersLoading) return;
+    setOwnersLoading(true);
+    try {
+      setOwners(await fetchSourceOwners());
+    } catch { /* 静默失败：弹窗里不显示源主分组 */ }
+    finally { setOwnersLoading(false); }
+  }
+
+  /** 进入某个源主的资源列表（先拉资源再切视图，避免空白） */
+  async function enterOwner(owner: SourceOwner) {
+    setOwnerResLoading(true);
+    setOwnerPicked(owner);
+    setSrcQuery('');
+    try {
+      setOwnerResources(await fetchSourceOwnerResources(owner.owner_id));
+    } catch {
+      setOwnerResources([]);
+    } finally {
+      setOwnerResLoading(false);
+    }
+  }
+
+  /** 返回源主列表 */
+  function backToOwners() {
+    setOwnerPicked(null);
+    setOwnerResources([]);
+    setSrcQuery('');
+  }
+
+  /** 源主的资源按资源聚合（结构与管理员资源一致，便于复用渲染） */
+  const ownerGroups = useMemo(() => {
+    const q = srcQuery.trim().toLowerCase();
+    const groups = new Map<string, { resource_id: string; name: string; episode_count: number; links: SourceOwnerResource[] }>();
+    for (const s of ownerResources) {
+      if (q && !s.name.toLowerCase().includes(q)) continue;
+      const g = groups.get(s.resource_id);
+      if (g) g.links.push(s);
+      else groups.set(s.resource_id, { resource_id: s.resource_id, name: s.name, episode_count: s.episode_count, links: [s] });
+    }
+    for (const g of groups.values()) {
+      g.links.sort((a, b) => (a.pan === b.pan ? 0 : a.pan === 'guangya' ? -1 : 1));
+    }
+    return [...groups.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  }, [ownerResources, srcQuery]);
 
   // 校准结果
   const [probeTarget, setProbeTarget] = useState<PanKey | null>(null);
@@ -2241,7 +2304,7 @@ export default function SubscribePage() {
                       <Button
                         type="button"
                         variant="outline"
-                        onClick={() => { setSrcQuery(''); setSrcPicker(true); void loadResourceSources(); }}
+                        onClick={() => { setSrcQuery(''); setSrcPicker(true); void loadResourceSources(); void loadOwners(); }}
                         className="w-full h-auto min-h-9 py-2 justify-between gap-2 border-border bg-input text-left font-normal hover:bg-muted"
                       >
                         <span className="min-w-0 flex-1">
@@ -2567,13 +2630,59 @@ export default function SubscribePage() {
       <Dialog open={srcPicker} onOpenChange={setSrcPicker}>
         <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-xl bg-card border-border">
           <DialogHeader>
-            <DialogTitle>选择订阅源</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              {ownerPicked && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={backToOwners}
+                  className="h-7 w-7 shrink-0 p-0"
+                  title="返回源主列表"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+              )}
+              {ownerPicked ? `${ownerPicked.display_name} 的更新资源` : '选择订阅源'}
+            </DialogTitle>
             <DialogDescription className="text-xs text-muted-foreground leading-relaxed">
-              来自管理员「资源管理」中<b>更新中</b>的资源；同一个资源有光鸭 / 夸克两条链接时，
+              来自管理员与源主「资源管理」中<b>更新中</b>的资源；同一个资源有光鸭 / 夸克两条链接时，
               用哪个网盘点哪个（只能选你已绑定的网盘）。订阅后分享里新增的集数会自动转存到你的网盘。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
+            {/* 源主列表：多位源主时先选源主，再选他的资源 */}
+            {!ownerPicked && owners.length > 0 && (
+              <div className="space-y-1.5 rounded-lg border border-border px-3 py-2">
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Crown className="h-3 w-3 text-primary" />
+                  源主（{owners.length}）
+                </div>
+                {owners.map((o) => (
+                  <button
+                    key={o.owner_id}
+                    type="button"
+                    onClick={() => void enterOwner(o)}
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted transition-colors"
+                  >
+                    {o.avatar_url ? (
+                      <img src={o.avatar_url} alt="" className="h-6 w-6 shrink-0 rounded-full object-cover" />
+                    ) : (
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[11px] font-medium text-primary">
+                        {(o.display_name || '源').charAt(0).toUpperCase()}
+                      </span>
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm text-foreground">{o.display_name}</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        更新中 {o.resource_count} 个资源
+                      </span>
+                    </span>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  </button>
+                ))}
+              </div>
+            )}
+
             <div className="flex items-center gap-2">
               <Search className="h-4 w-4 text-muted-foreground shrink-0" />
               <Input
@@ -2582,11 +2691,13 @@ export default function SubscribePage() {
                 placeholder="搜索资源名，如「斗罗大陆」"
                 className="h-9 bg-input border-border"
               />
-              {resSrcLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground shrink-0" />}
+              {(resSrcLoading || ownerResLoading || ownersLoading) && (
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground shrink-0" />
+              )}
             </div>
             <div className="max-h-[55vh] overflow-y-auto space-y-2 pr-1">
               {/* 管理员另配的订阅源（如果有） */}
-              {sources.length > 0 && !srcQuery.trim() && (
+              {sources.length > 0 && !srcQuery.trim() && !ownerPicked && (
                 <div className="space-y-1 rounded-lg border border-border px-3 py-2">
                   <div className="text-[11px] text-muted-foreground">管理员订阅源</div>
                   {sources.map((s) => (
@@ -2602,16 +2713,21 @@ export default function SubscribePage() {
                   ))}
                 </div>
               )}
-              {resSourceGroups.length === 0 ? (
-                <p className="py-8 text-center text-xs text-muted-foreground">
-                  {resSrcLoading
-                    ? '正在读取管理员资源…'
-                    : srcQuery.trim()
-                      ? '没有匹配的资源'
-                      : '管理员目前没有「更新中」的资源'}
-                </p>
-              ) : (
-                resSourceGroups.map((g) => {
+              {/* 资源列表：管理员资源 与 选中的源主资源 复用同一套渲染 */}
+              {(() => {
+                const groups = ownerPicked ? ownerGroups : resSourceGroups;
+                const loading = ownerPicked ? ownerResLoading : resSrcLoading;
+                const emptyText = ownerPicked
+                  ? (srcQuery.trim() ? '没有匹配的资源' : '该源主目前没有「更新中」的资源')
+                  : (resSrcLoading ? '正在读取管理员资源…' : srcQuery.trim() ? '没有匹配的资源' : '管理员目前没有「更新中」的资源');
+                if (groups.length === 0) {
+                  return (
+                    <p className="py-8 text-center text-xs text-muted-foreground">
+                      {loading && !ownerPicked ? '正在读取管理员资源…' : emptyText}
+                    </p>
+                  );
+                }
+                return groups.map((g) => {
                   const boundPans = new Set(pans.map((p) => p.pan as PanKey));
                   return (
                     <div key={g.resource_id} className="space-y-2 rounded-lg border border-border px-3 py-2">
@@ -2653,8 +2769,8 @@ export default function SubscribePage() {
                       </div>
                     </div>
                   );
-                })
-              )}
+                });
+              })()}
             </div>
           </div>
           <DialogFooter>

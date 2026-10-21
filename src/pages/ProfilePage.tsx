@@ -1,21 +1,31 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Loader2, Upload, Trash2, Clock, ShieldCheck, KeyRound, Eye, EyeOff } from 'lucide-react';
+import { Loader2, Upload, Trash2, Clock, ShieldCheck, KeyRound, Eye, EyeOff, Crown } from 'lucide-react';
 import { toast } from 'sonner';
 import AppLayout from '@/components/layouts/AppLayout';
 import PageMeta from '@/components/common/PageMeta';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import { Progress } from '@/components/ui/progress';
 import { useAuth } from '@/contexts/AuthContext';
-import { updateMyProfile, validateUsername } from '@/services/api';
+import { updateMyProfile, validateUsername, applySourceOwner, fetchMySourceOwnerStatus } from '@/services/api';
 import { uploadAvatar } from '@/lib/uploadAvatar';
+import type { MySourceOwnerStatus as OwnerStatus } from '@/types/index';
 
 /** 「账号」只展示用户名部分：内建账号是 xxx@miaoda.com 形式，个人中心不展示邮箱域名 */
 function accountNameOf(email?: string | null): string {
   if (!email) return '—';
   const local = email.split('@')[0];
   return local || email;
+}
+
+/** 源主申请时间：只展示到分钟，够用且不冗长 */
+function formatTime(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
 export default function ProfilePage() {
@@ -33,9 +43,57 @@ export default function ProfilePage() {
   const [showPwd, setShowPwd] = useState(false);
   const [changingPwd, setChangingPwd] = useState(false);
 
+  // 源主申请
+  const [ownerStatusRow, setOwnerStatusRow] = useState<OwnerStatus | null>(null);
+  const [loadingOwner, setLoadingOwner] = useState(true);
+  const [ownerEditing, setOwnerEditing] = useState(false);
+  const [ownerNote, setOwnerNote] = useState('');
+  const [ownerDisplayNameInput, setOwnerDisplayNameInput] = useState('');
+  const [applyingOwner, setApplyingOwner] = useState(false);
+
+  const ownerStatus = ownerStatusRow?.status ?? 'none';
+  /** 订阅源里展示的名字：优先自定义源主名，其次账号用户名 */
+  const ownerDisplayName = ownerStatusRow?.display_name || profile?.username || '源主';
+
   useEffect(() => {
     setUsername(profile?.username || '');
   }, [profile?.username]);
+
+  /** 拉取我的源主申请状态（失败静默：源主是附加功能，不该让整个个人中心报错） */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const row = await fetchMySourceOwnerStatus();
+        if (!cancelled) {
+          setOwnerStatusRow(row);
+          setOwnerDisplayNameInput(row.display_name || '');
+        }
+      } catch {
+        if (!cancelled) setOwnerStatusRow(null);
+      } finally {
+        if (!cancelled) setLoadingOwner(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  async function handleApplyOwner() {
+    setApplyingOwner(true);
+    try {
+      const r = await applySourceOwner({ note: ownerNote, displayName: ownerDisplayNameInput });
+      const row = await fetchMySourceOwnerStatus();
+      setOwnerStatusRow(row);
+      setOwnerDisplayNameInput(row.display_name || '');
+      setOwnerEditing(false);
+      setOwnerNote('');
+      toast.success(r.message || '申请已提交');
+    } catch (e) {
+      toast.error((e as Error).message || '提交申请失败');
+    } finally {
+      setApplyingOwner(false);
+    }
+  }
 
   const isAdmin = profile?.role === 'admin';
   const avatarUrl = profile?.avatar_url || null;
@@ -265,6 +323,130 @@ export default function ProfilePage() {
                 <div className="mt-0.5 font-medium text-foreground">{expiryText}</div>
               </div>
             </div>
+          </div>
+
+          {/* 源主申请 */}
+          <div className="rounded-xl border border-border bg-card p-5 md:p-6">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                  <Crown className="h-4 w-4 text-primary" />
+                  源主
+                  {ownerStatus === 'approved' && (
+                    <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                      已认证
+                    </span>
+                  )}
+                </h2>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  通过后，你「更新中」的资源会出现在其他用户的内置订阅源中
+                </p>
+              </div>
+              {!loadingOwner && ownerStatus !== 'approved' && (
+                <Button
+                  size="sm"
+                  onClick={() => setOwnerEditing((v) => !v)}
+                  disabled={ownerStatus === 'pending'}
+                  className="h-9 shrink-0 gap-1.5"
+                >
+                  {ownerStatus === 'pending' ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      审核中
+                    </>
+                  ) : (
+                    <>
+                      <Crown className="h-3.5 w-3.5" />
+                      {ownerStatus === 'rejected' ? '重新申请' : '申请成为源主'}
+                    </>
+                  )}
+                </Button>
+              )}
+            </div>
+
+            {/* 状态说明 */}
+            {!loadingOwner && ownerStatus === 'approved' && (
+              <div className="mt-4 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+                你已是源主，订阅源里会展示「<span className="font-medium text-foreground">{ownerDisplayName}</span>」
+                名下更新中的资源。
+                {ownerStatusRow?.apply_note && (
+                  <div className="mt-2 border-t border-border pt-2">
+                    申请理由：{ownerStatusRow.apply_note}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!loadingOwner && ownerStatus === 'pending' && (
+              <div className="mt-4 rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+                申请已提交，管理员审核通过后生效。
+                {ownerStatusRow?.created_at && (
+                  <div className="mt-1">申请时间：{formatTime(ownerStatusRow.created_at)}</div>
+                )}
+              </div>
+            )}
+
+            {!loadingOwner && ownerStatus === 'rejected' && (
+              <div className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-muted-foreground">
+                申请未通过
+                {ownerStatusRow?.review_note && (
+                  <div className="mt-1">原因：{ownerStatusRow.review_note}</div>
+                )}
+              </div>
+            )}
+
+            {/* 申请表 */}
+            {ownerEditing && (
+              <div className="mt-4 space-y-3 border-t border-border pt-4">
+                <div className="max-w-sm space-y-1.5">
+                  <Label htmlFor="owner-display-name" className="text-xs text-foreground">
+                    源主名称（可选）
+                  </Label>
+                  <Input
+                    id="owner-display-name"
+                    value={ownerDisplayNameInput}
+                    onChange={(e) => setOwnerDisplayNameInput(e.target.value)}
+                    placeholder={profile?.username || '留空则使用账号用户名'}
+                    className="h-10 bg-input border-border"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    订阅源里其他用户看到的名字
+                  </p>
+                </div>
+                <div className="max-w-sm space-y-1.5">
+                  <Label htmlFor="owner-note" className="text-xs text-foreground">
+                    申请理由
+                  </Label>
+                  <Textarea
+                    id="owner-note"
+                    value={ownerNote}
+                    onChange={(e) => setOwnerNote(e.target.value)}
+                    placeholder="简单介绍一下你的资源来源与更新情况"
+                    rows={3}
+                    className="bg-input border-border"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => void handleApplyOwner()}
+                    disabled={applyingOwner}
+                    className="h-9 gap-1.5"
+                  >
+                    {applyingOwner && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    提交申请
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setOwnerEditing(false)}
+                    className="h-9"
+                  >
+                    取消
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* 修改密码 */}

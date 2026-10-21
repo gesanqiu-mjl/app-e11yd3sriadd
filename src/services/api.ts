@@ -21,6 +21,10 @@ import {
   SubscriptionSource,
   SubscriptionSourceInput,
   AdminResourceSource,
+  MySourceOwnerStatus,
+  SourceOwner,
+  SourceOwnerResource,
+  SourceOwnerApplication,
   Tutorial,
 } from '@/types/index';
 
@@ -853,6 +857,89 @@ export async function fetchAdminResourceSources(): Promise<AdminResourceSource[]
   const { data, error } = await supabase.rpc('admin_resource_sources');
   if (error) throw error;
   return Array.isArray(data) ? (data as AdminResourceSource[]) : [];
+}
+
+// ============================================================
+// 源主（Source Owner）
+//
+// 身份以 public.source_owners 表为准（status='approved' 即源主），
+// 不写在 profiles 上 —— profiles 的特权列有触发器保护，独立表更干净。
+// 资源暴露靠 SECURITY DEFINER 函数（resources 表 RLS 不允许跨用户读）。
+// 特殊邀请码账号（subscription_only）在数据库层就被挡住，看不到源主资源。
+// ============================================================
+
+/** 查询我自己的源主申请状态 */
+export async function fetchMySourceOwnerStatus(): Promise<MySourceOwnerStatus> {
+  const { data, error } = await supabase.rpc('my_source_owner_status');
+  if (error) throw error;
+  const row = (data ?? {}) as Partial<MySourceOwnerStatus>;
+  return {
+    status: (row.status ?? 'none') as MySourceOwnerStatus['status'],
+    display_name: row.display_name ?? null,
+    apply_note: row.apply_note ?? null,
+    review_note: row.review_note ?? null,
+    username: row.username ?? null,
+    created_at: row.created_at ?? null,
+    reviewed_at: row.reviewed_at ?? null,
+  };
+}
+
+/** 申请成为源主（待审核可重复提交；已是源主时只更新展示名） */
+export async function applySourceOwner(params: {
+  note?: string;
+  displayName?: string;
+}): Promise<{ ok: boolean; status: string; message?: string }> {
+  const { data, error } = await supabase.rpc('apply_source_owner', {
+    p_note: params.note?.trim() || null,
+    p_display_name: params.displayName?.trim() || null,
+  });
+  if (error) throw error;
+  return (data ?? { ok: true, status: 'pending' }) as {
+    ok: boolean;
+    status: string;
+    message?: string;
+  };
+}
+
+/** 已通过的源主列表（受限账号得到空数组） */
+export async function fetchSourceOwners(): Promise<SourceOwner[]> {
+  const { data, error } = await supabase.rpc('source_owner_list');
+  if (error) throw error;
+  return Array.isArray(data) ? (data as SourceOwner[]) : [];
+}
+
+/** 某源主的「更新中」资源链接（受限账号得到空数组） */
+export async function fetchSourceOwnerResources(ownerId: string): Promise<SourceOwnerResource[]> {
+  const { data, error } = await supabase.rpc('source_owner_resources', {
+    p_owner_id: ownerId,
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? (data as SourceOwnerResource[]) : [];
+}
+
+/** 管理员：源主申请列表 */
+export async function fetchSourceOwnerApplications(
+  status?: 'pending' | 'approved' | 'rejected' | null
+): Promise<SourceOwnerApplication[]> {
+  const { data, error } = await supabase.rpc('list_source_owner_applications', {
+    p_status: status ?? null,
+  });
+  if (error) throw error;
+  return Array.isArray(data) ? (data as SourceOwnerApplication[]) : [];
+}
+
+/** 管理员：通过 / 驳回 / 撤销源主身份 */
+export async function reviewSourceOwner(params: {
+  userId: string;
+  action: 'approve' | 'reject' | 'revoke';
+  note?: string;
+}): Promise<void> {
+  const { error } = await supabase.rpc('review_source_owner', {
+    p_user_id: params.userId,
+    p_action: params.action,
+    p_note: params.note?.trim() || null,
+  });
+  if (error) throw error;
 }
 
 /** 管理员新增订阅源 */

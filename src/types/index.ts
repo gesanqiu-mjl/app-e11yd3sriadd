@@ -225,6 +225,61 @@ export interface SubscriptionSource {
 /** 新建/编辑订阅源时可提交的字段 */
 export type SubscriptionSourceInput = Omit<SubscriptionSource, 'id' | 'created_at' | 'updated_at'>;
 
+// ============================================================
+// 源主（Source Owner）
+// ============================================================
+
+/** 源主申请状态：未申请 / 待审核 / 已通过（=源主）/ 已驳回（含被撤销） */
+export type SourceOwnerStatus = 'none' | 'pending' | 'approved' | 'rejected';
+
+/** 我自己的源主申请状态（对应 RPC my_source_owner_status） */
+export interface MySourceOwnerStatus {
+  status: SourceOwnerStatus;
+  /** 源主展示名，空则回退账号用户名 */
+  display_name: string | null;
+  /** 我提交时的申请理由 */
+  apply_note: string | null;
+  /** 管理员审核意见 / 驳回原因 */
+  review_note: string | null;
+  username: string | null;
+  created_at: string | null;
+  reviewed_at: string | null;
+}
+
+/** 订阅源里展示的源主条目（对应 RPC source_owner_list） */
+export interface SourceOwner {
+  owner_id: string;
+  display_name: string;
+  username: string | null;
+  avatar_url: string | null;
+  /** 该源主「更新中」的资源数 */
+  resource_count: number;
+}
+
+/**
+ * 源主的「更新中」资源链接（对应 RPC source_owner_resources）。
+ * 列与 AdminResourceSource 完全一致，前端可复用同一套分组与渲染逻辑。
+ */
+export type SourceOwnerResource = AdminResourceSource;
+
+/** 管理员看到的源主申请条目（对应 RPC list_source_owner_applications） */
+export interface SourceOwnerApplication {
+  user_id: string;
+  username: string | null;
+  display_name: string | null;
+  status: Exclude<SourceOwnerStatus, 'none'>;
+  apply_note: string | null;
+  review_note: string | null;
+  created_at: string;
+  reviewed_at: string | null;
+  /** 审核管理员的用户名 */
+  reviewed_by_name: string | null;
+  /** 「更新中」资源数 */
+  resource_count: number;
+  /** 「已完结」资源数 */
+  finished_count: number;
+}
+
 // 开放接口密钥（管理员在「API 管理」创建，供第三方程序调用 /functions/v1/resource-api）
 export interface ApiKey {
   id: string;

@@ -79,6 +79,7 @@ import AnnouncementTab from '@/components/AnnouncementTab';
 import TutorialTab from '@/components/TutorialTab';
 import ApiKeysTab from '@/components/ApiKeysTab';
 import SubscriptionSourceTab from '@/components/SubscriptionSourceTab';
+import SourceOwnerTab from '@/components/SourceOwnerTab';
 
 const MEMBERSHIP_OPTIONS = [
   { value: '7', label: '7 天' },
@@ -804,6 +805,9 @@ export default function AdminPage() {
             </TabsTrigger>
             <TabsTrigger value="subscription-sources" className="text-xs gap-1.5 data-[state=active]:bg-card">
               <Link2 className="h-3.5 w-3.5" /> 订阅源
+            </TabsTrigger>
+            <TabsTrigger value="source-owners" className="text-xs gap-1.5 data-[state=active]:bg-card">
+              <Crown className="h-3.5 w-3.5" /> 源主审核
             </TabsTrigger>
           </TabsList>
 
@@ -1620,6 +1624,9 @@ export default function AdminPage() {
           </TabsContent>
           <TabsContent value="subscription-sources" className="mt-4">
             <SubscriptionSourceTab />
+          </TabsContent>
+          <TabsContent value="source-owners" className="mt-4">
+            <SourceOwnerTab />
           </TabsContent>
         </Tabs>
       </div>
