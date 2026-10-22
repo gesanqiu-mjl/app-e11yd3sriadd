@@ -37,7 +37,7 @@ const CORS = {
 
 const SITE_TIMEOUT_MS = 25000;
 
-type SiteKey = "ya" | "jying" | "hdhaven" | "framehdr" | "mukaku" | "panfx" | "xn" | "st1";
+type SiteKey = "ya" | "jying" | "framehdr" | "mukaku" | "panfx" | "xn" | "st1";
 
 interface SiteSpec {
   label: string;
@@ -75,22 +75,6 @@ const SITES: Record<SiteKey, SiteSpec> = {
     login: "login",
     captcha: false,
     codes: ["JYING_COOKIE_EXPIRED", "JYING_NOT_BOUND"],
-  },
-  hdhaven: {
-    label: "栖影 HDHaven",
-    fn: "hdhaven-proxy",
-    sessionTable: "hdhaven_sessions",
-    probe: { action: "status" },
-    // 2026-10 起改用站点官方 OpenAPI OAuth：用户在浏览器点一次授权，
-    // access_token 长期有效，不需要账号密码、也没有会话过期重登的概念
-    //（旧的 Cookie + Turnstile + 图形验证码那套已从 hdhaven-proxy 中整体移除）。
-    // 失效只发生在用户在 OPENAPI 页面撤销授权、重新授权或账号不可用，
-    // 此时无法自动恢复，必须重新走一次授权流程。
-    login: null,
-    captcha: false,
-    manualReason:
-      "栖影授权已失效（用户撤销授权或账号不可用），请到「站点同步 → 栖影 HDHaven」重新授权",
-    codes: ["HDHAVEN_TOKEN_EXPIRED", "HDHAVEN_NOT_BOUND", "HDHAVEN_RATE_LIMITED"],
   },
   framehdr: {
     label: "帧影",

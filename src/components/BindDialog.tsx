@@ -17,7 +17,6 @@ import {
   st1MyResources, bindResourceToSt1, unbindResourceFromSt1, ST1_TOKEN_EXPIRED_CODE,
   fetchMukakuResources, bindResourceToMukaku, unbindResourceFromMukaku, MUKAKU_TOKEN_EXPIRED_CODE,
   loadJyingShares, bindResourceToJying, unbindResourceFromJying, JYING_EXPIRED_CODE,
-  loadHdhavenShares, bindResourceToHdhaven, unbindResourceFromHdhaven, HDHAVEN_EXPIRED_CODE,
 } from '@/services/api';
 import type {
   Resource, XnShare, XnResourceBinding,
@@ -25,7 +24,6 @@ import type {
   PanfxPost, PanfxResourceBinding, MukakuWpResource, MukakuResourceBinding,
   St1ResourceBinding,
   JyingShareItem, JyingResourceBinding,
-  HdhavenShareItem, HdhavenResourceBinding,
 } from '@/types/index';
 
 function fmtDate(iso?: string | null) {
@@ -45,7 +43,6 @@ interface BindDialogProps {
   st1Binding: St1ResourceBinding | null;
   mukakuBindings: MukakuResourceBinding[];
   jyingBindings: JyingResourceBinding[];
-  hdhavenBindings: HdhavenResourceBinding[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onXnBound: (resourceId: string, binding: XnResourceBinding) => void;
@@ -62,8 +59,6 @@ interface BindDialogProps {
   onMukakuUnbound: (resourceId: string, linkId?: number) => void;
   onJyingBound: (resourceId: string, binding: JyingResourceBinding) => void;
   onJyingUnbound: (resourceId: string, linkId?: number) => void;
-  onHdhavenBound: (resourceId: string, binding: HdhavenResourceBinding) => void;
-  onHdhavenUnbound: (resourceId: string, slug?: string) => void;
 }
 
 // ─── 聚影标签页内容（只列出该账号在聚影已发布的分享记录，用于绑定） ───
@@ -231,184 +226,6 @@ function JyingPane({
   );
 }
 
-// ─── 栖影标签页内容（只列出该账号在栖影已发布的分享记录，用于绑定） ───
-function HdhavenPane({
-  resource, hdhavenBindings, onHdhavenBound, onHdhavenUnbound,
-}: Pick<BindDialogProps, 'resource' | 'hdhavenBindings' | 'onHdhavenBound' | 'onHdhavenUnbound'>) {
-  const [shares, setShares] = useState<HdhavenShareItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [keyword, setKeyword] = useState('');
-  const [bindingSlug, setBindingSlug] = useState<string | null>(null);
-  const [unbindingSlug, setUnbindingSlug] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setLoadError(null);
-    try {
-      // 栖影列表接口无分页/筛选参数，一次取全量，筛选在前端做
-      setShares(await loadHdhavenShares());
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      setShares([]);
-      setLoadError(
-        err.code === HDHAVEN_EXPIRED_CODE
-          ? '栖影授权已失效，请到「站点同步」页重新授权'
-          : err.message || '加载栖影分享记录失败'
-      );
-    } finally { setLoading(false); }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    load().finally(() => { if (cancelled) return; });
-    return () => { cancelled = true; };
-  }, [load]);
-
-  const visibleShares = keyword.trim()
-    ? shares.filter((s) =>
-        `${s.title ?? ''} ${s.media_title ?? ''}`.toLowerCase().includes(keyword.trim().toLowerCase())
-      )
-    : shares;
-
-  const panLabelOf = (panType?: string | null) =>
-    panType ? (PAN_TYPE_LABELS[panType] ?? panType) : '未知网盘';
-
-  async function handleBind(item: HdhavenShareItem) {
-    if (!resource) return;
-    setBindingSlug(item.slug);
-    try {
-      await bindResourceToHdhaven(resource.id, item, item.media_title ?? undefined);
-      const existing = hdhavenBindings.find((b) => b.slug === item.slug);
-      onHdhavenBound(resource.id, {
-        id: existing?.id ?? '',
-        resource_id: resource.id,
-        slug: item.slug,
-        tmdb_id: item.tmdb_id ?? null,
-        media_type: item.media_type ?? null,
-        link_title: item.title ?? null,
-        vod_name: item.media_title ?? null,
-        pan_type: item.pan_type ?? null,
-        pan_label: item.pan_type ? (PAN_TYPE_LABELS[item.pan_type] ?? item.pan_type) : null,
-        created_at: existing?.created_at ?? new Date().toISOString(),
-      });
-      toast.success('绑定栖影分享记录成功，资源更新时将自动同步');
-    } catch { toast.error('绑定失败，请重试'); }
-    finally { setBindingSlug(null); }
-  }
-
-  async function handleUnbind(slug: string) {
-    if (!resource) return;
-    setUnbindingSlug(slug);
-    try {
-      await unbindResourceFromHdhaven(resource.id, slug);
-      onHdhavenUnbound(resource.id, slug);
-      toast.success('已解绑该条栖影记录');
-    } catch { toast.error('解绑失败'); }
-    finally { setUnbindingSlug(null); }
-  }
-
-  return (
-    <div className="space-y-3">
-      {hdhavenBindings.length > 0 && (
-        <div className="space-y-1.5">
-          <div className="text-xs font-medium text-muted-foreground">已绑定 {hdhavenBindings.length} 条栖影分享记录</div>
-          {hdhavenBindings.map((b) => (
-            <div key={b.slug} className="flex items-center justify-between gap-2 p-2 rounded-lg bg-muted/40 border border-border text-xs">
-              <div className="min-w-0 flex items-center gap-2">
-                <CheckCircle2 className="h-3.5 w-3.5 text-primary shrink-0" />
-                <div className="min-w-0">
-                  <div className="truncate text-foreground">{b.vod_name || b.link_title || b.slug}</div>
-                  <div className="text-[10px] text-muted-foreground truncate">
-                    {b.pan_label || panLabelOf(b.pan_type)} · {b.slug}
-                  </div>
-                </div>
-              </div>
-              <Button variant="ghost" size="sm" onClick={() => handleUnbind(b.slug)}
-                disabled={unbindingSlug === b.slug}
-                className="h-7 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 shrink-0 gap-1">
-                {unbindingSlug === b.slug ? <Loader2 className="h-3 w-3 animate-spin" /> : <Unlink className="h-3 w-3" />}
-                解绑
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="flex items-center gap-2">
-        <div className="relative flex-1">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
-          <Input
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-            placeholder="按片名筛选你的栖影分享记录"
-            className="h-8 pl-8 text-xs bg-input border-border"
-          />
-        </div>
-        <Button variant="outline" size="sm" onClick={() => load()} disabled={loading}
-          className="h-8 text-xs border-border gap-1">
-          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
-          刷新
-        </Button>
-      </div>
-
-      {loadError ? (
-        <div className="py-6 text-center text-xs text-destructive">{loadError}</div>
-      ) : loading && shares.length === 0 ? (
-        <div className="flex items-center justify-center py-8 text-muted-foreground text-xs gap-2">
-          <Loader2 className="h-4 w-4 animate-spin" />加载中…
-        </div>
-      ) : visibleShares.length === 0 ? (
-        <div className="py-8 text-center text-xs text-muted-foreground">
-          {shares.length === 0 ? '未找到你的栖影分享记录' : '没有匹配的分享记录'}
-        </div>
-      ) : (
-        <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
-          {visibleShares.map((item) => {
-            const bound = hdhavenBindings.some((b) => b.slug === item.slug);
-            return (
-              <div key={item.slug}
-                className="flex items-start justify-between gap-2 p-2 rounded-lg border border-border bg-card text-xs">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="font-medium text-foreground truncate">{item.title || '未命名分享'}</span>
-                    <Badge variant="secondary" className="text-[10px] px-1 py-0">
-                      {panLabelOf(item.pan_type)}
-                    </Badge>
-                    {item.share_size && (
-                      <Badge variant="outline" className="text-[10px] px-1 py-0">{item.share_size}</Badge>
-                    )}
-                    {bound && <Badge className="text-[10px] px-1 py-0 bg-primary/15 text-primary border-0">已绑定</Badge>}
-                  </div>
-                  <div className="mt-0.5 text-[10px] text-muted-foreground truncate">
-                    {item.media_type === 'tv' ? '剧集' : '电影'}
-                    {item.media_title ? ` · ${item.media_title}` : ''}
-                    {item.file_count ? ` · ${item.file_count} 个文件` : ''}
-                  </div>
-                  <div className="text-[10px] text-muted-foreground/70 font-mono truncate">{item.slug}</div>
-                </div>
-                <Button variant={bound ? 'ghost' : 'outline'} size="sm"
-                  onClick={() => (bound ? handleUnbind(item.slug) : handleBind(item))}
-                  disabled={bindingSlug === item.slug || unbindingSlug === item.slug}
-                  className="h-7 text-xs shrink-0 gap-1">
-                  {bindingSlug === item.slug || unbindingSlug === item.slug
-                    ? <Loader2 className="h-3 w-3 animate-spin" />
-                    : bound ? <Unlink className="h-3 w-3" /> : <Link2 className="h-3 w-3" />}
-                  {bound ? '解绑' : '绑定'}
-                </Button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      <div className="flex items-start gap-2 p-2 rounded-lg bg-muted/40 text-[11px] text-muted-foreground">
-        <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-        <span>此处只列出你账号在栖影<strong>已发布</strong>的分享记录，绑定后资源更新时会自动替换该记录的链接（普通用户改动后资源会重新进入审核）。栖影暂未开放「新建分享」接口，新增分享请先在栖影站点发布。</span>
-      </div>
-    </div>
-  );
-}
 
 // ─── 帧影站点标签页内容 ────────────────────────────────────────
 function FramehdrPane({
@@ -1500,15 +1317,15 @@ function MukakuPane({
 // ─── 弹窗入口 ────────────────────────────────────────────────
 export default function BindDialog({
   resource, xnBindings, yaBindings, framehdrBinding, panfxBinding, st1Binding, mukakuBindings,
-  jyingBindings, hdhavenBindings, open, onOpenChange,
+  jyingBindings, open, onOpenChange,
   onXnBound, onXnUnbound, onYaBound, onYaUnbound,
   onFramehdrBound, onFramehdrUnbound, onPanfxBound, onPanfxUnbound, onSt1Bound, onSt1Unbound,
   onMukakuBound, onMukakuUnbound,
-  onJyingBound, onJyingUnbound, onHdhavenBound, onHdhavenUnbound,
+  onJyingBound, onJyingUnbound,
 }: BindDialogProps) {
   const boundCount = xnBindings.length + yaBindings.length
     + (framehdrBinding ? 1 : 0) + (panfxBinding ? 1 : 0) + (st1Binding ? 1 : 0) + mukakuBindings.length
-    + jyingBindings.length + hdhavenBindings.length;
+    + jyingBindings.length;
   const hasBound = boundCount > 0;
 
   return (
@@ -1562,11 +1379,6 @@ export default function BindDialog({
               聚影
               {jyingBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
             </TabsTrigger>
-            <TabsTrigger value="hdhaven"
-              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
-              栖影
-              {hdhavenBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
-            </TabsTrigger>
             <TabsTrigger value="st1"
               className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               1号站点
@@ -1615,13 +1427,7 @@ export default function BindDialog({
               onJyingBound={onJyingBound} onJyingUnbound={onJyingUnbound}
             />
           </TabsContent>
-          <TabsContent value="hdhaven" className="w-full min-w-0 mt-0">
-            <HdhavenPane
-              resource={resource} hdhavenBindings={hdhavenBindings}
-              onHdhavenBound={onHdhavenBound} onHdhavenUnbound={onHdhavenUnbound}
-            />
-          </TabsContent>
-        </Tabs>
+          </Tabs>
       </DialogContent>
     </Dialog>
   );

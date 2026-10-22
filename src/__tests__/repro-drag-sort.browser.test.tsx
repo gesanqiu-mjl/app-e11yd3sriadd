@@ -42,7 +42,6 @@ vi.mock('@/services/api', () => {
     fetchPanfxResourceBindings: emptyList,
     fetchMukakuResourceBindings: emptyList,
     fetchJyingResourceBindings: emptyList,
-    fetchHdhavenResourceBindings: emptyList,
     updateResourceField: () => Promise.resolve(null),
     updateResourceCover: () => Promise.resolve(null),
     recordChange: () => Promise.resolve(undefined),
@@ -78,8 +77,6 @@ vi.mock('@/services/api', () => {
     PANFX_COOKIE_EXPIRED_CODE: 'PANFX_COOKIE_EXPIRED',
     MUKAKU_TOKEN_EXPIRED_CODE: 'MUKAKU_TOKEN_EXPIRED',
     JYING_EXPIRED_CODE: 'JYING_COOKIE_EXPIRED',
-    HDHAVEN_EXPIRED_CODE: 'HDHAVEN_TOKEN_EXPIRED',
-    HDHAVEN_RATE_LIMITED_CODE: 'HDHAVEN_RATE_LIMITED',
   };
 });
 

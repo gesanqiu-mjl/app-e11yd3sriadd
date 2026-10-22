@@ -11,11 +11,9 @@
 
 import type { XlsxSheet } from '@/lib/parseXlsx';
 import { detectPanName, panNameMatchesType, PAN_TYPE_LABELS } from '@/lib/panUtils';
-import { parseEpisodeCountFromName, parseHdhavenMetaFromName } from '@/lib/hdhavenMeta';
 import { supabase } from '@/db/supabase';
 import {
   bindResourceToFramehdr,
-  bindResourceToHdhavenBySlug,
   bindResourceToJying,
   bindResourceToMukaku,
   bindResourceToXnShare,
@@ -23,14 +21,11 @@ import {
   fetchResources,
   getMukakuMovieDetail,
   FRAMEHDR_COOKIE_EXPIRED_CODE,
-  HDHAVEN_EXPIRED_CODE,
-  HDHAVEN_RATE_LIMITED_CODE,
   insertResources,
   JYING_EXPIRED_CODE,
   MUKAKU_TOKEN_EXPIRED_CODE,
   RESOURCE_QUOTA_EXCEEDED_CODE,
   searchFramehdrResources,
-  searchHdhavenTmdb,
   searchJyingMovies,
   searchMukakuMovies,
   searchXnVideos,
@@ -40,11 +35,28 @@ import {
 } from '@/services/api';
 
 // ============================================================
+// 通用工具
+// ============================================================
+
+/** 从名称解析集数：全N集 / 共N集 / 更新至第N集 / 第N集 */
+function parseEpisodeCountFromName(name: string): number | null {
+  const patterns = [/(?:全|共)\s*(\d{1,4})\s*集/, /更新至\s*第?\s*(\d{1,4})\s*集/, /第\s*(\d{1,4})\s*集/];
+  for (const re of patterns) {
+    const m = (name ?? '').match(re);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  }
+  return null;
+}
+
+// ============================================================
 // 站点定义
 // ============================================================
 
 /** 支持批量发帖的站点（123社区无「新建帖子」接口，未纳入） */
-export type BatchPostSite = 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying' | 'hdhaven';
+export type BatchPostSite = 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying';
 
 export const BATCH_POST_SITE_LABELS: Record<BatchPostSite, string> = {
   xnsite: '观影站点',
@@ -52,7 +64,6 @@ export const BATCH_POST_SITE_LABELS: Record<BatchPostSite, string> = {
   framehdr: '帧影站点',
   mukaku: '不太灵站点',
   jying: '聚影站点',
-  hdhaven: '栖影站点',
 };
 
 /** 站点登录态失效错误码 → 友好提示 */
@@ -62,16 +73,12 @@ const EXPIRED_CODES: Partial<Record<BatchPostSite, { code: string; message: stri
   framehdr: { code: FRAMEHDR_COOKIE_EXPIRED_CODE, message: '帧影登录已过期，请重新登录' },
   mukaku: { code: MUKAKU_TOKEN_EXPIRED_CODE, message: '不太灵登录已过期，请重新登录' },
   jying: { code: JYING_EXPIRED_CODE, message: '聚影登录已过期，请重新登录' },
-  hdhaven: { code: HDHAVEN_EXPIRED_CODE, message: '栖影授权已失效，请到站点同步页重新授权' },
 };
 
 function friendlyError(site: BatchPostSite, e: unknown): string {
   const err = e as Error & { code?: string };
   if (err?.code && err.code === EXPIRED_CODES[site]?.code) {
     return EXPIRED_CODES[site]!.message;
-  }
-  if (err?.code === HDHAVEN_RATE_LIMITED_CODE) {
-    return err.message || '栖影调用次数已达上限（每分钟 60 次 / 每日按账号等级），请稍后再试';
   }
   if (err?.code === RESOURCE_QUOTA_EXCEEDED_CODE) {
     return err.message || '资源库已超出配额，无法入库';
@@ -238,8 +245,7 @@ export type BatchPostTarget =
   | { site: 'ya'; videoTitle: string; category: string; videoId?: number; title: string; cover: string | null; year: string }
   | { site: 'framehdr'; resourceId: number; title: string; cover: string | null; year: string }
   | { site: 'mukaku'; moviesId: number; title: string; cover: string | null; year: string }
-  | { site: 'jying'; movieId: number; title: string; cover: string | null; year: string }
-  | { site: 'hdhaven'; tmdbId: string; mediaType: string; title: string; cover: string | null; year: string };
+  | { site: 'jying'; movieId: number; title: string; cover: string | null; year: string };
 
 /** 预览/执行计划中的一行 */
 export interface BatchPostPlanItem {
@@ -305,21 +311,6 @@ async function matchTarget(site: BatchPostSite, row: BatchPostRow): Promise<Batc
         const hit = pickBest(list, (it) => it.title, query, year, (it) => it.release_year);
         if (hit?.id) {
           return { site, movieId: hit.id, title: hit.title, cover: hit.cover || null, year: String(hit.release_year ?? '') };
-        }
-        break;
-      }
-      case 'hdhaven': {
-        const list = await searchHdhavenTmdb(query);
-        const hit = pickBest(list, (it) => it.title || it.name || '', query, year, (it) =>
-          (it.release_date || it.first_air_date || '').slice(0, 4)
-        );
-        if (hit?.id) {
-          const mediaType = hit.media_type || (hit.first_air_date ? 'tv' : 'movie');
-          return {
-            site, tmdbId: String(hit.id), mediaType, title: hit.title || hit.name || '',
-            cover: hit.poster_path ? `https://image.tmdb.org/t/p/w500${hit.poster_path}` : null,
-            year: (hit.release_date || hit.first_air_date || '').slice(0, 4),
-          };
         }
         break;
       }
@@ -573,37 +564,6 @@ async function postOne(site: BatchPostSite, item: BatchPostPlanItem, sortOrder: 
             vod_name: raw.movie_title ?? target.title,
             share_link: row.link,
             pan_label: raw.type ?? (panName || null),
-          });
-        break;
-      }
-      case 'hdhaven': {
-        const meta = parseHdhavenMetaFromName(title, {
-          isTv: target.mediaType === 'tv',
-          episodeCount: parseEpisodeCountFromName(title),
-        });
-        const data = await batchCreate('hdhaven', {
-          tmdb_id: target.tmdbId,
-          media_type: target.mediaType,
-          url: row.link,
-          title,
-          // 未命中的解析结果会被 JSON.stringify 丢弃
-          video_resolution: meta.video_resolution,
-          source: meta.source,
-          subtitle_language: meta.subtitle_language,
-          subtitle_type: meta.subtitle_type,
-          episode_range: meta.episode_range,
-        }, 120000);
-        const res = (data.data ?? {}) as { slug?: string; title?: string; pan_type?: string };
-        if (!res.slug) throw new Error('站点未返回分享 slug');
-        const slug = res.slug;
-        bindTask = (resourceId) =>
-          bindResourceToHdhavenBySlug({
-            resourceId,
-            slug,
-            linkTitle: title,
-            vodName: res.title || target.title,
-            panType: res.pan_type || panCode,
-            mediaType: target.mediaType,
           });
         break;
       }

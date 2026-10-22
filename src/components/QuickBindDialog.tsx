@@ -49,17 +49,13 @@ import {
   addJyingResource,
   bindResourceToJying,
   getJyingBinding,
-  searchHdhavenTmdb,
-  getHdhavenBinding,
-  createHdhavenShare,
 } from '@/services/api';
-import type { Resource, MukakuMovie, YaLink, JyingMovie, HdhavenTmdbItem } from '@/types/index';
+import type { Resource, MukakuMovie, YaLink, JyingMovie } from '@/types/index';
 import type { XnSearchItem, FramehdrSearchItem } from '@/services/api';
 import { detectPanName } from '@/lib/panUtils';
 import { SITE_URLS, siteHost } from '@/lib/siteCredentials';
-import { parseHdhavenMetaFromName } from '@/lib/hdhavenMeta';
 
-export type SiteSourceType = 'mukaku' | 'ya' | 'framehdr' | 'xn' | 'panfx' | 'jying' | 'hdhaven';
+export type SiteSourceType = 'mukaku' | 'ya' | 'framehdr' | 'xn' | 'panfx' | 'jying';
 
 export interface SiteBindingPayload {
   site: SiteSourceType;
@@ -79,8 +75,6 @@ export interface SiteBindingPayload {
   link_title?: string;
   /** 分享外链（观影小牛落库使用） */
   share_url?: string;
-  /** 栖影：投稿片源的 movie / tv，同步时用于判断是否提交「集数范围」 */
-  media_type?: string;
 }
 
 export interface SelectedPanLinkItem {
@@ -120,7 +114,6 @@ const SITE_OPTIONS: Array<{
   { id: 'xn', label: '观影片库', badge: '搜索提示', desc: '基于片库站内搜索联想片源', supported: true },
   { id: 'panfx', label: '123社区', badge: '仅发帖', desc: '暂未提供全网片源检索接口，仅支持帖子管理', supported: false },
   { id: 'jying', label: '聚影', badge: '云端片库', desc: '检索聚影全站片库，支持在该影片下自动新增网盘分享', supported: true },
-  { id: 'hdhaven', label: '栖影', badge: 'TMDB 片库', desc: '基于 TMDB 检索片源，支持直接投稿发布网盘资源（提交后由站点审核）', supported: true },
 ];
 
 /** 智能清洗关键词（去掉括号年份、集数、画质等），用于搜索站点片库 */
@@ -200,7 +193,6 @@ export default function QuickBindDialog({
   const [xnVideos, setXnVideos] = useState<XnSearchItem[]>([]);
   const [framehdrResults, setFramehdrResults] = useState<FramehdrSearchItem[]>([]);
   const [jyingShares, setJyingShares] = useState<JyingMovie[]>([]);
-  const [hdhavenResults, setHdhavenResults] = useState<HdhavenTmdbItem[]>([]);
 
   // 选中的片源
   const [selectedMovie, setSelectedMovie] = useState<MukakuMovie | null>(null);
@@ -208,7 +200,6 @@ export default function QuickBindDialog({
   const [selectedXn, setSelectedXn] = useState<XnSearchItem | null>(null);
   const [selectedFramehdr, setSelectedFramehdr] = useState<FramehdrSearchItem | null>(null);
   const [selectedJying, setSelectedJying] = useState<JyingMovie | null>(null);
-  const [selectedHdhaven, setSelectedHdhaven] = useState<HdhavenTmdbItem | null>(null);
 
   // 回填设置与发布表单
   const [targetName, setTargetName] = useState('');
@@ -231,8 +222,7 @@ export default function QuickBindDialog({
     mukakuBound: boolean;
     yaBound: boolean;
     jyingBound: boolean;
-    hdhavenBound: boolean;
-  }>({ mukakuBound: false, yaBound: false, jyingBound: false, hdhavenBound: false });
+  }>({ mukakuBound: false, yaBound: false, jyingBound: false });
 
   // 队列回填与发布执行状态
   const [queueProgress, setQueueProgress] = useState<{
@@ -291,17 +281,15 @@ export default function QuickBindDialog({
 
   async function checkSiteBindings() {
     try {
-      const [mStatus, yStatus, jStatus, hStatus] = await Promise.allSettled([
+      const [mStatus, yStatus, jStatus] = await Promise.allSettled([
         getMukakuStatus(),
         yaGetAccountStatus(),
         getJyingBinding(),
-        getHdhavenBinding(),
       ]);
       setSiteBindStatus({
         mukakuBound: mStatus.status === 'fulfilled' && (mStatus.value?.valid === true || mStatus.value?.status === 'active'),
         yaBound: yStatus.status === 'fulfilled' && yStatus.value?.success === true,
         jyingBound: jStatus.status === 'fulfilled' && jStatus.value?.status === 'active',
-        hdhavenBound: hStatus.status === 'fulfilled' && hStatus.value?.status === 'active',
       });
     } catch {
       // 容错忽略
@@ -360,13 +348,6 @@ export default function QuickBindDialog({
         setJyingShares(list);
         if (list.length === 0) {
           toast.info(`未在聚影片库搜到「${q}」，可尝试去掉年份或精简关键词`);
-        }
-      } else if (site === 'hdhaven') {
-        // 栖影走 TMDB 片库检索（中文可直接搜），用于定位片源并回填名称/封面
-        const list = await searchHdhavenTmdb(q);
-        setHdhavenResults(list);
-        if (list.length === 0) {
-          toast.info(`未在栖影片库搜到「${q}」，可尝试去掉年份或精简关键词`);
         }
       } else if (site === 'panfx') {
         toast.info('123社区仅支持论坛帖子发布管理，暂无全局片库检索 API');
@@ -436,14 +417,6 @@ export default function QuickBindDialog({
     setSelectedJying(item);
     if (item.cover) setSelectedCover(item.cover);
     toast.success(`已选定聚影片源《${item.title}》，发布时将在该影片下新增分享`);
-  }
-
-  // 选中栖影片源（TMDB 片库；不覆盖「资源标题」，标题始终以资源名称为准，
-  // 片源只用于提供投稿所需的 tmdb_id / media_type）
-  function handlePickHdhaven(item: HdhavenTmdbItem) {
-    setSelectedHdhaven(item);
-    if (item.poster_path) setSelectedCover(`https://image.tmdb.org/t/p/w500${item.poster_path}`);
-    toast.success(`已选定栖影片源《${item.title || item.name || ''}》`);
   }
 
   function handlePickXnVideo(item: XnSearchItem) {
@@ -555,13 +528,6 @@ export default function QuickBindDialog({
       } else if (selectedSite === 'jying' && !selectedJying) {
         // 聚影需先定位目标影片，未选片源无法在该影片下新增分享
         toast.warning('请先在上方搜索并选择聚影的【目标片源】，再点击发布');
-        shouldPublish = false;
-      } else if (selectedSite === 'hdhaven' && !siteBindStatus.hdhavenBound) {
-        toast.warning('检测到尚未绑定栖影账号，将仅做本地回填。请先前往「站点同步」页登录栖影。');
-        shouldPublish = false;
-      } else if (selectedSite === 'hdhaven' && !selectedHdhaven) {
-        // 栖影投稿必须携带 tmdb_id / media_type，未选片源无法发布
-        toast.warning('请先在上方搜索并选择栖影的【目标片源】，再点击发布');
         shouldPublish = false;
       }
     }
@@ -699,42 +665,6 @@ export default function QuickBindDialog({
             console.warn('发布到聚影失败', jyErr);
             toast.error(`发布至聚影失败: ${jyErr?.message || '未知错误'}`);
           }
-        } else if (selectedSite === 'hdhaven' && selectedHdhaven) {
-          try {
-            // 栖影：向选中 TMDB 片源投稿（POST /api/resources，站点详情页「我来分享」同款）；
-            // 成功后用返回 slug 落地绑定，之后本地改链即自动同步
-            const mediaType = selectedHdhaven.media_type
-              || (selectedHdhaven.first_air_date ? 'tv' : 'movie');
-            const created = await createHdhavenShare({
-              tmdbId: String(selectedHdhaven.id),
-              mediaType,
-              url: firstLink.url,
-              title: finalName,
-              accessCode: firstLink.extract_code,
-              // 按资源名称自动匹配站点投稿属性：分辨率 / 来源(SDR、HDR、DV) / 字幕 / 集数范围
-              meta: parseHdhavenMetaFromName(finalName, {
-                isTv: mediaType === 'tv',
-                episodeCount: resource?.episode_count ?? null,
-              }),
-            });
-            if (created.slug) {
-              firstBinding = {
-                site: 'hdhaven',
-                media_type: mediaType,
-                share_id: created.slug,
-                link_title: created.title || finalName,
-                vod_name: selectedHdhaven.title || selectedHdhaven.name || finalName,
-                pan_type: created.panType || undefined,
-                pan_url: firstLink.url,
-                code: firstLink.extract_code,
-              };
-            } else {
-              toast.warning('已发布到栖影，但未能取回条目 ID，请到「绑定站点剧集 → 栖影」手动绑定');
-            }
-          } catch (hdErr: any) {
-            console.warn('发布到栖影失败', hdErr);
-            toast.error(`发布至栖影失败: ${hdErr?.message || '未知错误'}`);
-          }
         } else if (selectedSite === 'xn' && selectedXn) {
           try {
             // 观影片库发布分享强制要求绑定至少 1 个资源，
@@ -840,38 +770,6 @@ export default function QuickBindDialog({
                 });
               } catch (subErr) {
                 console.warn('队列发布帧影失败', subErr);
-              }
-            } else if (selectedSite === 'hdhaven' && selectedHdhaven) {
-              // 栖影：队列第 2 条起继续投稿到同一片源，各自生成一条分享条目
-              try {
-                const mediaType = selectedHdhaven.media_type
-                  || (selectedHdhaven.first_air_date ? 'tv' : 'movie');
-                const created = await createHdhavenShare({
-                  tmdbId: String(selectedHdhaven.id),
-                  mediaType,
-                  url: item.url,
-                  title: finalName,
-                  accessCode: item.extract_code,
-                  meta: parseHdhavenMetaFromName(finalName, {
-                    isTv: mediaType === 'tv',
-                    episodeCount: resource?.episode_count ?? null,
-                  }),
-                });
-                if (created.slug) {
-                  subBinding = {
-                    site: 'hdhaven',
-                    media_type: mediaType,
-                    share_id: created.slug,
-                    link_title: created.title || finalName,
-                    vod_name: selectedHdhaven.title || selectedHdhaven.name || finalName,
-                    pan_type: created.panType || undefined,
-                    pan_url: item.url,
-                    code: item.extract_code,
-                  };
-                }
-              } catch (subErr: any) {
-                console.warn('队列发布栖影失败', subErr);
-                toast.error(`队列发布至栖影失败: ${subErr?.message || '未知错误'}`);
               }
             } else if (selectedSite === 'xn' && selectedXn) {
               try {
@@ -1247,54 +1145,6 @@ export default function QuickBindDialog({
                               <span>ID: {item.id}{item.release_year ? ` · ${item.release_year}` : ''}</span>
                               <Badge variant="secondary" className="text-[9px] px-1 py-0 shrink-0">
                                 {item.movie_type_display || '影片'}
-                              </Badge>
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )
-              ) : selectedSite === 'hdhaven' ? (
-                hdhavenResults.length === 0 ? (
-                  <div className="py-6 text-center text-xs text-muted-foreground">
-                    未检索到栖影片源。请先在「站点同步 → 栖影站点」绑定账号，再在下方搜索（基于 TMDB 片库）
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    {hdhavenResults.map((item) => {
-                      const name = item.title || item.name || '未命名';
-                      const year = (item.release_date || item.first_air_date || '').slice(0, 4);
-                      const picked = selectedHdhaven?.id === item.id;
-                      return (
-                        <div
-                          key={item.id}
-                          onClick={() => handlePickHdhaven(item)}
-                          className={`cursor-pointer rounded-lg border p-2 flex gap-2 transition-colors ${
-                            picked ? 'border-primary bg-primary/5' : 'border-border bg-card hover:bg-muted/40'
-                          }`}
-                        >
-                          <div className="relative w-10 h-14 rounded overflow-hidden bg-muted shrink-0">
-                            {item.poster_path && (
-                              <img
-                                src={`https://image.tmdb.org/t/p/w200${item.poster_path}`}
-                                alt={name}
-                                referrerPolicy="no-referrer"
-                                className="absolute inset-0 w-full h-full object-cover"
-                                onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                              />
-                            )}
-                          </div>
-                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
-                            <div className="flex items-center justify-between gap-1">
-                              <h4 className="font-medium text-xs truncate text-foreground">{name}</h4>
-                              {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
-                            </div>
-                            <div className="text-[10px] text-muted-foreground truncate">{item.overview || '—'}</div>
-                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40 gap-1">
-                              <span>TMDB: {item.id}{year ? ` · ${year}` : ''}</span>
-                              <Badge variant="secondary" className="text-[9px] px-1 py-0 shrink-0">
-                                {item.media_type === 'tv' ? '剧集' : '电影'}
                               </Badge>
                             </div>
                           </div>

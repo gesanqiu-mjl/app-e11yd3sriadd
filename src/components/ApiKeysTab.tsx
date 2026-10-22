@@ -952,8 +952,7 @@ xnsite      观影站点
 ya          鸭影臻藏
 framehdr    帧影站点
 mukaku      不太灵站点
-jying       聚影站点
-hdhaven     栖影站点`}
+jying       聚影站点`}
             />
 
             <div className="overflow-x-auto rounded-lg border border-border">

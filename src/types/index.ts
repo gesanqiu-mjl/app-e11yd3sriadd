@@ -559,64 +559,6 @@ export interface JyingResourceBinding {
   created_at: string;
 }
 
-// 栖影 HDHaven（hdhaven.com）账号绑定信息
-export interface HdhavenBinding {
-  status: 'active' | 'expired';
-  username: string | null;
-  user_number: number | null;
-  last_check_at: string | null;
-  remark: string | null;
-  updated_at: string | null;
-}
-
-/** 栖影「我的分享」条目（OpenAPI GET /shares，自动翻页聚合） */
-export interface HdhavenShareItem {
-  slug: string;                       // 分享条目标识（update 用）
-  tmdb_id: string | null;
-  media_type: string | null;          // movie / tv
-  title: string | null;               // 分享标题（通常含年份）
-  pan_type: string | null;            // 站点网盘类型：guangya / 115 / 123 / ed2k
-  share_size: string | null;
-  episode_range: string | null;
-  file_count: number | null;
-  remark: string | null;
-  hide_link: boolean | null;
-  validate_status: string | null;
-  review_status: string | null;
-  created_at: string | null;
-  updated_at: string | null;
-  media_title: string | null;
-  poster_path: string | null;
-  /** 分享链接与提取码：仅详情接口（/shares/{slug}）返回 */
-  url?: string | null;
-  access_code?: string | null;
-}
-
-/** 栖影片源检索结果（TMDB 原生结构） */
-export interface HdhavenTmdbItem {
-  id: number;
-  title?: string | null;              // 电影标题
-  name?: string | null;               // 剧集标题
-  media_type?: string | null;
-  release_date?: string | null;
-  first_air_date?: string | null;
-  poster_path?: string | null;
-  overview?: string | null;
-}
-
-// 资源与栖影分享条目的绑定关系（一个资源可绑定多条，每条对应一种网盘）
-export interface HdhavenResourceBinding {
-  id: string;
-  resource_id: string;
-  slug: string;
-  tmdb_id: string | null;
-  media_type: string | null;
-  link_title: string | null;
-  vod_name: string | null;
-  pan_type: string | null;
-  pan_label: string | null;
-  created_at: string;
-}
 
 export type DisplayFormat = 'all' | 'guangya' | 'quark';
 

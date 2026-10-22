@@ -15,7 +15,7 @@ import { toast } from 'sonner';
 import {
   Resource, FIELD_LABELS, XnResourceBinding, YaResourceBinding,
   FramehdrResourceBinding, PanfxResourceBinding, MukakuResourceBinding, MukakuMovie,
-  JyingResourceBinding, HdhavenResourceBinding, St1ResourceBinding,
+  JyingResourceBinding, St1ResourceBinding,
 } from '@/types/index';
 import {
   updateResourceField, updateResourceCover, recordChange, deleteResource, importCoverFromUrl,
@@ -26,16 +26,12 @@ import {
   getSt1ResourceBindings, updateSt1Resource, ST1_TOKEN_EXPIRED_CODE,
   fetchMukakuResourceBindings, syncResourceToMukaku, MUKAKU_TOKEN_EXPIRED_CODE, bindResourceToMukaku,
   fetchJyingResourceBindings, syncResourceToJying, JYING_EXPIRED_CODE, bindResourceToJying,
-  fetchHdhavenResourceBindings, bindResourceToHdhavenBySlug, syncResourceToHdhaven,
-  HDHAVEN_EXPIRED_CODE,
-  HDHAVEN_RATE_LIMITED_CODE,
   checkLinks, setResourceFinished, updateResourceSortOrders,
   fetchResources, fetchResourceSyncQueue, clearResourceSyncQueue,
 } from '@/services/api';
 import { AUTO_RELOGIN_SITES, ensureSiteSession, SITE_LABELS, type SiteKey } from '@/lib/siteCredentials';
 import { importJsonText } from '@/lib/jsonImport';
 import { downloadResourcesXlsx } from '@/lib/exportXlsx';
-import { parseHdhavenMetaFromName } from '@/lib/hdhavenMeta';
 import { uploadCover, deleteCover } from '@/lib/uploadCover';
 import { matchLinkForPanType, PAN_TYPE_LABELS } from '@/lib/panUtils';
 import {
@@ -198,8 +194,6 @@ function ResourceTable({
   const [mukakuBindings, setMukakuBindings] = useState<Record<string, MukakuResourceBinding[]>>({});
   // 聚影站点绑定关系（一个资源可绑定多条：每条对应一种网盘）
   const [jyingBindings, setJyingBindings] = useState<Record<string, JyingResourceBinding[]>>({});
-  // 栖影站点绑定关系（一个资源可绑定多条：每条对应一种网盘）
-  const [hdhavenBindings, setHdhavenBindings] = useState<Record<string, HdhavenResourceBinding[]>>({});
   const [bindTarget, setBindTarget] = useState<Resource | null>(null);
   const [bindOpen, setBindOpen] = useState(false);
   const [quickBindTarget, setQuickBindTarget] = useState<Resource | null>(null);
@@ -241,9 +235,8 @@ function ResourceTable({
       fetchPanfxResourceBindings().catch(() => [] as PanfxResourceBinding[]),
       fetchMukakuResourceBindings().catch(() => [] as MukakuResourceBinding[]),
       fetchJyingResourceBindings().catch(() => [] as JyingResourceBinding[]),
-      fetchHdhavenResourceBindings().catch(() => [] as HdhavenResourceBinding[]),
       getSt1ResourceBindings().catch(() => [] as St1ResourceBinding[]),
-    ]).then(([xnList, yaList, framehdrList, panfxList, mukakuList, jyingList, hdhavenList, st1List]) => {
+    ]).then(([xnList, yaList, framehdrList, panfxList, mukakuList, jyingList, st1List]) => {
       if (cancelled) return;
       const xnMap: Record<string, XnResourceBinding[]> = {};
       xnList.forEach((b) => { (xnMap[b.resource_id] ??= []).push(b); });
@@ -266,9 +259,6 @@ function ResourceTable({
       const jyingMap: Record<string, JyingResourceBinding[]> = {};
       jyingList.forEach((b) => { (jyingMap[b.resource_id] ??= []).push(b); });
       setJyingBindings(jyingMap);
-      const hdhavenMap: Record<string, HdhavenResourceBinding[]> = {};
-      hdhavenList.forEach((b) => { (hdhavenMap[b.resource_id] ??= []).push(b); });
-      setHdhavenBindings(hdhavenMap);
       setBindingsReady(true);
     });
     return () => { cancelled = true; };
@@ -416,8 +406,7 @@ function ResourceTable({
     const st1B = st1Bindings[resource.id];
     const mukList = mukakuBindings[resource.id] ?? [];
     const jyingList = jyingBindings[resource.id] ?? [];
-    const hdhavenList = hdhavenBindings[resource.id] ?? [];
-    if (xnList.length === 0 && yaList.length === 0 && !fhB && !pfxB && !st1B && mukList.length === 0 && jyingList.length === 0 && hdhavenList.length === 0) return;
+    if (xnList.length === 0 && yaList.length === 0 && !fhB && !pfxB && !st1B && mukList.length === 0 && jyingList.length === 0) return;
     setSyncingId(resource.id);
 
     // 命中这些错误码代表「站点会话失效」：先尝试用云端凭据自动重登，再重试一次
@@ -428,7 +417,6 @@ function ResourceTable({
       PANFX_COOKIE_EXPIRED_CODE,
       ST1_TOKEN_EXPIRED_CODE,
       MUKAKU_TOKEN_EXPIRED_CODE,
-      HDHAVEN_EXPIRED_CODE,
     ]);
 
     /** 会话失效时用云端保存的账号密码自动重登，返回是否已恢复可用 */
@@ -463,13 +451,6 @@ function ResourceTable({
               reloginTried = true;
               if (await tryAutoRelogin(site)) continue;
             }
-            throw err;
-          }
-          if (
-          // 栖影授权失效 / 额度用尽：重试无意义，直接上抛让用户去处理
-          err.code === HDHAVEN_EXPIRED_CODE ||
-          err.code === HDHAVEN_RATE_LIMITED_CODE
-        ) {
             throw err;
           }
           lastErr = e;
@@ -690,53 +671,6 @@ function ResourceTable({
       }
     }
 
-    // 栖影站点同步：同样是「修改已有分享」语义 —— 逐条把已绑定分享的链接替换为
-    // 本地资源中「同网盘类型」的链接（栖影没有新建分享的接口，只能改已有分享）。
-    // 站点有频率风控，服务端已限速，这里保持串行逐条提交
-    for (const hdB of hdhavenList) {
-      const hdLabel = hdB.pan_label || hdB.pan_type || '对应网盘';
-      const matchedUrl = matchLinkForPanType(
-        hdB.pan_type || hdB.pan_label,
-        Array.isArray(resource.links) ? resource.links : [],
-        resource.link ?? ''
-      );
-      if (!matchedUrl) {
-        failedSites.push({
-          site: `栖影·${hdLabel}`,
-          reason: `资源中没有「${hdLabel}」类型的链接，未同步该条分享`,
-        });
-        continue;
-      }
-      try {
-        await syncWithRetry(() => syncResourceToHdhaven({
-          slug: hdB.slug,
-          panUrl: matchedUrl,
-          panType: hdB.pan_type ?? undefined,
-          // 站点 update 是「全量字段回写」：把本地标题与按名称解析出的属性一起同步，
-          // 否则站点侧分享标题/属性永远不变（此前只发 URL 的 bug）
-          title,
-          meta: parseHdhavenMetaFromName(title, {
-            isTv: hdB.media_type ? hdB.media_type === 'tv' : (resource.episode_count ?? 0) > 1,
-            episodeCount: resource.episode_count ?? null,
-          }),
-        }), 'hdhaven');
-        succeededSites.push('栖影站点');
-        setHdhavenBindings((prev) => ({
-          ...prev,
-          [resource.id]: (prev[resource.id] ?? []).map((x) =>
-            x.slug === hdB.slug ? { ...x, link_title: title } : x
-          ),
-        }));
-      } catch (e) {
-        const err = e as Error & { code?: string };
-        const reason = err.code === HDHAVEN_EXPIRED_CODE
-          ? '授权已失效，请到「站点同步」页重新授权'
-          : err.code === HDHAVEN_RATE_LIMITED_CODE
-            ? '栖影调用次数已达上限（每分钟 60 次 / 每日按账号等级），请稍后再试'
-            : (err.message || '未知错误');
-        failedSites.push({ site: `栖影·${hdLabel}`, reason });
-      }
-    }
 
     if (succeededSites.length > 0) {
       toast.success(`已同步到 ${[...new Set(succeededSites)].join('、')}：${title}`);
@@ -1032,11 +966,10 @@ function ResourceTable({
       const yaList2 = yaBindings[resource.id] ?? [];
       const mukList2 = mukakuBindings[resource.id] ?? [];
       const jyList2 = jyingBindings[resource.id] ?? [];
-      const hdList2 = hdhavenBindings[resource.id] ?? [];
       const allBound = xnList2.length + yaList2.length
         + (framehdrBindings[resource.id] ? 1 : 0) + (panfxBindings[resource.id] ? 1 : 0)
         + (st1Bindings[resource.id] ? 1 : 0)
-        + mukList2.length + jyList2.length + hdList2.length;
+        + mukList2.length + jyList2.length;
       return (
         <div className="flex items-center gap-1 min-w-0">
           {/* touch-manipulation：关掉双击缩放，否则触屏上双击会变成缩放、触发不了 dblclick */}
@@ -1281,19 +1214,6 @@ function ResourceTable({
           const xnMap: Record<string, XnResourceBinding[]> = {};
           xnList.forEach((b) => { (xnMap[b.resource_id] ??= []).push(b); });
           setXnBindings(xnMap);
-        } else if (siteBinding.site === 'hdhaven' && siteBinding.share_id) {
-          // 栖影：投稿成功后落地「资源 × 栖影分享条目」绑定（slug 存放在 share_id）
-          await bindResourceToHdhavenBySlug({
-            resourceId,
-            slug: siteBinding.share_id,
-            linkTitle: siteBinding.link_title || filledName,
-            vodName: siteBinding.vod_name || filledName,
-            panType: siteBinding.pan_type ?? null,
-          });
-          const hdList = await fetchHdhavenResourceBindings();
-          const hdMap: Record<string, HdhavenResourceBinding[]> = {};
-          hdList.forEach((b) => { (hdMap[b.resource_id] ??= []).push(b); });
-          setHdhavenBindings(hdMap);
         }
       } catch (bindErr) {
         console.warn('保存站点绑定映射失败', bindErr);
@@ -1666,7 +1586,6 @@ function ResourceTable({
         st1Binding={bindTarget ? st1Bindings[bindTarget.id] ?? null : null}
         mukakuBindings={bindTarget ? mukakuBindings[bindTarget.id] ?? [] : []}
         jyingBindings={bindTarget ? jyingBindings[bindTarget.id] ?? [] : []}
-        hdhavenBindings={bindTarget ? hdhavenBindings[bindTarget.id] ?? [] : []}
         open={bindOpen}
         onOpenChange={setBindOpen}
         onXnBound={(resourceId, b) => setXnBindings((prev) => {
@@ -1738,19 +1657,6 @@ function ResourceTable({
             return next;
           }
           return { ...prev, [resourceId]: (prev[resourceId] ?? []).filter((x) => x.link_id !== linkId) };
-        })}
-        onHdhavenBound={(resourceId, b) => setHdhavenBindings((prev) => {
-          const list = prev[resourceId] ?? [];
-          const idx = list.findIndex((x) => x.slug === b.slug);
-          return { ...prev, [resourceId]: idx >= 0 ? list.map((x, i) => (i === idx ? b : x)) : [...list, b] };
-        })}
-        onHdhavenUnbound={(resourceId, slug) => setHdhavenBindings((prev) => {
-          if (slug == null) {
-            const next = { ...prev };
-            delete next[resourceId];
-            return next;
-          }
-          return { ...prev, [resourceId]: (prev[resourceId] ?? []).filter((x) => x.slug !== slug) };
         })}
       />
 

@@ -10,7 +10,7 @@
  *   （Authorization token 原样透传，站点会话 / Cookie 等逻辑保持不变）。
  *
  * 请求体：
- *   { site: 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying' | 'hdhaven',
+ *   { site: 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying',
  *     payload: { ...该站点代理要求的原始字段... },
  *     useShortLink?: boolean }
  *
@@ -56,7 +56,6 @@ const SITES: Record<
   framehdr: { fn: "framehdr-proxy", action: "add", actionInBody: false, timeoutMs: 20000 },
   mukaku: { fn: "mukaku-proxy", action: "add", actionInBody: false, timeoutMs: 20000 },
   jying: { fn: "jying-proxy", action: "add", actionInBody: false, timeoutMs: 45000 },
-  hdhaven: { fn: "hdhaven-proxy", action: "create_share", actionInBody: false, timeoutMs: 120000 },
 };
 
 // ── 短链：把正文里的网盘链接换成「该链接自己的短链」 ──

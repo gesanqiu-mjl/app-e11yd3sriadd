@@ -10,12 +10,11 @@
  */
 import { supabase } from '@/db/supabase';
 
-export type SiteKey = 'ya' | 'jying' | 'hdhaven' | 'framehdr' | 'mukaku' | 'panfx' | 'xn' | 'st1';
+export type SiteKey = 'ya' | 'jying' | 'framehdr' | 'mukaku' | 'panfx' | 'xn' | 'st1';
 
 export const SITE_LABELS: Record<SiteKey, string> = {
   ya: '鸭影臻藏',
   jying: '聚影',
-  hdhaven: '栖影 HDHaven',
   framehdr: '帧影',
   mukaku: '不太灵',
   panfx: '123社区',
@@ -26,7 +25,7 @@ export const SITE_LABELS: Record<SiteKey, string> = {
 /**
  * 各站点的真实网址（用于在「站点账号绑定」标题后展示，方便用户知道要开哪个站）。
  * 来源：各 proxy 边缘函数顶部的上游 BASE 常量，逐个核对过：
- *   jying-proxy:37 / hdhaven-proxy:49 / framehdr-proxy:30 / mukaku-proxy:30
+ *   jying-proxy:37 / framehdr-proxy:30 / mukaku-proxy:30
  *   panfx-proxy:24 / xnshare-proxy:51 / st1-proxy:43(BUILTIN_BASE)
  *   ya 是 Supabase 应用，没有独立官网域名，填它自己的 supabase 地址。
  * 注意别和 proxy 里的 SITE_URL 环境变量搞混——那个是 CORS 白名单，不是站点地址。
@@ -34,7 +33,6 @@ export const SITE_LABELS: Record<SiteKey, string> = {
 export const SITE_URLS: Record<SiteKey, string> = {
   ya: 'https://houhvngggkkcqcjmzafx.supabase.co',
   jying: 'https://www.jying.top',
-  hdhaven: 'https://hdhaven.com',
   framehdr: 'https://framehdr.com',
   mukaku: 'https://web3.mukaku.com',
   panfx: 'https://123panfx.com',
@@ -49,7 +47,6 @@ export function siteHost(url: string): string {
 
 /**
  * 能自动重登的站点（有账号密码登录通道，且登录不需要图形验证码）。
- * 栖影已改走官方 OAuth：access_token 长期有效，失效只能重新授权，没有「自动重登」概念。
  */
 export const AUTO_RELOGIN_SITES: SiteKey[] = ['ya', 'jying', 'framehdr'];
 
@@ -57,7 +54,6 @@ export const AUTO_RELOGIN_SITES: SiteKey[] = ['ya', 'jying', 'framehdr'];
 export const SITE_EXPIRED_CODES: Record<SiteKey, string[]> = {
   ya: ['YA_EXPIRED', 'YA_NOT_BOUND'],
   jying: ['JYING_COOKIE_EXPIRED', 'JYING_NOT_BOUND'],
-  hdhaven: ['HDHAVEN_TOKEN_EXPIRED', 'HDHAVEN_NOT_BOUND'],
   framehdr: ['COOKIE_EXPIRED'],
   mukaku: ['MUKAKU_TOKEN_EXPIRED', 'MUKAKU_NOT_BOUND'],
   panfx: ['COOKIE_EXPIRED'],

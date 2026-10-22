@@ -4,17 +4,7 @@ import IntersectObserver from '@/components/common/IntersectObserver';
 import { Toaster } from '@/components/ui/sonner';
 import { AuthProvider } from '@/contexts/AuthContext';
 import { RouteGuard } from '@/components/common/RouteGuard';
-import { useHdhavenOAuthCallback } from '@/hooks/use-hdhaven-oauth-callback';
 import { routes } from './routes';
-
-/**
- * 栖影 OAuth 授权回调：站点登记的回调地址是根路径，会带着 code/state 回到首页，
- * 必须在路由之外全局接住，否则授权成功后无人处理、换不到 token。
- */
-const HdhavenOAuthCallback: React.FC = () => {
-  useHdhavenOAuthCallback();
-  return null;
-};
 
 const App: React.FC = () => {
   return (
@@ -22,7 +12,6 @@ const App: React.FC = () => {
       <AuthProvider>
         <IntersectObserver />
         <RouteGuard>
-          <HdhavenOAuthCallback />
           <Routes>
             {routes.map((route, index) => (
               <Route key={index} path={route.path} element={route.element} />

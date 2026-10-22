@@ -55,11 +55,11 @@ const json = (data: unknown, status = 200) =>
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type SiteKey =
-  | "xn" | "ya" | "framehdr" | "panfx" | "mukaku" | "jying" | "hdhaven" | "st1";
+  | "xn" | "ya" | "framehdr" | "panfx" | "mukaku" | "jying" | "st1";
 
 const SITE_LABELS: Record<SiteKey, string> = {
   xn: "观影站点", ya: "鸭影臻藏", framehdr: "帧影",
-  panfx: "123社区", mukaku: "不太灵", jying: "聚影", hdhaven: "栖影 HDHaven",
+  panfx: "123社区", mukaku: "不太灵", jying: "聚影",
   st1: "1号站点",
 };
 
@@ -71,8 +71,6 @@ const EXPIRED_CODES: Record<SiteKey, string[]> = {
   panfx: ["COOKIE_EXPIRED"],
   mukaku: ["MUKAKU_TOKEN_EXPIRED", "10103", "10104"],
   jying: ["JYING_COOKIE_EXPIRED"],
-  // 栖影：改用官方 OpenAPI OAuth 后失效码为 TOKEN_EXPIRED，未授权为 NOT_BOUND
-  hdhaven: ["HDHAVEN_TOKEN_EXPIRED", "HDHAVEN_NOT_BOUND"],
   // 1号站点：令牌失效/未绑定（打开 API 的 401 INVALID_TOKEN）
   st1: ["ST1_TOKEN_EXPIRED", "ST1_NOT_BOUND"],
 };
@@ -276,15 +274,14 @@ async function pushTask(row: TaskRow): Promise<{ gone: boolean; pushed: SiteKey[
   // 资源已被删除 → 任务作废
   if (!res) return { gone: true, pushed: [], failed: [] };
 
-  const [xn, ya, fh, pfx, muk, jy, hd, st1] = await Promise.all([
+  const [xn, ya, fh, pfx, muk, jy, st1] = await Promise.all([
     svc.from("xn_resource_bindings").select("share_id, share_title, pan_label").eq("resource_id", row.resource_id),
     svc.from("ya_resource_bindings").select("link_id, link_title, pan_label").eq("resource_id", row.resource_id),
     svc.from("framehdr_resource_bindings").select("link_id, link_title, drive_name").eq("resource_id", row.resource_id).maybeSingle(),
     svc.from("panfx_resource_bindings").select("tid, firstpid, subject, fid").eq("resource_id", row.resource_id).maybeSingle(),
     svc.from("mukaku_resource_bindings").select("link_id, movies_id, seed_name, pan_type, share_code").eq("resource_id", row.resource_id),
     svc.from("jying_resource_bindings").select("link_id, movie_id, link_title, pan_label").eq("resource_id", row.resource_id),
-    svc.from("hdhaven_resource_bindings").select("slug, media_type, pan_type, pan_label, link_title").eq("resource_id", row.resource_id),
-    // 9) 1号站点：只在「该资源已发布到 1号站点」时才有绑定行（发布入口在「站点同步」页）
+    // 8) 1号站点：只在「该资源已发布到 1号站点」时才有绑定行（发布入口在「站点同步」页）
     svc.from("st1_resource_bindings").select("remote_id, title").eq("resource_id", row.resource_id).maybeSingle(),
   ]);
 
@@ -437,26 +434,8 @@ async function pushTask(row: TaskRow): Promise<{ gone: boolean; pushed: SiteKey[
     outcomes.push(mergeSite("jying", outs));
   }
 
-  // 8) 栖影（可多条；站点为「全量字段回写」，代理会用详情合并未提交字段）
-  const hdRows = (hd.data ?? []) as { slug: string; pan_type: string | null; pan_label: string | null }[];
-  if (hdRows.length) {
-    const outs: SiteOutcome[] = [];
-    for (const b of hdRows) {
-      const url = pickLink(b.pan_type ?? b.pan_label, ctx.links, ctx.link);
-      if (!url) { outs.push({ site: "hdhaven", ok: false, reason: "未找到与该网盘类型匹配的资源链接" }); continue; }
-      outs.push(await pushSite("hdhaven", ctx, () =>
-        callFn("hdhaven-proxy", "update", uid, {
-          slug: b.slug,
-          url,
-          title: ctx.title,
-          pan_type: b.pan_type ?? undefined,
-        }, { timeoutMs: 120_000 })));
-      await sleep(SITE_GAP_MS);
-    }
-    outcomes.push(mergeSite("hdhaven", outs));
-  }
 
-  // 9) 1号站点（API 令牌型；已发布的片源用 PATCH 同步标题与云盘地址）
+  // 8) 1号站点（API 令牌型；已发布的片源用 PATCH 同步标题与云盘地址）
   const st1Row = st1.data as { remote_id: string; title: string | null } | null;
   if (st1Row?.remote_id) {
     const url = pickLink(null, ctx.links, ctx.link);
