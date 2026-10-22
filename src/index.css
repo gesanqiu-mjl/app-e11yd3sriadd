@@ -62,42 +62,55 @@
   }
 
   .dark {
-    --background: 210 40% 96%;
-    --foreground: 222 47% 11%;
-    --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
-    --primary: 221 83% 53%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 215 25% 42%;
-    --secondary-foreground: 0 0% 100%;
-    --muted: 210 40% 96%;
-    --muted-foreground: 215 16% 47%;
-    --accent: 221 83% 46%;
-    --accent-foreground: 0 0% 100%;
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 214 32% 91%;
-    --input: 214 32% 94%;
-    --ring: 221 83% 53%;
-    --chart-1: 221 83% 53%;
-    --chart-2: 199 89% 48%;
-    --chart-3: 262 83% 58%;
-    --chart-4: 215 25% 42%;
-    --chart-5: 173 80% 40%;
-    --sidebar-background: 0 0% 100%;
-    --sidebar-foreground: 222 47% 11%;
-    --sidebar-primary: 221 83% 53%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 214 95% 93%;
-    --sidebar-accent-foreground: 221 83% 45%;
-    --sidebar-border: 214 32% 91%;
-    --sidebar-ring: 221 83% 53%;
-    --shadow-card: 0 1px 2px 0 hsl(222 47% 11% / 0.05);
-    --shadow-hover: 0 6px 16px 0 hsl(221 83% 53% / 0.12);
+    /* 暗夜主题：深蓝黑底 + 浅灰蓝文字，降低夜间亮度刺眼感 */
+    --background: 222 47% 7%;
+    --foreground: 210 40% 96%;
+
+    --card: 222 47% 10%;
+    --card-foreground: 210 40% 96%;
+
+    --popover: 222 47% 10%;
+    --popover-foreground: 210 40% 96%;
+
+    /* 暗底上主色提亮，按钮文字改深色保证对比 */
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 96%;
+
+    --muted: 217 33% 15%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 217 33% 20%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 63% 45%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 217 33% 20%;
+    --input: 217 33% 22%;
+    --ring: 224 76% 60%;
+
+    --chart-1: 217 91% 60%;
+    --chart-2: 199 89% 55%;
+    --chart-3: 262 83% 68%;
+    --chart-4: 215 25% 60%;
+    --chart-5: 173 80% 50%;
+
+    --sidebar-background: 222 47% 9%;
+    --sidebar-foreground: 210 40% 96%;
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 222 47% 11%;
+    --sidebar-accent: 217 33% 17%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 217 33% 17%;
+    --sidebar-ring: 224 76% 60%;
+
+    --shadow-card: 0 1px 3px 0 hsl(0 0% 0% / 0.4);
+    --shadow-hover: 0 6px 16px 0 hsl(221 83% 53% / 0.25);
     --gradient-primary: linear-gradient(135deg, hsl(221 83% 53%), hsl(199 89% 48%));
-    --gradient-card: linear-gradient(180deg, hsl(0 0% 100%), hsl(210 40% 98%));
+    --gradient-card: linear-gradient(180deg, hsl(222 47% 12%), hsl(222 47% 9%));
     --gradient-background: none;
   }
 }

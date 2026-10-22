@@ -21,6 +21,19 @@
       })();
     </script>
     <meta name="description" content="专业影视资源更新追踪与多网盘自动化同步系统，支持剧集更新追踪、多平台发布与多盘链接管理。" />
+    <script>
+      // 暗色主题：在 CSS/JS 加载前同步设置 html.dark，避免首屏白屏闪烁（FOUC）。
+      // 优先级：localStorage 手动选择 > 系统 prefers-color-scheme；未选择时跟随系统。
+      (function () {
+        try {
+          var t = localStorage.getItem('theme');
+          var dark =
+            t === 'dark' ||
+            (t !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.toggle('dark', dark);
+        } catch (e) {}
+      })();
+    </script>
     <meta name="keywords" content="影视资源, 资源更新追踪, 网盘同步, 剧集管理, 夸克网盘" />
   </head>
   <body>

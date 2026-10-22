@@ -1339,7 +1339,7 @@ export default function SubscribePage() {
                   }`}
                 >
                   <div className="flex items-center gap-2.5">
-                    <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white ring-1 ring-border/60">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-card ring-1 ring-border/60">
                       <img
                         src={meta.logo}
                         alt={PAN_LABELS[pan]}
@@ -2090,7 +2090,7 @@ export default function SubscribePage() {
             )}
             {scanSession && (
               <>
-                <div className="flex justify-center rounded-lg border border-border bg-white p-3">
+                <div className="flex justify-center rounded-lg border border-border bg-card p-3">
                   {scanSession.qrImageUrl ? (
                     // 百度直接给现成二维码图片（内容为百度 App 专用协议，不能自己编码）
                     <img src={scanSession.qrImageUrl} alt="百度登录二维码" className="h-[180px] w-[180px]" />

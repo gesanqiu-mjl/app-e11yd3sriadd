@@ -20,6 +20,8 @@ import {
   ImagePlus,
   Clapperboard,
   User,
+  Sun,
+  Moon,
   type LucideIcon,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
@@ -180,6 +182,21 @@ export default function AppLayout({ children, fixedHeight = false }: AppLayoutPr
   const [searchParams] = useSearchParams();
   const isAdmin = profile?.role === 'admin';
   const username = profile?.username || '用户';
+
+  /** 暗色主题：初始值来自 index.html 在渲染前已设置好的 <html>.dark，
+      与用户上次选择 / 系统偏好保持一致；切换时同步 class + 持久化 */
+  const [theme, setTheme] = useState<'light' | 'dark'>(
+    () => (document.documentElement.classList.contains('dark') ? 'dark' : 'light')
+  );
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    try {
+      localStorage.setItem('theme', theme);
+    } catch {
+      /* localStorage 不可用时静默降级，仅本次会话生效 */
+    }
+  }, [theme]);
+  const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
 
   /** 侧边栏顶部展示位（管理员在「登录页配置」里填写图片/视频 URL） */
   const [media, setMedia] = useState<{ type: string; url: string | null; link: string | null }>({
@@ -370,6 +387,19 @@ export default function AppLayout({ children, fixedHeight = false }: AppLayoutPr
         <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center gap-2 border-b border-border bg-card px-3 md:px-4">
           <SidebarTrigger className="-ml-1 h-10 w-10 shrink-0 text-muted-foreground hover:text-foreground md:h-8 md:w-8" />
           <span className="truncate text-sm font-semibold text-foreground">{currentTitle}</span>
+          <button
+            type="button"
+            onClick={toggleTheme}
+            title={theme === 'dark' ? '切换到浅色模式' : '切换到夜间模式'}
+            aria-label={theme === 'dark' ? '切换到浅色模式' : '切换到夜间模式'}
+            className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+          >
+            {theme === 'dark' ? (
+              <Sun className="h-[18px] w-[18px]" />
+            ) : (
+              <Moon className="h-[18px] w-[18px]" />
+            )}
+          </button>
         </header>
         {/* 手机端底部导航是 fixed 的，给内容留出 56px + 安全区，避免最后一行被导航压住 */}
         <main className="min-h-0 min-w-0 flex-1 pb-[calc(3.5rem+env(safe-area-inset-bottom))] md:pb-0">
