@@ -291,6 +291,13 @@ CREATE OR REPLACE FUNCTION "public"."update_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
+  -- 会话变量 app.skip_touch_updated_at=on 时保留原值：
+  -- 链接检测等「纯状态回写」用它避免刷新 updated_at，
+  -- 否则外部按 updated_at 增量拉取的推送会误判资源已更新
+  IF current_setting('app.skip_touch_updated_at', true) = 'on' THEN
+    NEW.updated_at = OLD.updated_at;
+    RETURN NEW;
+  END IF;
   NEW.updated_at = now();
   RETURN NEW;
 END;

@@ -4,9 +4,12 @@
 //   1. 前端单批检测: POST { resource_ids: ["uuid", ...] }
 //   2. 定时全量巡检: POST { scope: "all", days: 1, limit: 300 }
 // 判定规则: 光鸭接口返回 msg==="success"、data.shareStatus===1 且 totalFileNum>0 才视为有效;
-//           夸克/迅雷等通过 HEAD/GET 请求探测可达性;
+//           百度走分享页判定(HTTP 404 或页面含失效文案即失效);
+//           夸克走其后端 token 接口; 迅雷等通过 HEAD/GET 请求探测可达性;
 //           其余情况(分享已失效/链接不存在/网络错误等)一律判定失效。
 // 检测结果自动回写数据库 (link_status / link_checked_at)。
+// 回写走 apply_link_check: 结果照常落库，但不刷新 updated_at ——否则外部按
+// updated_at 增量拉取的自动推送会把「点了一次检测」误判成资源更新并推到群里。
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const supabase = createClient(
@@ -132,6 +135,48 @@ async function checkQuark(link: string): Promise<boolean> {
       return true;
     }
     return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 百度网盘分享有效性检测。
+ *
+ * 说明：早期方案是调用 /api/share/attachverify（先取 shareid + uk，再查标题），
+ * 但该接口现已下线——实测（本机与服务器均如此）返回 404，因此改为判定分享页本身。
+ *
+ * 实测结论（2026-10，服务器环境）：
+ *   分享有效   → GET /s/1xxxx 302 到 /share/init?surl=xxx，最终 HTTP 200，
+ *                页面标题「百度网盘 请输入提取码」，正文含「请输入提取码」
+ *   分享失效   → 直接 HTTP 404，页面标题「页面不存在」，正文含「不存在」「已过期」
+ *
+ * 相比原先的 HEAD 探测：HEAD 对百度只能拿到 302，既区分不出失效、也拿不到页
+ * 面语义，容易把「需要提取码的正常分享」误判成失效。改用页面状态码 + 正
+ * 文关键词后，判定结果与实际可用性一致。
+ */
+async function checkBaidu(link: string): Promise<boolean> {
+  const PC_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  try {
+    const resp = await fetch(link, {
+      method: "GET",
+      redirect: "follow",
+      headers: { "User-Agent": PC_UA, "Accept-Language": "zh-CN,zh;q=0.9" },
+      signal: AbortSignal.timeout(20000),
+    });
+    // 链接不存在 / 已取消 / 已过期：百度直接给 404
+    if (resp.status === 404) return false;
+    if (!resp.ok) return false;
+
+    const html = await resp.text();
+    // 兜底：状态码 200 但页面明确提示失效的情况
+    const INVALID_HINTS =
+      /链接不存在|页面不存在|已被取消|已失效|已过期|分享已取消|文件已被删除|您访问的页面/;
+    if (INVALID_HINTS.test(html)) return false;
+
+    // 走到这里说明分享页正常（通常是「请输入提取码」或文件列表页）
+    return true;
   } catch {
     return false;
   }
@@ -264,7 +309,18 @@ async function checkOne(link: string): Promise<boolean> {
   if (/pan\.quark\.cn\/s\//.test(link)) {
     return checkQuark(link);
   }
+  // 百度：分享页可达性判定（见 checkBaidu 注释）
+  if (/pan\.baidu\.com\/(s|share)\//.test(link)) {
+    return checkBaidu(link);
+  }
   // 迅雷 / 123pan / lanzou 等：HEAD 探测可达性
+  //
+  // 迅雷说明：文档给的 /anchor/share 接口已下线（实测 404）；真实接口是
+  //   https://api-pan.xunlei.com/drive/v1/share?device_id=...&share_id=...
+  // 但它强制要求 captcha_token（返回 captcha_invalid / "captcha_token is empty"），
+  // 即需要人机验证码，服务端无法自行获取，因此直连判定这条路走不通。
+  // 另外迅雷分享页是纯前端渲染（有效与失效链接都返回 200 且标题同为「迅雷」），
+  // 也无法像百度那样用页面判定。故暂保留 HEAD/GET 可达性探测。
   // SSRF 防护：内网 / 回环 / 云元数据地址直接判定失效，不发起请求
   if (isBlockedHost(link)) return false;
   try {
@@ -376,14 +432,16 @@ async function persist(
       status: urlValid.has(l.url) ? (urlValid.get(l.url) ? "valid" : "invalid") : l.status ?? "unknown",
       checked_at: r.checkedAt,
     }));
-    const { error } = await supabase
-      .from(TABLE)
-      .update({
-        link_status: r.status,
-        link_checked_at: r.checkedAt,
-        links: updatedLinks,
-      })
-      .eq("id", row.id);
+    // 走 apply_link_check 而不是直接 update：
+    // 检测结果仍会落库（刷新后还在），但不会刷新 updated_at。
+    // 否则外部「自动推送」按 resource-api 的 since（updated_at 增量）拉取时
+    // 会把「点了一次检测」误判成资源更新，把资源推送到群里。
+    const { error } = await supabase.rpc("apply_link_check", {
+      p_id: row.id,
+      p_links: updatedLinks,
+      p_link_status: r.status,
+      p_link_checked_at: r.checkedAt,
+    });
     if (error) console.error("persist failed:", error.message, r.id);
   }
 }
