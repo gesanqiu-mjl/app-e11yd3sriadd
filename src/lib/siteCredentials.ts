@@ -10,7 +10,7 @@
  */
 import { supabase } from '@/db/supabase';
 
-export type SiteKey = 'ya' | 'jying' | 'hdhaven' | 'framehdr' | 'mukaku' | 'pinglian' | 'panfx' | 'xn' | 'st1';
+export type SiteKey = 'ya' | 'jying' | 'hdhaven' | 'framehdr' | 'mukaku' | 'panfx' | 'xn' | 'st1';
 
 export const SITE_LABELS: Record<SiteKey, string> = {
   ya: '鸭影臻藏',
@@ -18,7 +18,6 @@ export const SITE_LABELS: Record<SiteKey, string> = {
   hdhaven: '栖影 HDHaven',
   framehdr: '帧影',
   mukaku: '不太灵',
-  pinglian: '盘链',
   panfx: '123社区',
   xn: '观影站点',
   st1: '1号站点',
@@ -28,7 +27,7 @@ export const SITE_LABELS: Record<SiteKey, string> = {
  * 各站点的真实网址（用于在「站点账号绑定」标题后展示，方便用户知道要开哪个站）。
  * 来源：各 proxy 边缘函数顶部的上游 BASE 常量，逐个核对过：
  *   jying-proxy:37 / hdhaven-proxy:49 / framehdr-proxy:30 / mukaku-proxy:30
- *   panlinks-proxy:52 / panfx-proxy:24 / xnshare-proxy:51 / st1-proxy:43(BUILTIN_BASE)
+ *   panfx-proxy:24 / xnshare-proxy:51 / st1-proxy:43(BUILTIN_BASE)
  *   ya 是 Supabase 应用，没有独立官网域名，填它自己的 supabase 地址。
  * 注意别和 proxy 里的 SITE_URL 环境变量搞混——那个是 CORS 白名单，不是站点地址。
  */
@@ -38,7 +37,6 @@ export const SITE_URLS: Record<SiteKey, string> = {
   hdhaven: 'https://hdhaven.com',
   framehdr: 'https://framehdr.com',
   mukaku: 'https://web3.mukaku.com',
-  pinglian: 'https://pinglian.lol',
   panfx: 'https://123panfx.com',
   xn: 'https://www.xn--wcv59z.com',
   st1: 'http://zy.beida.pw',
@@ -62,7 +60,6 @@ export const SITE_EXPIRED_CODES: Record<SiteKey, string[]> = {
   hdhaven: ['HDHAVEN_TOKEN_EXPIRED', 'HDHAVEN_NOT_BOUND'],
   framehdr: ['COOKIE_EXPIRED'],
   mukaku: ['MUKAKU_TOKEN_EXPIRED', 'MUKAKU_NOT_BOUND'],
-  pinglian: ['PINGLIAN_COOKIE_EXPIRED'],
   panfx: ['COOKIE_EXPIRED'],
   xn: ['COOKIE_EXPIRED', 'XN_COOKIE_EXPIRED'],
   st1: ['ST1_TOKEN_EXPIRED', 'ST1_NOT_BOUND'],

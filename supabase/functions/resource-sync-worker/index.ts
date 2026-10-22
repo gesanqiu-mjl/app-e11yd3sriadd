@@ -55,17 +55,16 @@ const json = (data: unknown, status = 200) =>
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type SiteKey =
-  | "pinglian" | "xn" | "ya" | "framehdr" | "panfx" | "mukaku" | "jying" | "hdhaven" | "st1";
+  | "xn" | "ya" | "framehdr" | "panfx" | "mukaku" | "jying" | "hdhaven" | "st1";
 
 const SITE_LABELS: Record<SiteKey, string> = {
-  pinglian: "盘链", xn: "观影站点", ya: "鸭影臻藏", framehdr: "帧影",
+  xn: "观影站点", ya: "鸭影臻藏", framehdr: "帧影",
   panfx: "123社区", mukaku: "不太灵", jying: "聚影", hdhaven: "栖影 HDHaven",
   st1: "1号站点",
 };
 
 /** 站点「会话失效」错误码（与各代理保持一致） */
 const EXPIRED_CODES: Record<SiteKey, string[]> = {
-  pinglian: ["PINGLIAN_COOKIE_EXPIRED"],
   xn: ["COOKIE_EXPIRED"],
   ya: ["YA_EXPIRED"],
   framehdr: ["COOKIE_EXPIRED"],
@@ -277,8 +276,7 @@ async function pushTask(row: TaskRow): Promise<{ gone: boolean; pushed: SiteKey[
   // 资源已被删除 → 任务作废
   if (!res) return { gone: true, pushed: [], failed: [] };
 
-  const [pn, xn, ya, fh, pfx, muk, jy, hd, st1] = await Promise.all([
-    svc.from("resource_bindings").select("link_id, link_title, pan_type, link_password").eq("resource_id", row.resource_id),
+  const [xn, ya, fh, pfx, muk, jy, hd, st1] = await Promise.all([
     svc.from("xn_resource_bindings").select("share_id, share_title, pan_label").eq("resource_id", row.resource_id),
     svc.from("ya_resource_bindings").select("link_id, link_title, pan_label").eq("resource_id", row.resource_id),
     svc.from("framehdr_resource_bindings").select("link_id, link_title, drive_name").eq("resource_id", row.resource_id).maybeSingle(),
@@ -301,28 +299,7 @@ async function pushTask(row: TaskRow): Promise<{ gone: boolean; pushed: SiteKey[
 
   const outcomes: SiteOutcome[] = [];
 
-  // 1) 盘链（可多条绑定，逐条串行——站点是 PHP session，绝不能并发）
-  const pnRows = (pn.data ?? []) as { link_id: number; pan_type: string | null; link_password: string | null }[];
-  if (pnRows.length) {
-    const outs: SiteOutcome[] = [];
-    for (const b of pnRows) {
-      const url = pickLink(b.pan_type, ctx.links, ctx.link);
-      if (!url) { outs.push({ site: "pinglian", ok: false, reason: "未找到与该网盘类型匹配的资源链接" }); continue; }
-      outs.push(await pushSite("pinglian", ctx, () =>
-        callFn("panlinks-proxy", "update", uid, {
-          link_id: b.link_id,
-          link_title: ctx.title,
-          link_url: url,
-          link_password: b.link_password ?? "",
-          pan_type: b.pan_type ?? "others",
-          note: "",
-        })));
-      await sleep(SITE_GAP_MS);
-    }
-    outcomes.push(mergeSite("pinglian", outs));
-  }
-
-  // 2) 观影站点 xn（可多条）
+  // 1) 观影站点 xn（可多条）
   const xnRows = (xn.data ?? []) as { share_id: string | number; pan_label: string | null }[];
   if (xnRows.length) {
     const outs: SiteOutcome[] = [];

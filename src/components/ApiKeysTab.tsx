@@ -942,13 +942,12 @@ Authorization: Bearer <access_token>
 
 # ── 请求体 ──
 {
-  "site": "pinglian",          // 目标站点，见下方清单
+  "site": "xnsite",           // 目标站点，见下方清单
   "payload": { ...该站点发帖接口的原始字段... },
   "useShortLink": false        // 可选：是否把正文里的网盘链接换成短链
 }
 
 # ── 支持批量发帖的站点（site）──
-pinglian    盘链站点
 xnsite      观影站点
 ya          鸭影臻藏
 framehdr    帧影站点
@@ -1001,19 +1000,19 @@ curl -X POST "${import.meta.env.VITE_SUPABASE_URL}/auth/v1/token?grant_type=pass
 curl -X POST "${BATCH_POST_API_BASE}" \\
   -H "Authorization: Bearer <access_token>" \\
   -H "Content-Type: application/json" \\
-  -d '{"site":"pinglian","payload":{"...":"..."},"useShortLink":false}'
+  -d '{"site":"xnsite","payload":{"...":"..."},"useShortLink":false}'
 
 # ── 3) 发帖：开短链（正文换成短链，短链按调用账号隔离）──
 curl -X POST "${BATCH_POST_API_BASE}" \\
   -H "Authorization: Bearer <access_token>" \\
   -H "Content-Type: application/json" \\
-  -d '{"site":"pinglian","payload":{"...":"..."},"useShortLink":true}'
+  -d '{"site":"xnsite","payload":{"...":"..."},"useShortLink":true}'
 
 # ── 4) JavaScript（Node / 浏览器）──
 const res = await fetch('${BATCH_POST_API_BASE}', {
   method: 'POST',
   headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
-  body: JSON.stringify({ site: 'pinglian', payload: { /* ... */ }, useShortLink: true }),
+  body: JSON.stringify({ site: 'xnsite', payload: { /* ... */ }, useShortLink: true }),
 });
 const json = await res.json();   // 原样返回站点响应；失败时 success=false + message
 console.log(json.success, json.message);`}

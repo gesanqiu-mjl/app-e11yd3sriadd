@@ -62,7 +62,7 @@ export function sortLinksByPriority(links: PanLink[]): PanLink[] {
   });
 }
 
-// ─── 盘链 pan_type 与资源链接 pan_name 的匹配 ─────────────────
+// ─── 站点 pan_type 与资源链接 pan_name 的匹配 ─────────────────
 
 export const PAN_TYPE_LABELS: Record<string, string> = {
   quark: '夸克', aliyun: '阿里云盘', baidu: '百度网盘', '123': '123 网盘',
@@ -83,7 +83,7 @@ function normPanText(s: string): string {
   return s.toLowerCase().replace(/\s+/g, '').replace(/(云盘|网盘|盘)$/, '');
 }
 
-/** 判断资源链接的网盘名（如「夸克云盘」）是否与盘链 pan_type（如 quark）匹配 */
+/** 判断资源链接的网盘名（如「夸克云盘」）是否与站点 pan_type（如 quark）匹配 */
 export function panNameMatchesType(panName: string, panType: string): boolean {
   const name = normPanText(panName ?? '');
   if (!name) return false;

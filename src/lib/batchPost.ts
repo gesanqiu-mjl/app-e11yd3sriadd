@@ -17,7 +17,6 @@ import {
   bindResourceToFramehdr,
   bindResourceToHdhavenBySlug,
   bindResourceToJying,
-  bindResourceToLink,
   bindResourceToMukaku,
   bindResourceToXnShare,
   bindResourceToYa,
@@ -34,7 +33,6 @@ import {
   searchHdhavenTmdb,
   searchJyingMovies,
   searchMukakuMovies,
-  searchPinglianLibrary,
   searchXnVideos,
   searchYaVideos,
   XN_COOKIE_EXPIRED_CODE,
@@ -46,17 +44,9 @@ import {
 // ============================================================
 
 /** 支持批量发帖的站点（123社区无「新建帖子」接口，未纳入） */
-export type BatchPostSite =
-  | 'pinglian'
-  | 'xnsite'
-  | 'ya'
-  | 'framehdr'
-  | 'mukaku'
-  | 'jying'
-  | 'hdhaven';
+export type BatchPostSite = 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying' | 'hdhaven';
 
 export const BATCH_POST_SITE_LABELS: Record<BatchPostSite, string> = {
-  pinglian: '盘链站点',
   xnsite: '观影站点',
   ya: '鸭影臻藏',
   framehdr: '帧影站点',
@@ -67,7 +57,6 @@ export const BATCH_POST_SITE_LABELS: Record<BatchPostSite, string> = {
 
 /** 站点登录态失效错误码 → 友好提示 */
 const EXPIRED_CODES: Partial<Record<BatchPostSite, { code: string; message: string }>> = {
-  pinglian: { code: 'COOKIE_EXPIRED', message: '盘链登录已过期，请先在站点同步页重新登录' },
   xnsite: { code: XN_COOKIE_EXPIRED_CODE, message: '观影站点登录已过期，请重新绑定 Cookie' },
   ya: { code: YA_EXPIRED_CODE, message: '鸭影臻藏登录已过期，请重新绑定' },
   framehdr: { code: FRAMEHDR_COOKIE_EXPIRED_CODE, message: '帧影登录已过期，请重新登录' },
@@ -245,7 +234,6 @@ function pickBest<T>(
 
 /** 站点侧匹配到的目标片源 */
 export type BatchPostTarget =
-  | { site: 'pinglian'; videoId: number; title: string; cover: string | null; year: string }
   | { site: 'xnsite'; dir: string; id: string; title: string; cover: string | null; year: string }
   | { site: 'ya'; videoTitle: string; category: string; videoId?: number; title: string; cover: string | null; year: string }
   | { site: 'framehdr'; resourceId: number; title: string; cover: string | null; year: string }
@@ -270,17 +258,6 @@ async function matchTarget(site: BatchPostSite, row: BatchPostRow): Promise<Batc
 
   for (const query of queries) {
     switch (site) {
-      case 'pinglian': {
-        const list = await searchPinglianLibrary(query);
-        const hit = pickBest(list, (it) => it.video_title || it.title, query, year, (it) => it.video_year);
-        if (hit?.video_id) {
-          return {
-            site, videoId: Number(hit.video_id), title: hit.video_title || hit.title,
-            cover: hit.video_cover || null, year: String(hit.video_year ?? ''),
-          };
-        }
-        break;
-      }
       case 'xnsite': {
         const list = await searchXnVideos(query);
         const hit = pickBest(list, (it) => it.title, query, year, (it) => it.year);
@@ -495,27 +472,6 @@ async function postOne(site: BatchPostSite, item: BatchPostPlanItem, sortOrder: 
 
   try {
     switch (target.site) {
-      case 'pinglian': {
-        const data = await batchCreate('pinglian', {
-          link_title: title,
-          link_url: row.link,
-          link_password: '',
-          pan_type: panName || 'others',
-          vod_id: target.videoId,
-          note: '',
-        }, 20000);
-        const linkId = Number((data.data as { id?: number | string } | undefined)?.id);
-        if (!Number.isFinite(linkId) || linkId <= 0) throw new Error('站点未返回链接记录 ID');
-        bindTask = (resourceId) =>
-          bindResourceToLink(resourceId, {
-            id: linkId,
-            title,
-            video_title: target.title,
-            pan_type: panCode,
-            password: null,
-          });
-        break;
-      }
       case 'xnsite': {
         const data = await batchCreate('xnsite', {
           title,

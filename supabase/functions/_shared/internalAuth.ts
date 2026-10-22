@@ -1,7 +1,7 @@
 /**
  * 内部调用鉴权（服务端 worker / 定时任务 → 站点代理）
  *
- * 背景：所有站点代理（panlinks-proxy / xnshare-proxy / resource-manager / …）
+ * 背景：所有站点代理（xnshare-proxy / resource-manager / …）
  * 原先只认「本应用用户 JWT」（`svc.auth.getUser(token)`），而服务端任务没有用户 JWT，
  * 于是站点推送只能由浏览器发起 —— 用户关掉页面就永远不会执行。
  *

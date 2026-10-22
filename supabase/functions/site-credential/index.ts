@@ -37,7 +37,7 @@ const CORS = {
 
 const SITE_TIMEOUT_MS = 25000;
 
-type SiteKey = "ya" | "jying" | "hdhaven" | "framehdr" | "mukaku" | "pinglian" | "panfx" | "xn" | "st1";
+type SiteKey = "ya" | "jying" | "hdhaven" | "framehdr" | "mukaku" | "panfx" | "xn" | "st1";
 
 interface SiteSpec {
   label: string;
@@ -109,17 +109,6 @@ const SITES: Record<SiteKey, SiteSpec> = {
     login: "login",
     captcha: true,
     codes: ["MUKAKU_TOKEN_EXPIRED", "MUKAKU_NOT_BOUND"],
-  },
-  pinglian: {
-    label: "盘链",
-    fn: "panlinks-proxy",
-    sessionTable: "pinglian_sessions",
-    // 注意：pinglian 的 action=status 是站点公开接口，未登录也返回 200，不能用来判失效；
-    // 必须用 list（未登录时返回 401 + PINGLIAN_COOKIE_EXPIRED）
-    probe: { action: "list" },
-    login: "login",
-    captcha: true,
-    codes: ["PINGLIAN_COOKIE_EXPIRED"],
   },
   panfx: {
     label: "123社区",

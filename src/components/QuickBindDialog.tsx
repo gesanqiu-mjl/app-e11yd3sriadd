@@ -41,9 +41,6 @@ import {
   yaAddResource,
   bindResourceToYa,
   yaGetAccountStatus,
-  searchPinglianLibrary,
-  addPanLink,
-  bindResourceToLink,
   searchXnVideos,
   addXnShare,
   searchFramehdrResources,
@@ -56,17 +53,17 @@ import {
   getHdhavenBinding,
   createHdhavenShare,
 } from '@/services/api';
-import type { Resource, MukakuMovie, YaLink, PinglianLink, JyingMovie, HdhavenTmdbItem } from '@/types/index';
-import type { PinglianLibraryItem, XnSearchItem, FramehdrSearchItem } from '@/services/api';
+import type { Resource, MukakuMovie, YaLink, JyingMovie, HdhavenTmdbItem } from '@/types/index';
+import type { XnSearchItem, FramehdrSearchItem } from '@/services/api';
 import { detectPanName } from '@/lib/panUtils';
 import { SITE_URLS, siteHost } from '@/lib/siteCredentials';
 import { parseHdhavenMetaFromName } from '@/lib/hdhavenMeta';
 
-export type SiteSourceType = 'mukaku' | 'ya' | 'pinglian' | 'framehdr' | 'xn' | 'panfx' | 'jying' | 'hdhaven';
+export type SiteSourceType = 'mukaku' | 'ya' | 'framehdr' | 'xn' | 'panfx' | 'jying' | 'hdhaven';
 
 export interface SiteBindingPayload {
   site: SiteSourceType;
-  /** 站点侧记录 ID：mukaku / ya / pinglian 为数字；观影小牛改用 share_id */
+  /** 站点侧记录 ID：mukaku / ya 为数字；观影小牛改用 share_id */
   link_id?: number;
   movies_id?: number;
   video_id?: number;
@@ -78,7 +75,7 @@ export interface SiteBindingPayload {
   pan_url?: string;
   /** 观影小牛：站点分享短码 ID */
   share_id?: string;
-  /** 分享标题（盘链 / 观影小牛落库使用） */
+  /** 分享标题（观影小牛落库使用） */
   link_title?: string;
   /** 分享外链（观影小牛落库使用） */
   share_url?: string;
@@ -119,7 +116,6 @@ const SITE_OPTIONS: Array<{
   supported: boolean;
 }> = [
   { id: 'mukaku', label: '不太灵片库', badge: '一键发布', desc: '站内全网片库检索，支持自动发布网盘资源并挂载', supported: true },
-  { id: 'pinglian', label: '盘链片库', badge: '网盘库', desc: '检索全站网盘分享库，支持同步发布到剧集', supported: true },
   { id: 'framehdr', label: '帧影', badge: '豆瓣片库', desc: '基于帧影站内豆瓣源检索影片条目', supported: true },
   { id: 'xn', label: '观影片库', badge: '搜索提示', desc: '基于片库站内搜索联想片源', supported: true },
   { id: 'panfx', label: '123社区', badge: '仅发帖', desc: '暂未提供全网片源检索接口，仅支持帖子管理', supported: false },
@@ -180,7 +176,7 @@ function parseMultiLinesToLinks(text: string): SelectedPanLinkItem[] {
 /**
  * 某条网盘链接对指定站点的勾选状态。
  * 各站点互相独立：站点未单独设置过时回退到默认 checked，
- * 这样用户可以「只把光鸭云盘发给帧影、把全部链接发给盘链」而互不影响。
+ * 这样用户可以「只把光鸭云盘发给帧影、把全部链接发给鸭影」而互不影响。
  */
 function isLinkCheckedForSite(item: SelectedPanLinkItem, site: SiteSourceType): boolean {
   return item.checkedSites?.[site] ?? item.checked;
@@ -201,7 +197,6 @@ export default function QuickBindDialog({
   // 搜索结果列表
   const [mukakuMovies, setMukakuMovies] = useState<MukakuMovie[]>([]);
   const [yaLinks, setYaLinks] = useState<YaLink[]>([]);
-  const [pinglianLinks, setPinglianLinks] = useState<PinglianLibraryItem[]>([]);
   const [xnVideos, setXnVideos] = useState<XnSearchItem[]>([]);
   const [framehdrResults, setFramehdrResults] = useState<FramehdrSearchItem[]>([]);
   const [jyingShares, setJyingShares] = useState<JyingMovie[]>([]);
@@ -210,7 +205,6 @@ export default function QuickBindDialog({
   // 选中的片源
   const [selectedMovie, setSelectedMovie] = useState<MukakuMovie | null>(null);
   const [selectedYa, setSelectedYa] = useState<YaLink | null>(null);
-  const [selectedPinglian, setSelectedPinglian] = useState<PinglianLink | null>(null);
   const [selectedXn, setSelectedXn] = useState<XnSearchItem | null>(null);
   const [selectedFramehdr, setSelectedFramehdr] = useState<FramehdrSearchItem | null>(null);
   const [selectedJying, setSelectedJying] = useState<JyingMovie | null>(null);
@@ -281,7 +275,6 @@ export default function QuickBindDialog({
       setPublishedSites({});
       setSelectedMovie(null);
       setSelectedYa(null);
-      setSelectedPinglian(null);
       setSelectedXn(null);
       setNewSingleUrl('');
       setNewSingleCode('');
@@ -320,7 +313,6 @@ export default function QuickBindDialog({
     setSelectedSite(site);
     setSelectedMovie(null);
     setSelectedYa(null);
-    setSelectedPinglian(null);
     setSelectedXn(null);
     if (keyword.trim()) {
       doSearch(keyword.trim(), site);
@@ -349,12 +341,6 @@ export default function QuickBindDialog({
         setYaLinks(list);
         if (list.length === 0) {
           toast.info(`未在鸭影臻藏搜到「${q}」，可尝试去掉年份或精简关键词`);
-        }
-      } else if (site === 'pinglian') {
-        const list = await searchPinglianLibrary(q);
-        setPinglianLinks(list);
-        if (list.length === 0) {
-          toast.info(`未在盘链片库搜到「${q}」，可尝试去除年份或缩短关键词`);
         }
       } else if (site === 'xn') {
         const list = await searchXnVideos(q);
@@ -434,32 +420,6 @@ export default function QuickBindDialog({
       });
     }
     toast.success(`已选定鸭影《${title}》`);
-  }
-
-  // 选中盘链片源（不覆盖「资源标题」，标题始终以资源名称为准）
-  function handlePickPinglian(item: PinglianLink) {
-    setSelectedPinglian(item);
-    const title = item.video_title || item.title || '';
-    if (item.video_cover) setSelectedCover(item.video_cover);
-
-    // 同上：资源已有自己的网盘链接时，盘链条目仅作为发布目标（video_id）与封面来源
-    if (item.url && !resourceHasOwnLink) {
-      setPanLinks((prev) => {
-        const exists = prev.some((l) => l.url === item.url);
-        if (exists) return prev;
-        return [
-          {
-            id: `pinglian-${item.id || Date.now()}`,
-            url: item.url,
-            pan_name: item.pan_type || detectPanName(item.url),
-            extract_code: item.password || '',
-            checked: true,
-          },
-          ...prev,
-        ];
-      });
-    }
-    toast.success(`已选定盘链条目《${title}》`);
   }
 
   // 选中观影小牛片源（不覆盖「资源标题」）
@@ -687,30 +647,6 @@ export default function QuickBindDialog({
             console.warn('发布到鸭影失败', yaErr);
             toast.error(`发布至鸭影失败: ${yaErr?.message || '未知错误'}`);
           }
-        } else if (selectedSite === 'pinglian' && selectedPinglian?.video_id) {
-          try {
-            const plRes = await addPanLink({
-              link_title: finalName,
-              link_url: firstLink.url,
-              link_password: firstLink.extract_code,
-              pan_type: detectPanName(firstLink.url),
-              vod_id: Number(selectedPinglian.video_id),
-            });
-            // 发布成功即落地「资源 × 盘链记录」绑定，使资源显示为已绑定
-            if (plRes?.linkId) {
-              firstBinding = {
-                site: 'pinglian',
-                link_id: plRes.linkId,
-                link_title: finalName,
-                vod_name: selectedPinglian.video_title || finalName,
-                pan_type: detectPanName(firstLink.url) || 'others',
-                code: firstLink.extract_code,
-              };
-            }
-          } catch (plErr: any) {
-            console.warn('发布到盘链失败', plErr);
-            toast.error(`发布至盘链失败: ${plErr?.message || '未知错误'}`);
-          }
         } else if (selectedSite === 'framehdr' && selectedFramehdr) {
           try {
             // 帧影发布到指定片源：resource_id 为站点影片 ID，name 为网盘类型
@@ -891,31 +827,6 @@ export default function QuickBindDialog({
                 }
               } catch (subErr) {
                 console.warn('队列发布鸭影失败', subErr);
-              }
-            } else if (selectedSite === 'pinglian' && selectedPinglian?.video_id) {
-              // 盘链：队列第 2 条起同样要发布 —— 保持资源标题不变、仅更换网盘链接，
-              // 在同一片源下再建一条分享记录；否则只有首条会上站
-              try {
-                const plSub = await addPanLink({
-                  link_title: finalName,
-                  link_url: item.url,
-                  link_password: item.extract_code,
-                  pan_type: detectPanName(item.url),
-                  vod_id: Number(selectedPinglian.video_id),
-                });
-                if (plSub?.linkId) {
-                  subBinding = {
-                    site: 'pinglian',
-                    link_id: plSub.linkId,
-                    link_title: finalName,
-                    vod_name: selectedPinglian.video_title || finalName,
-                    pan_type: detectPanName(item.url) || 'others',
-                    code: item.extract_code,
-                  };
-                }
-              } catch (subErr: any) {
-                console.warn('队列发布盘链失败', subErr);
-                toast.error(`队列发布至盘链失败: ${subErr?.message || '未知错误'}`);
               }
             } else if (selectedSite === 'framehdr' && selectedFramehdr) {
               // 帧影：队列第 2 条起同样发布到同一片源，资源名称不变、仅更换链接
@@ -1238,74 +1149,6 @@ export default function QuickBindDialog({
                               {item.url
                                 ? <span className="font-mono">{item.url}</span>
                                 : '你尚未在该片源下发布链接 · 选中后可直接发布新资源'}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )
-              ) : selectedSite === 'pinglian' ? (
-                pinglianLinks.length === 0 ? (
-                  <div className="py-6 text-center text-xs text-muted-foreground">
-                    未检索到盘链片源。请先在设置页绑定盘链账号，并尝试精简关键词
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    {pinglianLinks.map((item) => {
-                      const picked = selectedPinglian?.video_id === item.video_id;
-                      return (
-                        <div
-                          key={String(item.video_id)}
-                          onClick={() => handlePickPinglian(item)}
-                          className={`flex gap-2.5 p-2 rounded-md border cursor-pointer transition-all ${
-                            picked
-                              ? 'border-primary bg-primary/10 shadow-xs ring-1 ring-primary'
-                              : 'border-border bg-card hover:bg-muted/50'
-                          }`}
-                        >
-                          {item.video_cover ? (
-                            <img
-                              src={item.video_cover}
-                              alt={item.video_title || item.title}
-                              className="w-12 h-16 object-cover rounded shrink-0 bg-muted"
-                              onError={(e) => {
-                                (e.target as HTMLElement).style.display = 'none';
-                              }}
-                            />
-                          ) : (
-                            <div className="w-12 h-16 rounded bg-muted flex items-center justify-center shrink-0">
-                              <Film className="h-5 w-5 text-muted-foreground/50" />
-                            </div>
-                          )}
-                          <div className="flex-1 min-w-0 flex flex-col justify-between py-0.5">
-                            <div>
-                              <div className="flex items-center justify-between gap-1">
-                                <h4 className="font-medium text-xs truncate text-foreground">
-                                  {item.video_title || item.title}
-                                </h4>
-                                {picked && <Check className="h-3.5 w-3.5 text-primary shrink-0" />}
-                              </div>
-                              <div className="flex items-center gap-1.5 mt-1 text-[10px] text-muted-foreground flex-wrap">
-                                {item.video_year && (
-                                  <span className="flex items-center gap-0.5">
-                                    <Calendar className="h-2.5 w-2.5" />
-                                    {item.video_year}
-                                  </span>
-                                )}
-                                {item.video_type && (
-                                  <span className="truncate max-w-24">· {item.video_type}</span>
-                                )}
-                                {item.video_remarks && (
-                                  <span className="truncate max-w-20">· {item.video_remarks}</span>
-                                )}
-                              </div>
-                            </div>
-                            <div className="flex items-center justify-between text-[10px] text-muted-foreground pt-1 border-t border-border/40">
-                              <span>站点片源ID: {item.video_id}</span>
-                              <Badge variant="outline" className="text-[9px] px-1 py-0">
-                                点击选定
-                              </Badge>
                             </div>
                           </div>
                         </div>

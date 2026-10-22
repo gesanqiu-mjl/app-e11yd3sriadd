@@ -2,7 +2,7 @@
  * batch-post：批量发帖专用入口（服务端权限校验）
  *
  * 为什么单独做一个函数：
- *   批量发帖与「单条快捷绑定 / 资源同步」调用的是同一批站点创建接口（panlinks-proxy
+ *   批量发帖与「单条快捷绑定 / 资源同步」调用的是同一批站点创建接口（xnshare-proxy
  *   action=add、xnshare-proxy action=add、jying-proxy action=add ...）。若直接在这些
  *   代理函数上加权限校验，会把用户正常的单条绑定 / 同步一起锁掉。
  *   因此批量发帖统一走本函数：先校验调用方的「批量发帖权限」（管理员在后台开通，
@@ -10,7 +10,7 @@
  *   （Authorization token 原样透传，站点会话 / Cookie 等逻辑保持不变）。
  *
  * 请求体：
- *   { site: 'pinglian' | 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying' | 'hdhaven',
+ *   { site: 'xnsite' | 'ya' | 'framehdr' | 'mukaku' | 'jying' | 'hdhaven',
  *     payload: { ...该站点代理要求的原始字段... },
  *     useShortLink?: boolean }
  *
@@ -51,7 +51,6 @@ const SITES: Record<
   string,
   { fn: string; action: string; actionInBody: boolean; timeoutMs: number }
 > = {
-  pinglian: { fn: "panlinks-proxy", action: "add", actionInBody: false, timeoutMs: 20000 },
   xnsite: { fn: "xnshare-proxy", action: "add", actionInBody: false, timeoutMs: 20000 },
   ya: { fn: "resource-manager", action: "addResource", actionInBody: true, timeoutMs: 20000 },
   framehdr: { fn: "framehdr-proxy", action: "add", actionInBody: false, timeoutMs: 20000 },

@@ -13,13 +13,12 @@ import {
 } from '@/components/ui/context-menu';
 import { toast } from 'sonner';
 import {
-  Resource, FIELD_LABELS, ResourceBinding, XnResourceBinding, YaResourceBinding,
+  Resource, FIELD_LABELS, XnResourceBinding, YaResourceBinding,
   FramehdrResourceBinding, PanfxResourceBinding, MukakuResourceBinding, MukakuMovie,
   JyingResourceBinding, HdhavenResourceBinding, St1ResourceBinding,
 } from '@/types/index';
 import {
   updateResourceField, updateResourceCover, recordChange, deleteResource, importCoverFromUrl,
-  fetchResourceBindings, updatePanLink, COOKIE_EXPIRED_CODE, PINGLIAN_LINK_NOT_FOUND_CODE, bindResourceToLink,
   fetchXnResourceBindings, syncResourceToXn, XN_COOKIE_EXPIRED_CODE, bindResourceToXnShare,
   fetchYaResourceBindings, syncResourceToYa, YA_EXPIRED_CODE, bindResourceToYa,
   fetchFramehdrResourceBindings, syncResourceToFramehdr, FRAMEHDR_COOKIE_EXPIRED_CODE, bindResourceToFramehdr,
@@ -185,8 +184,6 @@ function ResourceTable({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadTargetRef = useRef<string | null>(null);
 
-  // 盘链绑定关系（一个资源可绑定多条站点记录，按网盘类型分别同步）
-  const [bindings, setBindings] = useState<Record<string, ResourceBinding[]>>({});
   // 观影站点绑定关系（一个资源可绑定多条分享，按网盘标签分别同步）
   const [xnBindings, setXnBindings] = useState<Record<string, XnResourceBinding[]>>({});
   // 鸭影臻藏绑定关系（一个资源可绑定多条片源，按网盘标签分别同步）
@@ -238,7 +235,6 @@ function ResourceTable({
   useEffect(() => {
     let cancelled = false;
     Promise.all([
-      fetchResourceBindings().catch(() => [] as ResourceBinding[]),
       fetchXnResourceBindings().catch(() => [] as XnResourceBinding[]),
       fetchYaResourceBindings().catch(() => [] as YaResourceBinding[]),
       fetchFramehdrResourceBindings().catch(() => [] as FramehdrResourceBinding[]),
@@ -247,11 +243,8 @@ function ResourceTable({
       fetchJyingResourceBindings().catch(() => [] as JyingResourceBinding[]),
       fetchHdhavenResourceBindings().catch(() => [] as HdhavenResourceBinding[]),
       getSt1ResourceBindings().catch(() => [] as St1ResourceBinding[]),
-    ]).then(([list, xnList, yaList, framehdrList, panfxList, mukakuList, jyingList, hdhavenList, st1List]) => {
+    ]).then(([xnList, yaList, framehdrList, panfxList, mukakuList, jyingList, hdhavenList, st1List]) => {
       if (cancelled) return;
-      const map: Record<string, ResourceBinding[]> = {};
-      list.forEach((b) => { (map[b.resource_id] ??= []).push(b); });
-      setBindings(map);
       const xnMap: Record<string, XnResourceBinding[]> = {};
       xnList.forEach((b) => { (xnMap[b.resource_id] ??= []).push(b); });
       setXnBindings(xnMap);
@@ -416,7 +409,6 @@ function ResourceTable({
 
   /** 同步已绑定资源到所有已绑定站点（名称/集数/链接变更时） */
   async function syncToSite(resource: Resource) {
-    const pinglianList = bindings[resource.id] ?? [];
     const xnList = xnBindings[resource.id] ?? [];
     const yaList = yaBindings[resource.id] ?? [];
     const fhB = framehdrBindings[resource.id];
@@ -425,12 +417,11 @@ function ResourceTable({
     const mukList = mukakuBindings[resource.id] ?? [];
     const jyingList = jyingBindings[resource.id] ?? [];
     const hdhavenList = hdhavenBindings[resource.id] ?? [];
-    if (pinglianList.length === 0 && xnList.length === 0 && yaList.length === 0 && !fhB && !pfxB && !st1B && mukList.length === 0 && jyingList.length === 0 && hdhavenList.length === 0) return;
+    if (xnList.length === 0 && yaList.length === 0 && !fhB && !pfxB && !st1B && mukList.length === 0 && jyingList.length === 0 && hdhavenList.length === 0) return;
     setSyncingId(resource.id);
 
     // 命中这些错误码代表「站点会话失效」：先尝试用云端凭据自动重登，再重试一次
     const RELOGIN_TRIGGER_CODES = new Set<string | undefined>([
-      COOKIE_EXPIRED_CODE,
       XN_COOKIE_EXPIRED_CODE,
       YA_EXPIRED_CODE,
       FRAMEHDR_COOKIE_EXPIRED_CODE,
@@ -475,7 +466,6 @@ function ResourceTable({
             throw err;
           }
           if (
-          err.code === PINGLIAN_LINK_NOT_FOUND_CODE ||
           // 栖影授权失效 / 额度用尽：重试无意义，直接上抛让用户去处理
           err.code === HDHAVEN_EXPIRED_CODE ||
           err.code === HDHAVEN_RATE_LIMITED_CODE
@@ -503,54 +493,7 @@ function ResourceTable({
     const succeededSites: string[] = [];
     const failedSites: { site: string; reason: string }[] = [];
 
-    // 盘链：逐条绑定记录串行同步，多链接时按网盘类型匹配对应链接。
-    // 同一盘链 session 的请求必须串行发送——PHP 站点有 session 文件锁，
-    // 并发会导致后到请求被阻塞拿到异常响应，被误判为登录过期
-    for (const b of pinglianList) {
-      const panLabel = PAN_TYPE_LABELS[b.pan_type ?? ''] ?? b.pan_type ?? '对应网盘';
-      const matchedUrl = matchLinkForPanType(
-        b.pan_type,
-        Array.isArray(resource.links) ? resource.links : [],
-        resource.link ?? ''
-      );
-      if (!matchedUrl) {
-        failedSites.push({
-          site: `盘链·${panLabel}`,
-          reason: `资源中没有「${panLabel}」类型的链接，未同步该条记录`,
-        });
-        continue;
-      }
-      try {
-        const upd = await syncWithRetry(() => updatePanLink({
-          link_id: b.link_id,
-          link_title: title,
-          link_url: matchedUrl,
-          link_password: b.link_password ?? '',
-          pan_type: b.pan_type ?? 'others',
-        }), 'pinglian');
-        // 站点改版后旧 link_id 失效：服务端自动迁移成功时返回新 ID，本地同步更新
-        const remappedId =
-          typeof upd?.data?.id === 'number' && upd.data.id !== b.link_id ? upd.data.id : null;
-        if (!succeededSites.includes('盘链')) succeededSites.push('盘链');
-        setBindings((prev) => ({
-          ...prev,
-          [resource.id]: (prev[resource.id] ?? []).map((x) =>
-            x.link_id === b.link_id
-              ? { ...x, link_title: title, ...(remappedId != null ? { link_id: remappedId } : {}) }
-              : x
-          ),
-        }));
-      } catch (e) {
-        const err = e as Error & { code?: string };
-        const reason = err.code === COOKIE_EXPIRED_CODE
-          ? '登录已过期，请到「站点同步」页重新登录'
-          : err.code === PINGLIAN_LINK_NOT_FOUND_CODE
-          ? '该绑定在站点已失效（站点已改版），请解绑后重新绑定'
-          : (err.message || '未知错误');
-        failedSites.push({ site: `盘链·${panLabel}`, reason });
-      }
-    }
-    // 全站串行同步：盘链完成后依次执行观影 → 鸭影 → 帧影 → 123社区，
+    // 全站串行同步：依次执行观影 → 鸭影 → 帧影 → 123社区，
     // 一条接一条顺序提交，避免并发请求触发站点会话锁/限流
 
     // 观影站点：逐条分享记录串行同步，多链接时按网盘标签匹配对应链接
@@ -852,11 +795,6 @@ function ResourceTable({
       if (resource?.cover_url) await deleteCover(resource.cover_url).catch(() => {});
       await deleteResource(id);
       // 同步清理本地绑定状态（DB 外键 ON DELETE CASCADE 已自动删行）
-      setBindings((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
       setYaBindings((prev) => {
         const next = { ...prev };
         delete next[id];
@@ -1090,13 +1028,12 @@ function ResourceTable({
     }
 
     if (col.key === 'name') {
-      const bList = bindings[resource.id] ?? [];
       const xnList2 = xnBindings[resource.id] ?? [];
       const yaList2 = yaBindings[resource.id] ?? [];
       const mukList2 = mukakuBindings[resource.id] ?? [];
       const jyList2 = jyingBindings[resource.id] ?? [];
       const hdList2 = hdhavenBindings[resource.id] ?? [];
-      const allBound = bList.length + xnList2.length + yaList2.length
+      const allBound = xnList2.length + yaList2.length
         + (framehdrBindings[resource.id] ? 1 : 0) + (panfxBindings[resource.id] ? 1 : 0)
         + (st1Bindings[resource.id] ? 1 : 0)
         + mukList2.length + jyList2.length + hdList2.length;
@@ -1158,11 +1095,9 @@ function ResourceTable({
             size="icon"
             title={readOnly
               ? '会员已到期，编辑功能已锁定'
-              : allBound > 1
+              : allBound > 0
                 ? `已绑定 ${allBound} 条站点记录`
-                : bList.length === 1
-                  ? `已绑定：${bList[0].vod_name || bList[0].link_title || `#${bList[0].link_id}`}`
-                  : '绑定站点剧集'}
+                : '绑定站点剧集'}
             disabled={readOnly}
             onClick={(e) => { e.stopPropagation(); setBindTarget(resource); setBindOpen(true); }}
             className={`h-6 w-6 shrink-0 ${allBound > 0 ? 'text-secondary hover:text-secondary hover:bg-secondary/10' : 'text-muted-foreground/60 hover:text-primary hover:bg-primary/10'}`}
@@ -1312,19 +1247,6 @@ function ResourceTable({
           const yaMap: Record<string, YaResourceBinding[]> = {};
           yaList.forEach((b) => { (yaMap[b.resource_id] ??= []).push(b); });
           setYaBindings(yaMap);
-        } else if (siteBinding.site === 'pinglian' && siteBinding.link_id) {
-          // 盘链：发布成功后落地「资源 × 盘链记录」绑定
-          await bindResourceToLink(resourceId, {
-            id: siteBinding.link_id,
-            title: siteBinding.link_title || filledName,
-            video_title: siteBinding.vod_name || filledName,
-            pan_type: siteBinding.pan_type || 'others',
-            password: siteBinding.code || null,
-          });
-          const plList = await fetchResourceBindings();
-          const plMap: Record<string, ResourceBinding[]> = {};
-          plList.forEach((b) => { (plMap[b.resource_id] ??= []).push(b); });
-          setBindings(plMap);
         } else if (siteBinding.site === 'framehdr' && siteBinding.link_id) {
           // 帧影：发布成功后落地「资源 × 帧影链接」绑定
           await bindResourceToFramehdr(resourceId, {
@@ -1737,7 +1659,6 @@ function ResourceTable({
 
       <BindDialog
         resource={bindTarget}
-        pinglianBindings={bindTarget ? bindings[bindTarget.id] ?? [] : []}
         xnBindings={bindTarget ? xnBindings[bindTarget.id] ?? [] : []}
         yaBindings={bindTarget ? yaBindings[bindTarget.id] ?? [] : []}
         framehdrBinding={bindTarget ? framehdrBindings[bindTarget.id] ?? null : null}
@@ -1748,19 +1669,6 @@ function ResourceTable({
         hdhavenBindings={bindTarget ? hdhavenBindings[bindTarget.id] ?? [] : []}
         open={bindOpen}
         onOpenChange={setBindOpen}
-        onPinglianBound={(resourceId, b) => setBindings((prev) => {
-          const list = prev[resourceId] ?? [];
-          const idx = list.findIndex((x) => x.link_id === b.link_id);
-          return { ...prev, [resourceId]: idx >= 0 ? list.map((x, i) => (i === idx ? b : x)) : [...list, b] };
-        })}
-        onPinglianUnbound={(resourceId, linkId) => setBindings((prev) => {
-          if (linkId == null) {
-            const next = { ...prev };
-            delete next[resourceId];
-            return next;
-          }
-          return { ...prev, [resourceId]: (prev[resourceId] ?? []).filter((x) => x.link_id !== linkId) };
-        })}
         onXnBound={(resourceId, b) => setXnBindings((prev) => {
           const list = prev[resourceId] ?? [];
           const idx = list.findIndex((x) => x.share_id === b.share_id);

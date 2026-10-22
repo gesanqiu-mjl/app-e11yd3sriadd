@@ -1,6 +1,6 @@
 // ============================================================
 // Supabase Edge Function: resource-sync
-// 资源同步更新代理（与盘链 panlinks-proxy / 观影 xnshare-proxy 同构）
+// 资源同步更新代理（与观影 xnshare-proxy 同构）
 //
 // 作用：把本站资源接口（api_search_videos / api_add_resource）
 //       封装为统一入口，供脚本/前端调用，隐藏 anon key。

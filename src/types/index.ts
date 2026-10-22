@@ -305,55 +305,6 @@ export interface ApiKey {
   last_ip: string | null;
 }
 
-// 盘链账号绑定信息
-export interface PinglianBinding {
-  status: 'active' | 'expired';
-  username: string | null;
-  last_check_at: string | null;
-  remark: string | null;
-  updated_at: string | null;
-}
-
-/** 盘链图形验证码（GET /api/auth/captcha）：id 用于登录提交，image 为 base64 PNG，ttl 为有效期秒数 */
-export interface PinglianCaptcha {
-  id: string;
-  image: string;
-  ttl: number;
-}
-
-// 盘链发布记录（v4 接口字段）
-export interface PinglianLink {
-  id: number;
-  video_id: number;
-  source_link_id: number | null;
-  user_id: number;
-  username: string | null;
-  title: string;
-  url: string;
-  password: string | null;
-  pan_type: string;
-  note: string | null;
-  is_active: boolean;
-  is_system: boolean;
-  is_verified: boolean;
-  created_at: string | null;
-  updated_at: string | null;
-  video_title: string | null;
-  video_cover: string | null;
-}
-
-// 资源与站点剧集绑定关系
-export interface ResourceBinding {
-  id: string;
-  resource_id: string;
-  link_id: number;
-  link_title: string | null;
-  vod_name: string | null;
-  pan_type: string | null;
-  link_password: string | null;
-  created_at: string;
-}
-
 // 资源与观影站点分享的绑定关系（一个资源可绑定多条，每条对应一种网盘）
 export interface XnResourceBinding {
   id: string;

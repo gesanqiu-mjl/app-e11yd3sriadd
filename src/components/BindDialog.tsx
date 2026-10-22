@@ -10,7 +10,6 @@ import {
 import { toast } from 'sonner';
 import { PAN_TYPE_LABELS, detectPanName } from '@/lib/panUtils';
 import {
-  loadPanLinks, bindResourceToLink, unbindResource, COOKIE_EXPIRED_CODE, searchPanLinks,
   loadXnShares, bindResourceToXnShare, unbindResourceFromXn, XN_COOKIE_EXPIRED_CODE,
   searchYaVideos, bindResourceToYa, unbindResourceFromYa, YA_EXPIRED_CODE,
   loadFramehdrLinks, bindResourceToFramehdr, unbindResourceFromFramehdr, FRAMEHDR_COOKIE_EXPIRED_CODE,
@@ -21,7 +20,7 @@ import {
   loadHdhavenShares, bindResourceToHdhaven, unbindResourceFromHdhaven, HDHAVEN_EXPIRED_CODE,
 } from '@/services/api';
 import type {
-  Resource, PinglianLink, ResourceBinding, XnShare, XnResourceBinding,
+  Resource, XnShare, XnResourceBinding,
   YaLink, YaResourceBinding, FramehdrLink, FramehdrResourceBinding,
   PanfxPost, PanfxResourceBinding, MukakuWpResource, MukakuResourceBinding,
   St1ResourceBinding,
@@ -38,7 +37,6 @@ function fmtDate(iso?: string | null) {
 
 interface BindDialogProps {
   resource: Resource | null;
-  pinglianBindings: ResourceBinding[];
   xnBindings: XnResourceBinding[];
   yaBindings: YaResourceBinding[];
   framehdrBinding: FramehdrResourceBinding | null;
@@ -50,8 +48,6 @@ interface BindDialogProps {
   hdhavenBindings: HdhavenResourceBinding[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onPinglianBound: (resourceId: string, binding: ResourceBinding) => void;
-  onPinglianUnbound: (resourceId: string, linkId?: number) => void;
   onXnBound: (resourceId: string, binding: XnResourceBinding) => void;
   onXnUnbound: (resourceId: string, shareId?: string) => void;
   onYaBound: (resourceId: string, binding: YaResourceBinding) => void;
@@ -410,218 +406,6 @@ function HdhavenPane({
         <Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
         <span>此处只列出你账号在栖影<strong>已发布</strong>的分享记录，绑定后资源更新时会自动替换该记录的链接（普通用户改动后资源会重新进入审核）。栖影暂未开放「新建分享」接口，新增分享请先在栖影站点发布。</span>
       </div>
-    </div>
-  );
-}
-
-// ─── 盘链标签页内容（一链接一记录：同一部剧的多条网盘记录可分别绑定） ──
-function PinglianPane({
-  resource, pinglianBindings, onPinglianBound, onPinglianUnbound,
-}: Pick<BindDialogProps, 'resource' | 'pinglianBindings' | 'onPinglianBound' | 'onPinglianUnbound'>) {
-  const [links, setLinks] = useState<PinglianLink[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [keyword, setKeyword] = useState('');
-  const [bindingLinkId, setBindingLinkId] = useState<number | null>(null);
-  const [unbindingLinkId, setUnbindingLinkId] = useState<number | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
-    loadPanLinks()
-      .then((data) => { if (!cancelled) setLinks(data); })
-      .catch((e) => {
-        if (cancelled) return;
-        setLinks([]);
-        const err = e as Error & { code?: string };
-        setLoadError(
-          err.code === COOKIE_EXPIRED_CODE
-            ? '盘链登录已过期，请先到「站点同步」页重新登录'
-            : err.message || '加载站点剧集失败'
-        );
-      })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, []);
-
-  // v4 站点列表单页最多 200 条（发布量大的用户首屏不全）：
-  // 输入关键词后改为站点服务端搜索（?search=），覆盖全部发布记录
-  const [serverResults, setServerResults] = useState<PinglianLink[] | null>(null);
-  const [searching, setSearching] = useState(false);
-
-  useEffect(() => {
-    const kw = keyword.trim();
-    if (!kw) {
-      setServerResults(null);
-      setSearching(false);
-      return;
-    }
-    let cancelled = false;
-    const timer = setTimeout(async () => {
-      setSearching(true);
-      try {
-        const res = await searchPanLinks(kw);
-        if (!cancelled) setServerResults(res);
-      } catch {
-        if (!cancelled) setServerResults([]);
-      } finally {
-        if (!cancelled) setSearching(false);
-      }
-    }, 400);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [keyword]);
-
-  const filtered = useMemo(() => {
-    // 服务端搜索结果直接采用；无关键词时本地过滤首屏 200 条
-    if (serverResults) return serverResults;
-    const q = keyword.trim().toLowerCase();
-    if (!q) return links;
-    return links.filter((l) =>
-      (l.title ?? '').toLowerCase().includes(q) ||
-      (l.video_title ?? '').toLowerCase().includes(q)
-    );
-  }, [links, keyword, serverResults]);
-
-  async function handleBind(link: PinglianLink) {
-    if (!resource) return;
-    setBindingLinkId(link.id);
-    try {
-      await bindResourceToLink(resource.id, link);
-      const existing = pinglianBindings.find((b) => b.link_id === link.id);
-      onPinglianBound(resource.id, {
-        id: existing?.id ?? '',
-        resource_id: resource.id,
-        link_id: link.id,
-        link_title: link.title,
-        vod_name: link.video_title,
-        pan_type: link.pan_type,
-        link_password: link.password,
-        created_at: existing?.created_at ?? new Date().toISOString(),
-      });
-      toast.success('绑定盘链成功，资源更新时将自动同步');
-    } catch { toast.error('绑定失败，请重试'); }
-    finally { setBindingLinkId(null); }
-  }
-
-  async function handleUnbind(linkId: number) {
-    if (!resource) return;
-    setUnbindingLinkId(linkId);
-    try {
-      await unbindResource(resource.id, linkId);
-      onPinglianUnbound(resource.id, linkId);
-      toast.success('已解绑该条盘链记录');
-    } catch { toast.error('解绑失败'); }
-    finally { setUnbindingLinkId(null); }
-  }
-
-  return (
-    <div className="space-y-3">
-      {pinglianBindings.length > 0 && (
-        <div className="space-y-1.5">
-          <p className="text-[11px] text-muted-foreground px-0.5">
-            已绑定 {pinglianBindings.length} 条站点记录，同步时将按网盘类型自动匹配对应链接
-          </p>
-          {pinglianBindings.map((b) => (
-            <div key={b.link_id}
-              className="flex items-center gap-2 p-2.5 rounded-lg bg-secondary/10 border border-secondary/20">
-              <CheckCircle2 className="h-4 w-4 text-secondary shrink-0" />
-              <div className="flex-1 min-w-0 overflow-hidden">
-                <p className="text-xs font-medium text-foreground truncate leading-snug">
-                  {b.vod_name || `#${b.link_id}`}
-                </p>
-                <p className="text-[11px] text-muted-foreground truncate mt-0.5 leading-snug">
-                  {b.link_title ?? '—'}
-                  {b.pan_type && (
-                    <span className="ml-1 shrink-0">
-                      · {PAN_TYPE_LABELS[b.pan_type] ?? b.pan_type}
-                    </span>
-                  )}
-                </p>
-              </div>
-              <Button variant="ghost" size="sm" onClick={() => handleUnbind(b.link_id)}
-                disabled={unbindingLinkId === b.link_id}
-                className="h-7 shrink-0 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 gap-1 px-2">
-                {unbindingLinkId === b.link_id
-                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  : <Unlink className="h-3.5 w-3.5" />}
-                解绑
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="relative">
-        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
-        <Input value={keyword} onChange={(e) => setKeyword(e.target.value)}
-          placeholder="搜索盘链剧集名称…"
-          className="pl-8 h-9 text-sm bg-input border-border focus-visible:ring-primary/40" />
-      </div>
-
-      {loading ? (
-        <div className="py-10 text-center text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin inline mr-2" />加载盘链剧集…
-        </div>
-      ) : loadError ? (
-        <div className="flex items-start gap-2 py-6 px-3 text-sm text-destructive">
-          <Info className="h-4 w-4 shrink-0 mt-0.5" /><span>{loadError}</span>
-        </div>
-      ) : searching ? (
-        <div className="py-10 text-center text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin inline mr-2" />正在站点内搜索「{keyword.trim()}」…
-        </div>
-      ) : filtered.length === 0 ? (
-        <div className="py-10 text-center text-sm text-muted-foreground">
-          {keyword ? `未找到「${keyword}」` : '站点暂无剧集，请先到盘链发布资源'}
-        </div>
-      ) : (
-        <div className="max-h-56 overflow-y-auto overflow-x-hidden w-full min-w-0 rounded-lg border border-border divide-y divide-border/50">
-          {filtered.map((link) => {
-            const bound = pinglianBindings.find((b) => b.link_id === link.id);
-            return (
-              <div key={link.id}
-                className={`flex items-center gap-2 px-3 py-2.5 transition-colors min-w-0 w-full ${bound ? 'bg-secondary/10' : 'hover:bg-muted/40'}`}>
-                <div className="flex-1 min-w-0 overflow-hidden">
-                  <p className="flex items-baseline gap-1 text-xs font-medium text-foreground leading-snug">
-                    {link.video_title && <span className="text-muted-foreground shrink-0">[{link.video_title}]</span>}
-                    <span className="truncate min-w-0">{link.title || '—'}</span>
-                  </p>
-                  <div className="flex items-center gap-2 mt-0.5">
-                    <span className="text-[11px] text-muted-foreground">
-                      {fmtDate(link.updated_at ?? link.created_at)}
-                    </span>
-                    <Badge variant="secondary"
-                      className="h-4 px-1.5 bg-muted text-muted-foreground border-0 hover:bg-muted text-[10px]">
-                      {PAN_TYPE_LABELS[link.pan_type] ?? link.pan_type}
-                    </Badge>
-                  </div>
-                </div>
-                {bound ? (
-                  <Button variant="ghost" size="sm" onClick={() => handleUnbind(link.id)}
-                    disabled={unbindingLinkId === link.id}
-                    className="h-7 shrink-0 text-xs text-destructive hover:text-destructive hover:bg-destructive/10 gap-1 px-2">
-                    {unbindingLinkId === link.id
-                      ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      : <Unlink className="h-3.5 w-3.5" />}
-                    解绑
-                  </Button>
-                ) : (
-                  <Button variant="outline" size="sm"
-                    onClick={() => handleBind(link)}
-                    disabled={bindingLinkId === link.id}
-                    className="h-7 shrink-0 text-xs border-border text-muted-foreground hover:text-foreground hover:bg-muted gap-1">
-                    {bindingLinkId === link.id
-                      ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      : <Link2 className="h-3.5 w-3.5" />}
-                    绑定
-                  </Button>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
     </div>
   );
 }
@@ -1390,7 +1174,7 @@ function YaPane({
 
   return (
     <div className="space-y-3">
-      {/* 已绑定列表（仿盘链样式：一条网盘一条记录） */}
+      {/* 已绑定列表（一条网盘一条记录） */}
       {yaBindings.length > 0 && (
         <div className="space-y-1.5">
           <p className="text-[11px] text-muted-foreground px-0.5">
@@ -1715,14 +1499,14 @@ function MukakuPane({
 
 // ─── 弹窗入口 ────────────────────────────────────────────────
 export default function BindDialog({
-  resource, pinglianBindings, xnBindings, yaBindings, framehdrBinding, panfxBinding, st1Binding, mukakuBindings,
+  resource, xnBindings, yaBindings, framehdrBinding, panfxBinding, st1Binding, mukakuBindings,
   jyingBindings, hdhavenBindings, open, onOpenChange,
-  onPinglianBound, onPinglianUnbound, onXnBound, onXnUnbound, onYaBound, onYaUnbound,
+  onXnBound, onXnUnbound, onYaBound, onYaUnbound,
   onFramehdrBound, onFramehdrUnbound, onPanfxBound, onPanfxUnbound, onSt1Bound, onSt1Unbound,
   onMukakuBound, onMukakuUnbound,
   onJyingBound, onJyingUnbound, onHdhavenBound, onHdhavenUnbound,
 }: BindDialogProps) {
-  const boundCount = pinglianBindings.length + xnBindings.length + yaBindings.length
+  const boundCount = xnBindings.length + yaBindings.length
     + (framehdrBinding ? 1 : 0) + (panfxBinding ? 1 : 0) + (st1Binding ? 1 : 0) + mukakuBindings.length
     + jyingBindings.length + hdhavenBindings.length;
   const hasBound = boundCount > 0;
@@ -1749,15 +1533,10 @@ export default function BindDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <Tabs defaultValue="pinglian" className="w-full min-w-0">
+        <Tabs defaultValue="xnsite" className="w-full min-w-0">
           {/* 9 个站点 tab 在手机宽度一行放不下（不换行时内在宽度约 520px，必然溢出屏幕），
               所以改成可换行 + 高度自适应：窄屏自动折成两行，桌面端仍是单行 h-8 */}
           <TabsList className="w-full flex-wrap justify-start h-auto md:h-8 bg-muted border border-border mb-1">
-            <TabsTrigger value="pinglian"
-              className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
-              盘链
-              {pinglianBindings.length > 0 && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-secondary inline-block" />}
-            </TabsTrigger>
             <TabsTrigger value="xnsite"
               className="flex-1 text-xs data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm">
               观影
@@ -1798,12 +1577,6 @@ export default function BindDialog({
             <St1Pane
               resource={resource} st1Binding={st1Binding}
               onSt1Bound={onSt1Bound} onSt1Unbound={onSt1Unbound}
-            />
-          </TabsContent>
-          <TabsContent value="pinglian" className="w-full min-w-0 mt-0">
-            <PinglianPane
-              resource={resource} pinglianBindings={pinglianBindings}
-              onPinglianBound={onPinglianBound} onPinglianUnbound={onPinglianUnbound}
             />
           </TabsContent>
           <TabsContent value="xnsite" className="w-full min-w-0 mt-0">

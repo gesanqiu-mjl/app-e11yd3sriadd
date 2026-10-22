@@ -36,7 +36,6 @@ vi.mock('@/services/api', () => {
   const emptyList = () => Promise.resolve([]);
   return {
     // ResourceTable
-    fetchResourceBindings: emptyList,
     fetchXnResourceBindings: emptyList,
     fetchYaResourceBindings: emptyList,
     fetchFramehdrResourceBindings: emptyList,
@@ -48,7 +47,6 @@ vi.mock('@/services/api', () => {
     updateResourceCover: () => Promise.resolve(null),
     recordChange: () => Promise.resolve(undefined),
     deleteResource: () => Promise.resolve(undefined),
-    updatePanLink: () => Promise.resolve(undefined),
     syncResourceToXn: () => Promise.resolve(undefined),
     syncResourceToYa: () => Promise.resolve(undefined),
     syncResourceToFramehdr: () => Promise.resolve(undefined),
@@ -60,9 +58,6 @@ vi.mock('@/services/api', () => {
     insertResource: () => Promise.resolve(null),
     insertResources: () => Promise.resolve([]),
     // BindDialog
-    loadPanLinks: emptyList,
-    bindResourceToLink: () => Promise.resolve(undefined),
-    unbindResource: () => Promise.resolve(undefined),
     loadXnShares: emptyList,
     bindResourceToXnShare: () => Promise.resolve(undefined),
     unbindResourceFromXn: () => Promise.resolve(undefined),

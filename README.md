@@ -60,7 +60,7 @@ npm run build    # 产物输出到 dist/
 
 ### 站点凭据云端存储与自动重登
 
-各站点（鸭影 / 聚影 / 栖影 / 帧影 / 不太灵 / 盘链 / 123社区 / 观影）的登录凭据会加密存入
+各站点（鸭影 / 聚影 / 栖影 / 帧影 / 不太灵 / 123社区 / 观影）的登录凭据会加密存入
 `site_credentials` 表，用户登录本应用后前端自动巡检已绑定站点，**会话失效时用云端凭据自动重新登录**，
 减少同步失败。部署要求：
 
@@ -72,7 +72,7 @@ supabase functions deploy site-credential
 - 加密：pgcrypto 对称加密，数据库只存密文；密钥仅存在于 Edge Function 环境变量 `SITE_CRED_KEY`。
   前端即便被攻破也读不到密文（`secret_enc` 未授权给 authenticated 角色），换密钥等于作废旧凭据。
 - 自动重登能力：鸭影（refresh + 账密）、聚影、栖影（未开两步验证时）、帧影可全自动；
-  不太灵 / 盘链登录需图形验证码、123社区 / 观影仅支持 Cookie，巡检时会提示手动重新登录。
+  不太灵登录需图形验证码、123社区 / 观影仅支持 Cookie，巡检时会提示手动重新登录。
 - 同步兜底：资源同步命中「会话失效」错误码时，会先自动重登再重试一次，仍失败才报错。
 
 ### 订阅转存（RSS / 网页更新页 → 网盘转存 → 自动入库）
@@ -144,7 +144,7 @@ supabase functions deploy resource-api --no-verify-jwt
 
 另一个写入接口是**批量发帖（自动发帖脚本）** `batch-post`：POST + 本系统登录态 JWT（不是 X-API-Key），
 调用方必须已开通批量发帖权限（管理员在后台授予）。请求体为 `{ site, payload, useShortLink }`，
-`site` 支持 7 个站点：`pinglian / xnsite / ya / framehdr / mukaku / jying / hdhaven`。
+`site` 支持 6 个站点：`xnsite / ya / framehdr / mukaku / jying / hdhaven`。
 
 `useShortLink`（短链开关，由调用方自行选择）：
 
