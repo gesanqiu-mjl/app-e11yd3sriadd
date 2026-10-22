@@ -564,6 +564,11 @@ export default function QuickBindDialog({
       });
 
       let firstBinding: SiteBindingPayload | undefined;
+      // 实际发布成功的条数（首条 + 队列各条累加）。
+      // 用于收尾提示如实反映结果：站点失败/限流时不能仍提示「全部成功」。
+      let publishedCount = 0;
+      // 队列各条发布失败的次数（首条失败由各自 toast.error 单独提示）
+      let failedCount = 0;
       if (shouldPublish) {
         if (selectedSite === 'mukaku' && mukakuMoviesId) {
           try {
@@ -583,8 +588,10 @@ export default function QuickBindDialog({
                 code: firstLink.extract_code,
               };
             }
+            publishedCount += 1;
           } catch (pubErr: any) {
             console.warn('发布到不太灵失败，降级本地回填', pubErr);
+            failedCount += 1;
             toast.error(`发布至不太灵失败: ${pubErr?.message || '未知错误'}，已保留本地回填`);
           }
         } else if (selectedSite === 'ya') {
@@ -609,8 +616,10 @@ export default function QuickBindDialog({
                 code: firstLink.extract_code,
               };
             }
+            publishedCount += 1;
           } catch (yaErr: any) {
             console.warn('发布到鸭影失败', yaErr);
+            failedCount += 1;
             toast.error(`发布至鸭影失败: ${yaErr?.message || '未知错误'}`);
           }
         } else if (selectedSite === 'framehdr' && selectedFramehdr) {
@@ -635,8 +644,10 @@ export default function QuickBindDialog({
             } else {
               toast.warning('已发布到帧影，但未能取回链接 ID，请手动绑定该资源');
             }
+            publishedCount += 1;
           } catch (fhErr: any) {
             console.warn('发布到帧影失败', fhErr);
+            failedCount += 1;
             toast.error(`发布至帧影失败: ${fhErr?.message || '未知错误'}`);
           }
         } else if (selectedSite === 'jying' && selectedJying) {
@@ -661,8 +672,10 @@ export default function QuickBindDialog({
             } else {
               toast.warning('已发布到聚影，但未能取回资源 ID，请手动绑定该资源');
             }
+            publishedCount += 1;
           } catch (jyErr: any) {
             console.warn('发布到聚影失败', jyErr);
+            failedCount += 1;
             toast.error(`发布至聚影失败: ${jyErr?.message || '未知错误'}`);
           }
         } else if (selectedSite === 'xn' && selectedXn) {
@@ -690,8 +703,10 @@ export default function QuickBindDialog({
             } else {
               toast.warning('已发布到观影片库，但未能取回分享 ID，请手动绑定该资源');
             }
+            publishedCount += 1;
           } catch (xnErr: any) {
             console.warn('发布到观影片库失败', xnErr);
+            failedCount += 1;
             toast.error(`发布至观影片库失败: ${xnErr?.message || '未知错误'}`);
           }
         }
@@ -732,8 +747,10 @@ export default function QuickBindDialog({
                     code: item.extract_code,
                   };
                 }
+                publishedCount += 1;
               } catch (subErr) {
                 console.warn('队列发布不太灵失败', subErr);
+                failedCount += 1;
               }
             } else if (selectedSite === 'ya') {
               try {
@@ -755,8 +772,10 @@ export default function QuickBindDialog({
                     code: item.extract_code,
                   };
                 }
+                publishedCount += 1;
               } catch (subErr) {
                 console.warn('队列发布鸭影失败', subErr);
+                failedCount += 1;
               }
             } else if (selectedSite === 'framehdr' && selectedFramehdr) {
               // 帧影：队列第 2 条起同样发布到同一片源，资源名称不变、仅更换链接
@@ -768,8 +787,35 @@ export default function QuickBindDialog({
                   password: item.extract_code,
                   description: finalName,
                 });
+                publishedCount += 1;
               } catch (subErr) {
                 console.warn('队列发布帧影失败', subErr);
+                failedCount += 1;
+              }
+            } else if (selectedSite === 'jying' && selectedJying) {
+              // 聚影：队列第 2 条起同样在该影片下新增一条分享记录，
+              // 网盘类型由站点按链接自动识别，无需传入
+              try {
+                const jySub = await addJyingResource({
+                  movieId: selectedJying.id,
+                  shareLink: item.url,
+                  description: finalName,
+                  extractionCode: item.extract_code,
+                });
+                if (jySub.id) {
+                  subBinding = {
+                    site: 'jying',
+                    link_id: jySub.id,
+                    vod_name: selectedJying.title,
+                    link_title: finalName,
+                    pan_url: item.url,
+                    code: item.extract_code,
+                  };
+                }
+                publishedCount += 1;
+              } catch (subErr) {
+                console.warn('队列发布聚影失败', subErr);
+                failedCount += 1;
               }
             } else if (selectedSite === 'xn' && selectedXn) {
               try {
@@ -791,8 +837,10 @@ export default function QuickBindDialog({
                     code: item.extract_code,
                   };
                 }
+                publishedCount += 1;
               } catch (subErr) {
                 console.warn('队列发布观影片库失败', subErr);
+                failedCount += 1;
               }
             }
           }
@@ -811,11 +859,21 @@ export default function QuickBindDialog({
 
       const siteLabel = SITE_OPTIONS.find((s) => s.id === selectedSite)?.label ?? selectedSite;
       if (shouldPublish) {
-        setPublishedSites((prev) => ({ ...prev, [selectedSite]: activeCheckedLinks.length }));
+        setPublishedSites((prev) => ({ ...prev, [selectedSite]: publishedCount }));
       }
-      toast.success(
-        `《${finalName}》已回填${shouldPublish ? `，并向【${siteLabel}】发布 ${activeCheckedLinks.length} 条网盘链接` : ''}。可继续切换站点发布`
-      );
+      if (!shouldPublish) {
+        toast.success(`《${finalName}》已回填。可继续切换站点发布`);
+      } else if (failedCount === 0 && publishedCount === activeCheckedLinks.length) {
+        toast.success(
+          `《${finalName}》已回填，并向【${siteLabel}】发布 ${publishedCount} 条网盘链接。可继续切换站点发布`
+        );
+      } else {
+        // 部分失败：如实告知成功/失败条数，不再笼统提示「已全部发布」
+        const parts = [`《${finalName}》已回填`];
+        if (publishedCount > 0) parts.push(`向【${siteLabel}】成功发布 ${publishedCount}/${activeCheckedLinks.length} 条`);
+        if (failedCount > 0) parts.push(`${failedCount} 条发布失败（可在列表中重试或到站点同步页补发）`);
+        toast.warning(parts.join('，') + '。可继续切换站点发布');
+      }
       // 不关闭弹窗：支持连续向多个站点发布，切换站点后各自的勾选状态互相独立
     } catch (e: any) {
       console.error('快捷绑定并发布失败', e);
