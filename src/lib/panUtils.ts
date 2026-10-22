@@ -25,13 +25,6 @@ const PAN_RULES: PanRule[] = [
   { name: '移动云盘',  patterns: [/yun\.139\.com/i] },
 ];
 
-/** 优先级：数字越小越靠前；光鸭 > 夸克 > 迅雷 > 其余 */
-const PAN_PRIORITY: Record<string, number> = {
-  '光鸭云盘': 1,
-  '夸克云盘': 2,
-  '迅雷云盘': 3,
-};
-
 /** 根据 URL 自动识别云盘名称，识别不到时返回空字符串 */
 export function detectPanName(url: string): string {
   if (!url) return '';
@@ -53,13 +46,15 @@ export function extractPasscodeFromUrl(url: string): string {
   return m ? m[1] : '';
 }
 
-/** 按优先级排序 PanLink 数组（不改变原数组） */
-export function sortLinksByPriority(links: PanLink[]): PanLink[] {
-  return [...links].sort((a, b) => {
-    const pa = PAN_PRIORITY[a.pan_name] ?? 999;
-    const pb = PAN_PRIORITY[b.pan_name] ?? 999;
-    return pa - pb;
-  });
+/**
+ * 保持网盘链接的「添加顺序」，不做任何重排（返回副本，避免调用方改动原数组）。
+ *
+ * 历史行为曾按固定优先级（光鸭 > 夸克 > 迅雷 > 其余）重排，导致用户复制资源时
+ * 网盘顺序与自己在资源里添加的顺序不一致。现改为忠实保留links 数组的原始顺序，
+ * 与用户添加顺序一致。
+ */
+export function keepLinkOrder(links: PanLink[]): PanLink[] {
+  return [...links];
 }
 
 // ─── 站点 pan_type 与资源链接 pan_name 的匹配 ─────────────────
@@ -130,7 +125,7 @@ export function extractPanLinks(text: string): PanLink[] {
 }
 
 /**
- * 统一获取资源链接列表（含优先级排序）。
+ * 统一获取资源链接列表（保持用户添加的顺序）。
  * 优先使用 links 数组；回退时从 fallbackLink 中重新提取（兼容旧数据中含多个 URL 的拼接字符串）。
  */
 export function resolveLinks(links: PanLink[] | undefined | null, fallbackLink: string): PanLink[] {
@@ -140,7 +135,7 @@ export function resolveLinks(links: PanLink[] | undefined | null, fallbackLink: 
       url: l.url,
       pan_name: l.pan_name || detectPanName(l.url),
     }));
-    return sortLinksByPriority(normalized);
+    return keepLinkOrder(normalized);
   }
   if (fallbackLink?.trim()) {
     // 旧 link 字段可能包含多个拼接 URL，尝试重新提取
@@ -148,17 +143,17 @@ export function resolveLinks(links: PanLink[] | undefined | null, fallbackLink: 
     const result = extracted.length > 0
       ? extracted
       : [{ url: fallbackLink.trim(), pan_name: detectPanName(fallbackLink) }];
-    return sortLinksByPriority(result);
+    return keepLinkOrder(result);
   }
   return [];
 }
 
 /**
- * 将 PanLink 数组格式化为文本行（用于复制），已按优先级排序。
+ * 将 PanLink 数组格式化为文本行（用于复制），保持用户添加的顺序。
  * 格式：光鸭云盘链接：URL
  */
 export function formatPanLinks(links: PanLink[]): string {
-  return sortLinksByPriority(links)
+  return keepLinkOrder(links)
     .filter((l) => l.url.trim())
     .map((l) => {
       const label = l.pan_name ? `${l.pan_name}链接` : '链接';
