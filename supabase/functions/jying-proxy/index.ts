@@ -526,6 +526,36 @@ Deno.serve(async (req) => {
           resource?: Record<string, unknown>;
         }>(r.text);
         if (r.status >= 400 || !data?.resource) {
+          const msg = String(data?.message ?? "");
+          // 站点按 share_link 去重：该影片下已有完全相同的链接时，
+          // 站点不会新增、只返回「重复链接已跳过」。
+          // 这不是失败——应视为「已存在」，查出既有记录的 id 返回给前端去建绑定，
+          // 否则用户重复绑定同一部影片的同一条链接时会被误判为发布失败。
+          if (/重复链接|已跳过|没有新增资源/.test(msg)) {
+            const norm = (s: unknown) => String(s ?? "").trim().replace(/[?#].*$/, "").replace(/\/+$/, "");
+            const want = norm(shareLink);
+            const listR = await forward(
+              `/api/app/my-resource-movies/${encodeURIComponent(movieId)}/resources/?page=1&page_size=100`
+            );
+            const listJ = parseJsonSafe<{ results?: Array<Record<string, unknown>> }>(listR.text);
+            const hitRow = (listJ?.results ?? []).find((x) => norm(x.share_link) === want);
+            if (hitRow?.id) {
+              await touchActive();
+              return json({
+                success: true,
+                data: {
+                  resource: {
+                    id: Number(hitRow.id),
+                    movie_id: Number(movieId),
+                    movie_title: hitRow.movie_title ?? null,
+                    type: hitRow.resource_type_display ?? null,
+                  },
+                  // existed=true 告知调用方：这是已存在的记录，不是本次新建
+                  existed: true,
+                },
+              });
+            }
+          }
           return json(
             { error: data?.message || `聚影新增分享失败（HTTP ${r.status}）` },
             400
