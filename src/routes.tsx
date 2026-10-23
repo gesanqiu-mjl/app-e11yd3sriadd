@@ -8,6 +8,7 @@ import CollectPage from './pages/CollectPage';
 import ShortLinkPage from './pages/ShortLinkPage';
 import ShortLinkRedirectPage from './pages/ShortLinkRedirectPage';
 import ProfilePage from './pages/ProfilePage';
+import StagingPage from './pages/StagingPage';
 import UpdatesPage from './pages/UpdatesPage';
 import type { ReactNode } from 'react';
 
@@ -69,6 +70,11 @@ export const routes: RouteConfig[] = [
     name: '个人中心',
     path: '/profile',
     element: <ProfilePage />,
+  },
+  {
+    name: '暂存空间',
+    path: '/staging',
+    element: <StagingPage />,
   },
   {
     // 短链兜底跳转（公开、不进菜单）：自有域名未把 /s/*、/go/* 转发到短链函数时由前端接管

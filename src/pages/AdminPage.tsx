@@ -80,6 +80,7 @@ import TutorialTab from '@/components/TutorialTab';
 import ApiKeysTab from '@/components/ApiKeysTab';
 import SubscriptionSourceTab from '@/components/SubscriptionSourceTab';
 import SourceOwnerTab from '@/components/SourceOwnerTab';
+import StagingTab from '@/components/StagingTab';
 
 const MEMBERSHIP_OPTIONS = [
   { value: '7', label: '7 天' },
@@ -808,6 +809,9 @@ export default function AdminPage() {
             </TabsTrigger>
             <TabsTrigger value="source-owners" className="text-xs gap-1.5 data-[state=active]:bg-card">
               <Crown className="h-3.5 w-3.5" /> 源主审核
+            </TabsTrigger>
+            <TabsTrigger value="staging" className="text-xs gap-1.5 data-[state=active]:bg-card">
+              <Layers className="h-3.5 w-3.5" /> 暂存管理
             </TabsTrigger>
           </TabsList>
 
@@ -1627,6 +1631,9 @@ export default function AdminPage() {
           </TabsContent>
           <TabsContent value="source-owners" className="mt-4">
             <SourceOwnerTab />
+          </TabsContent>
+          <TabsContent value="staging" className="mt-4">
+            <StagingTab />
           </TabsContent>
         </Tabs>
       </div>

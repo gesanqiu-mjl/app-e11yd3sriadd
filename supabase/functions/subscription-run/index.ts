@@ -6437,6 +6437,338 @@ Deno.serve(async (req) => {
     return fail("该操作仅限管理员", 403);
   }
 
+  // ── 暂存空间（staging）：独立动作组。管理端与用户端均经此分流 ──
+  if (action.startsWith("staging")) {
+    return await handleStagingRequest(action, body, userId, callerRole);
+  }
+
+  // 暂存空间逻辑（闭包：直接复用本作用域的 svc/admin/gyCall 等）
+  async function handleStagingRequest(
+    action: string,
+    body: Record<string, unknown>,
+    userId: string | null,
+    callerRole: string | null
+  ): Promise<Response> {
+    const db = admin as any;
+    const b = body as any;
+    const ok = (data: unknown, extra?: Record<string, unknown>) =>
+      new Response(JSON.stringify({ success: true, data, ...extra }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const isAdmin = callerRole === "admin";
+    const uid = userId ?? "";
+    const fmt = (n: number): string => {
+      if (!n) return "0 B";
+      const u = ["B", "KB", "MB", "GB", "TB"];
+      let i = 0, v = n;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return `${v.toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
+    };
+    const loadAccountCred = async (accountId: string): Promise<PanCred> => {
+      const { data: accRows, error: accErr } = await db.from("staging_accounts")
+        .select("pan_owner_user_id, root_dir_id, status, label").eq("id", accountId).maybeSingle();
+      if (accErr) throw new Error(`读取主账号失败：${accErr.message}`);
+      const acc = accRows as any;
+      if (!acc) throw new Error("主账号不存在");
+      const { data: tokRows, error: tokErr } = await db.rpc("load_pan_oauth", {
+        p_user_id: acc.pan_owner_user_id, p_pan: "guangya", p_key: CRED_KEY,
+      });
+      if (tokErr) throw new Error(`读取光鸭凭证失败：${tokErr.message}`);
+      const tok = ((tokRows ?? []) as Array<{ token_json: string | null }>)[0];
+      if (!tok?.token_json) throw new Error("该主账号对应的光鸭账号未绑定，或凭证缺失/失效");
+      let tokens: GypTokens;
+      try { tokens = JSON.parse(tok.token_json) as GypTokens; } catch { throw new Error("光鸭凭证格式错误"); }
+      if (!tokens.access_token) throw new Error("光鸭凭证无效（缺少 access_token）");
+      return { kind: "oauth", userId: accountId, tokens, rootDirId: acc.root_dir_id ?? "" };
+    };
+
+    // ===== 管理员：列出主账号（含已用/已分配聚合） =====
+    if (action === "stagingListAccounts") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const { data, error } = await db.from("staging_accounts")
+        .select("id,label,pan_owner_user_id,root_dir_id,total_capacity_bytes,status,last_error,created_at")
+        .order("created_at", { ascending: false });
+      if (error) return fail(`查询失败：${error.message}`);
+      const accounts = (data ?? []) as Array<Record<string, unknown>>;
+      const enriched = await Promise.all(accounts.map(async (a) => {
+        const { data: used } = await db.from("staging_files").select("size_bytes").eq("account_id", a.id);
+        const usedBytes = (used ?? []).reduce((s: number, r: any) => s + Number(r.size_bytes ?? 0), 0);
+        const { data: allocs } = await db.from("staging_allocations").select("capacity_bytes").eq("account_id", a.id);
+        const allocBytes = (allocs ?? []).reduce((s: number, r: any) => s + Number(r.capacity_bytes ?? 0), 0);
+        const { data: users } = await db.from("staging_allocations").select("user_id").eq("account_id", a.id);
+        return { ...a, used_bytes: usedBytes, allocated_bytes: allocBytes, user_count: (users ?? []).length };
+      }));
+      return ok(enriched);
+    }
+
+    // ===== 管理员：新增/编辑主账号（关联已绑定的光鸭账号） =====
+    if (action === "stagingSaveAccount") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const id = b.id ? String(b.id) : null;
+      const label = String(b.label ?? "").trim();
+      const panOwnerUserId = String(b.pan_owner_user_id ?? "").trim();
+      const rootDirId = b.root_dir_id ? String(b.root_dir_id).trim() || null : null;
+      const totalCapacityBytes = Number(b.total_capacity_bytes ?? 0);
+      if (!label) return fail("请填写账号备注名");
+      if (!panOwnerUserId) return fail("请选择已绑定光鸭的账号");
+      const row = id
+        ? { id, label, pan_owner_user_id: panOwnerUserId, root_dir_id: rootDirId, total_capacity_bytes: totalCapacityBytes }
+        : { label, pan_owner_user_id: panOwnerUserId, root_dir_id: rootDirId, total_capacity_bytes: totalCapacityBytes };
+      const { data: saved, error } = await db.from("staging_accounts").upsert(row).select("id").single();
+      if (error) return fail(`保存失败：${error.message}`);
+      return ok({ id: (saved as any)?.id });
+    }
+
+    // ===== 管理员：列出已绑定光鸭的账号（供添加主账号时选择） =====
+    if (action === "stagingListPanOwners") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const { data, error } = await db.from("pan_accounts")
+        .select("user_id, username, status").eq("pan", "guangya").eq("credential_type", "oauth");
+      if (error) return fail(`查询失败：${error.message}`);
+      const rows = (data ?? []) as any[];
+      const userIds = Array.from(new Set(rows.map((r) => r.user_id)));
+      const { data: profs } = await db.from("profiles").select("id,username").in("id", userIds);
+      const profMap = new Map((profs ?? []).map((p: any) => [p.id, p.username]));
+      const out = rows.map((r) => ({
+        user_id: r.user_id,
+        username: profMap.get(r.user_id) || r.username || r.user_id,
+        status: r.status,
+      }));
+      return ok(out);
+    }
+
+    // ===== 管理员：删除主账号 =====
+    if (action === "stagingDeleteAccount") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const id = String(b.id ?? "");
+      if (!id) return fail("缺少账号 ID");
+      const { error } = await db.from("staging_accounts").delete().eq("id", id);
+      if (error) return fail(`删除失败：${error.message}`);
+      return ok({ id });
+    }
+
+    // ===== 管理员：列出某主账号的空间分配 =====
+    if (action === "stagingListAllocations") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const accountId = String(b.account_id ?? "");
+      if (!accountId) return fail("缺少主账号 ID");
+      const { data, error } = await db.from("staging_allocations")
+        .select("id,account_id,user_id,capacity_bytes,created_at")
+        .eq("account_id", accountId).order("created_at", { ascending: true });
+      if (error) return fail(`查询失败：${error.message}`);
+      const allocs = (data ?? []) as any[];
+      const userIds = Array.from(new Set(allocs.map((a) => a.user_id)));
+      const { data: profs } = await db.from("profiles").select("id,username,email").in("id", userIds);
+      const profMap = new Map((profs ?? []).map((p: any) => [p.id, p]));
+      const out = allocs.map((a) => ({ ...a, profile: profMap.get(a.user_id) ?? null }));
+      return ok(out);
+    }
+
+    // ===== 管理员：分配/调整用户空间 =====
+    if (action === "stagingSaveAllocation") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const accountId = String(b.account_id ?? "");
+      const targetUserId = String(b.user_id ?? "");
+      const capacityBytes = Number(b.capacity_bytes ?? 0);
+      if (!accountId || !targetUserId) return fail("缺少主账号或用户");
+      const { error } = await db.from("staging_allocations").upsert(
+        { account_id: accountId, user_id: targetUserId, capacity_bytes: capacityBytes },
+        { onConflict: "account_id,user_id" }
+      );
+      if (error) return fail(`保存失败：${error.message}`);
+      return ok({ ok: true });
+    }
+
+    // ===== 管理员：删除分配 =====
+    if (action === "stagingDeleteAllocation") {
+      if (!isAdmin) return fail("该操作仅限管理员", 403);
+      const id = String(b.id ?? "");
+      if (!id) return fail("缺少分配 ID");
+      const { error } = await db.from("staging_allocations").delete().eq("id", id);
+      if (error) return fail(`删除失败：${error.message}`);
+      return ok({ id });
+    }
+
+    // ===== 用户：我的空间状态（分配 + 已用 + 主账号信息） =====
+    if (action === "stagingMyStatus") {
+      if (!uid) return fail("请先登录", 401);
+      const accountId = b.account_id ? String(b.account_id) : null;
+      let q = db.from("staging_allocations").select("id,account_id,capacity_bytes").eq("user_id", uid);
+      if (accountId) q = q.eq("account_id", accountId);
+      const { data: allocs, error } = await q;
+      if (error) return fail(`查询失败：${error.message}`);
+      const list = (allocs ?? []) as any[];
+      const accountIds = Array.from(new Set(list.map((a) => a.account_id)));
+      const { data: accs } = await db.from("staging_accounts")
+        .select("id,label,status,total_capacity_bytes,root_dir_id").in("id", accountIds);
+      const accMap = new Map((accs ?? []).map((a: any) => [a.id, a]));
+      const withUsed = await Promise.all(list.map(async (a) => {
+        const { data: files } = await db.from("staging_files")
+          .select("size_bytes").eq("account_id", a.account_id).eq("user_id", uid);
+        const used = (files ?? []).reduce((s: number, r: any) => s + Number(r.size_bytes ?? 0), 0);
+        return { ...a, used_bytes: used, account: accMap.get(a.account_id) ?? null };
+      }));
+      return ok(withUsed);
+    }
+
+    // ===== 用户：转存（核心） =====
+    if (action === "stagingTransfer") {
+      if (!uid) return fail("请先登录", 401);
+      const accountId = String(b.account_id ?? "");
+      const shareUrl = String(b.share_url ?? "").trim();
+      const pwd = b.pwd ? String(b.pwd).trim() : "";
+      if (!accountId) return fail("请选择暂存主账号");
+      if (!shareUrl) return fail("请填写光鸭分享链接");
+      const shareId = gyParseShareId(shareUrl);
+      if (!shareId) return fail("无法从链接解析出光鸭分享 ID");
+
+      // 1) 分配与额度
+      const { data: alloc, error: allocErr } = await db.from("staging_allocations")
+        .select("capacity_bytes").eq("account_id", accountId).eq("user_id", uid).maybeSingle();
+      if (allocErr) return fail(`查询分配失败：${allocErr.message}`);
+      if (!alloc) return fail("您在该主账号上没有分配空间，请联系管理员分配");
+      const capacity = Number(alloc.capacity_bytes ?? 0);
+      if (capacity <= 0) return fail("您在该主账号上的空间额度为 0，请联系管理员调整");
+
+      // 2) 已用
+      const { data: usedRows } = await db.from("staging_files")
+        .select("size_bytes").eq("account_id", accountId).eq("user_id", uid);
+      const used = (usedRows ?? []).reduce((s: number, r: any) => s + Number(r.size_bytes ?? 0), 0);
+
+      // 3) 主账号凭证
+      let cred: PanCred;
+      try { cred = await loadAccountCred(accountId); } catch (e) { return fail((e as Error).message); }
+
+      // 4) 分享令牌 + 叶子文件（含大小）
+      let sat: string;
+      try {
+        sat = await gyShareAccessToken(cred, shareId);
+      } catch (e) {
+        return fail(`获取分享访问令牌失败：${(e as Error).message}（如分享需要提取码，暂不支持）`);
+      }
+      const leaves: ShareFile[] = [];
+      try {
+        await gyCollectLeafFilesNamed(cred, sat, "", leaves);
+      } catch (e) {
+        return fail(`读取分享文件失败：${(e as Error).message}`);
+      }
+      if (leaves.length === 0) return fail("分享里没有可转存的文件");
+
+      // 5) 大小对比：仅转存小于剩余空间的文件（整体超出则拒绝）
+      const totalSize = leaves.reduce((s, f) => s + (f.size ?? 0), 0);
+      if (used + totalSize > capacity) {
+        return fail(
+          `暂存空间不足：本次需 ${fmt(totalSize)}，您已用 ${fmt(used)} / 总额度 ${fmt(capacity)}，请删除部分文件或联系管理员扩容`
+        );
+      }
+
+      // 6) 转存（restore_share，分批，不重试避免重复）
+      const parentId = cred.rootDirId ?? "";
+      if (!parentId) return fail("该主账号未配置暂存目录（root_dir_id），无法转存，请联系管理员设置");
+      const fileIds = leaves.map((f) => f.id);
+      let transferred = 0;
+      const failed: string[] = [];
+      for (let i = 0; i < fileIds.length; i += GY_TRANSFER_BATCH) {
+        const batch = fileIds.slice(i, i + GY_TRANSFER_BATCH);
+        try {
+          await gyCall(cred, "/userres/v1/restore_share", { accessToken: sat, fileIds: batch, parentId }, { retryTransient: false });
+          transferred += batch.length;
+        } catch (e) {
+          if (e instanceof GuangyaAuthError) {
+            await db.from("staging_accounts").update({ status: "invalid", last_error: (e as Error).message }).eq("id", accountId);
+            return fail(`主账号凭证失效：${(e as Error).message}`);
+          }
+          failed.push((e as Error).message);
+        }
+      }
+
+      // 7) 写暂存文件记录（应用层隔离，按 user_id 区分）
+      const rows = leaves.map((f) => ({
+        account_id: accountId, user_id: uid, file_id: f.id,
+        parent_id: parentId, name: f.name, size_bytes: f.size ?? 0,
+        is_dir: false, status: "done",
+      }));
+      const { error: insErr } = await db.from("staging_files").upsert(rows, { onConflict: "account_id,user_id,file_id" });
+      if (insErr) console.error("[staging] 写文件记录失败", insErr.message);
+
+      if (failed.length > 0) {
+        return ok({ transferred, total: leaves.length, message: `转存完成 ${transferred}/${leaves.length}（部分失败：${failed[0]}）` });
+      }
+      return ok({ transferred, total: leaves.length, message: `成功转存 ${transferred} 个文件，共 ${fmt(totalSize)}` });
+    }
+
+    // ===== 用户：列出我的暂存文件 =====
+    if (action === "stagingListFiles") {
+      if (!uid) return fail("请先登录", 401);
+      const accountId = b.account_id ? String(b.account_id) : null;
+      let q = db.from("staging_files")
+        .select("id,account_id,file_id,name,size_bytes,is_dir,status,created_at")
+        .eq("user_id", uid);
+      if (accountId) q = q.eq("account_id", accountId);
+      const { data, error } = await q.order("created_at", { ascending: false });
+      if (error) return fail(`查询失败：${error.message}`);
+      return ok(data ?? []);
+    }
+
+    // ===== 用户：删除文件（跨主账号按 file_id 调光鸭删除） =====
+    if (action === "stagingDeleteFiles") {
+      if (!uid) return fail("请先登录", 401);
+      const ids = Array.isArray(b.ids) ? (b.ids as string[]) : [];
+      if (ids.length === 0) return fail("请选择要删除的文件");
+      const { data: rows, error: selErr } = await db.from("staging_files")
+        .select("id,file_id,account_id").eq("user_id", uid).in("id", ids);
+      if (selErr) return fail(`查询失败：${selErr.message}`);
+      const owned = (rows ?? []) as Array<{ id: string; file_id: string; account_id: string }>;
+      if (owned.length === 0) return fail("没有可删除的文件");
+      const byAccount = new Map<string, string[]>();
+      for (const r of owned) {
+        if (!byAccount.has(r.account_id)) byAccount.set(r.account_id, []);
+        byAccount.get(r.account_id)!.push(r.file_id);
+      }
+      const errs: string[] = [];
+      for (const [accId, fids] of byAccount) {
+        let cred: PanCred;
+        try { cred = await loadAccountCred(accId); } catch (e) { errs.push((e as Error).message); continue; }
+        try { await gyDeleteFiles(cred, fids); } catch (e) { errs.push((e as Error).message); }
+      }
+      const { error: delErr } = await db.from("staging_files").delete().in("id", owned.map((r) => r.id));
+      if (delErr) errs.push(delErr.message);
+      if (errs.length) return ok({ deleted: owned.length, message: `已删除 ${owned.length} 个文件（部分：${errs[0]}）` });
+      return ok({ deleted: owned.length, message: `已删除 ${owned.length} 个文件` });
+    }
+
+    // ===== 用户：重命名文件 =====
+    if (action === "stagingRenameFile") {
+      if (!uid) return fail("请先登录", 401);
+      const id = String(b.id ?? "");
+      const newName = String(b.new_name ?? "").trim();
+      if (!id || !newName) return fail("缺少文件或新名称");
+      const { data: row, error: selErr } = await db.from("staging_files")
+        .select("id,file_id,account_id,user_id").eq("id", id).eq("user_id", uid).maybeSingle();
+      if (selErr) return fail(`查询失败：${selErr.message}`);
+      if (!row) return fail("文件不存在或无权操作");
+      const accId = (row as any).account_id;
+      let cred: PanCred;
+      try { cred = await loadAccountCred(accId); } catch (e) { return fail((e as Error).message); }
+      try {
+        await gyRenameFile(cred, (row as any).file_id, newName);
+      } catch (e) {
+        return fail(`重命名失败：${(e as Error).message}`);
+      }
+      await db.from("staging_files").update({ name: newName }).eq("id", id);
+      return ok({ id, name: newName });
+    }
+
+    // ===== 用户：创建分享链接（接口待用户后续提供，先占位） =====
+    if (action === "stagingCreateShare") {
+      if (!uid) return fail("请先登录", 401);
+      return fail("创建分享链接功能接口待开放，敬请期待", 501);
+    }
+
+    return fail(`未知的动作：${action}`, 404);
+  }
+
   const listPan = async (uid: string) => {
     const { data } = await svc
       .from("pan_accounts")
