@@ -3,6 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/favicon.png?v=2" />
+    <script>
+      // 域名白名单：本系统的页面只允许在自有域名下运行。
+      // 站点被整站克隆/反代到其它域名（如 gy.lubao2.de5.net）时，访客会在进入前
+      // 被立即送回源站，避免在他人域名下输入账号密码。
+      (function () {
+        var host = location.hostname.toLowerCase();
+        var ok =
+          host === 'tuiguang.xyz.hr' ||
+          host === 'guangya.xyz.hr' ||
+          host === 'www.tuiguang.xyz.hr' ||
+          host === 'www.guangya.xyz.hr' ||
+          host === 'localhost' ||
+          host === '127.0.0.1' ||
+          /^\d{1,3}(\.\d{1,3}){3}$/.test(host); // 允许直接以 IP 访问（运维/调试）
+        if (!ok) {
+          location.replace(
+            'https://tuiguang.xyz.hr' + location.pathname + location.search + location.hash
+          );
+        }
+      })();
+    </script>
     <!-- viewport-fit=cover：让页面延伸到刘海/圆角屏安全区，配合 CSS 的 safe-area-inset-* 一起用
          （不加会导致 iPhone 上顶/底出现黑边，或内容被灵动岛/横条遮挡） -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
