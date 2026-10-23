@@ -6480,7 +6480,7 @@ Deno.serve(async (req) => {
     if (action === "stagingListAccounts") {
       if (!isAdmin) return fail("该操作仅限管理员", 403);
       const { data, error } = await db.from("staging_accounts")
-        .select("id,label,root_dir_id,total_capacity_bytes,status,last_error,created_at")
+        .select("id,label,root_dir_id,root_dir_name,total_capacity_bytes,status,last_error,created_at")
         .order("created_at", { ascending: false });
       if (error) return fail(`查询失败：${error.message}`);
       const accounts = (data ?? []) as Array<Record<string, unknown>>;
@@ -6650,8 +6650,8 @@ Deno.serve(async (req) => {
       }
 
       // 6) 转存（restore_share，分批，不重试避免重复）
+      // 未指定暂存目录时 parentId 为空 → 直接转存到该云盘根目录
       const parentId = cred.rootDirId ?? "";
-      if (!parentId) return fail("该主账号未配置暂存目录（root_dir_id），无法转存，请联系管理员设置");
       const fileIds = leaves.map((f) => f.id);
       let transferred = 0;
       const failed: string[] = [];

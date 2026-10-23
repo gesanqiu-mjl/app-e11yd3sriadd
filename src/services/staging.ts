@@ -4,6 +4,7 @@ export interface StagingAccount {
   id: string;
   label: string;
   root_dir_id: string | null;
+  root_dir_name?: string | null;
   total_capacity_bytes: number;
   status: string;
   last_error?: string | null;
@@ -48,9 +49,44 @@ export interface StagingFile {
 
 export const GB = 1024 ** 3;
 
+export interface StagingDir {
+  id: string;
+  name: string;
+}
+
 // ───────── 管理员端 ─────────
 export async function stagingListAccounts(): Promise<StagingAccount[]> {
   return callSubscriptionFn<StagingAccount[]>('stagingListAccounts', {});
+}
+
+/** 扫码授权后自动绑定主账号：后端读取账号名与云盘根目录，返回目录列表供选择 */
+export async function stagingBindAccount(input: {
+  token_json: string;
+  id?: string;
+  root_dir_id?: string | null;
+  total_capacity_bytes?: number;
+}): Promise<{ id: string; label: string; username?: string; dirs: StagingDir[] }> {
+  return callSubscriptionFn<{ id: string; label: string; username?: string; dirs: StagingDir[] }>(
+    'stagingBindAccount',
+    input,
+  );
+}
+
+/** 浏览主账号云盘目录（parentId 为空 = 根目录） */
+export async function stagingListDirs(accountId: string, parentId?: string): Promise<StagingDir[]> {
+  return callSubscriptionFn<StagingDir[]>('stagingListDirs', {
+    account_id: accountId,
+    parent_id: parentId ?? '',
+  });
+}
+
+/** 设置主账号的暂存目录（空 = 根目录） */
+export async function stagingSetDir(input: {
+  id: string;
+  root_dir_id: string | null;
+  root_dir_name?: string | null;
+}): Promise<void> {
+  return callSubscriptionFn('stagingSetDir', input);
 }
 
 export async function stagingSaveAccount(input: {
