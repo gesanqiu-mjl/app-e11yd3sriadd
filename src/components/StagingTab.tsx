@@ -137,7 +137,7 @@ export default function StagingTab() {
         }
         setScanRemain((r) => (r > 0 ? r - 1 : 0));
         try {
-          const r: any = await pollPanDeviceAuth(scanSession.sessionId);
+          const r: any = await pollPanDeviceAuth(s.sessionId);
           if (r.status === 'success') {
             if (scanDoneRef.current) return;
             scanDoneRef.current = true;
