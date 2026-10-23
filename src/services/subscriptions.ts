@@ -191,7 +191,7 @@ export interface RunAllResult {
 
 const FN_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/subscription-run`;
 
-async function callSubscriptionFn<T>(action: string, body: Record<string, unknown> = {}, timeoutMs = 120000): Promise<T> {
+export async function callSubscriptionFn<T>(action: string, body: Record<string, unknown> = {}, timeoutMs = 120000): Promise<T> {
   const { data: sessionData } = await supabase.auth.getSession();
   const token = sessionData?.session?.access_token;
   if (!token) throw new Error('请先登录');

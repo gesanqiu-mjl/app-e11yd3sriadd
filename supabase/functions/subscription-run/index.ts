@@ -6466,19 +6466,12 @@ Deno.serve(async (req) => {
       return `${v.toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
     };
     const loadAccountCred = async (accountId: string): Promise<PanCred> => {
-      const { data: accRows, error: accErr } = await db.from("staging_accounts")
-        .select("pan_owner_user_id, root_dir_id, status, label").eq("id", accountId).maybeSingle();
-      if (accErr) throw new Error(`读取主账号失败：${accErr.message}`);
-      const acc = accRows as any;
+      const { data: rows, error } = await db.rpc("load_staging_account", { p_id: accountId, p_key: CRED_KEY });
+      if (error) throw new Error(`读取主账号失败：${error.message}`);
+      const acc = ((rows ?? []) as Array<any>)[0];
       if (!acc) throw new Error("主账号不存在");
-      const { data: tokRows, error: tokErr } = await db.rpc("load_pan_oauth", {
-        p_user_id: acc.pan_owner_user_id, p_pan: "guangya", p_key: CRED_KEY,
-      });
-      if (tokErr) throw new Error(`读取光鸭凭证失败：${tokErr.message}`);
-      const tok = ((tokRows ?? []) as Array<{ token_json: string | null }>)[0];
-      if (!tok?.token_json) throw new Error("该主账号对应的光鸭账号未绑定，或凭证缺失/失效");
       let tokens: GypTokens;
-      try { tokens = JSON.parse(tok.token_json) as GypTokens; } catch { throw new Error("光鸭凭证格式错误"); }
+      try { tokens = JSON.parse(acc.token_json) as GypTokens; } catch { throw new Error("光鸭凭证格式错误"); }
       if (!tokens.access_token) throw new Error("光鸭凭证无效（缺少 access_token）");
       return { kind: "oauth", userId: accountId, tokens, rootDirId: acc.root_dir_id ?? "" };
     };
@@ -6487,7 +6480,7 @@ Deno.serve(async (req) => {
     if (action === "stagingListAccounts") {
       if (!isAdmin) return fail("该操作仅限管理员", 403);
       const { data, error } = await db.from("staging_accounts")
-        .select("id,label,pan_owner_user_id,root_dir_id,total_capacity_bytes,status,last_error,created_at")
+        .select("id,label,root_dir_id,total_capacity_bytes,status,last_error,created_at")
         .order("created_at", { ascending: false });
       if (error) return fail(`查询失败：${error.message}`);
       const accounts = (data ?? []) as Array<Record<string, unknown>>;
@@ -6502,41 +6495,34 @@ Deno.serve(async (req) => {
       return ok(enriched);
     }
 
-    // ===== 管理员：新增/编辑主账号（关联已绑定的光鸭账号） =====
+    // ===== 管理员：新增/编辑主账号（独立光鸭账号，扫码授权后凭证存本表） =====
     if (action === "stagingSaveAccount") {
       if (!isAdmin) return fail("该操作仅限管理员", 403);
       const id = b.id ? String(b.id) : null;
       const label = String(b.label ?? "").trim();
-      const panOwnerUserId = String(b.pan_owner_user_id ?? "").trim();
       const rootDirId = b.root_dir_id ? String(b.root_dir_id).trim() || null : null;
       const totalCapacityBytes = Number(b.total_capacity_bytes ?? 0);
+      const tokenJson = b.token_json ? String(b.token_json) : null;
       if (!label) return fail("请填写账号备注名");
-      if (!panOwnerUserId) return fail("请选择已绑定光鸭的账号");
-      const row = id
-        ? { id, label, pan_owner_user_id: panOwnerUserId, root_dir_id: rootDirId, total_capacity_bytes: totalCapacityBytes }
-        : { label, pan_owner_user_id: panOwnerUserId, root_dir_id: rootDirId, total_capacity_bytes: totalCapacityBytes };
-      const { data: saved, error } = await db.from("staging_accounts").upsert(row).select("id").single();
+      if (!id && !tokenJson) return fail("请先绑定光鸭账号（扫码授权）后再保存");
+      if (tokenJson) {
+        // 含凭证：完整保存（新增 或 覆盖更新 token）
+        const { data: savedId, error } = await db.rpc("save_staging_account", {
+          p_id: id, p_label: label, p_token_json: tokenJson, p_root_dir_id: rootDirId,
+          p_total_capacity_bytes: totalCapacityBytes, p_key: CRED_KEY,
+        });
+        if (error) return fail(`保存失败：${error.message}`);
+        return ok({ id: savedId });
+      }
+      // 未改凭证：仅更新基础信息（不改 token）
+      const { data: saved, error } = await db.from("staging_accounts")
+        .update({ label, root_dir_id: rootDirId, total_capacity_bytes: totalCapacityBytes, updated_at: new Date().toISOString() })
+        .eq("id", id!).select("id").single();
       if (error) return fail(`保存失败：${error.message}`);
       return ok({ id: (saved as any)?.id });
     }
 
-    // ===== 管理员：列出已绑定光鸭的账号（供添加主账号时选择） =====
-    if (action === "stagingListPanOwners") {
-      if (!isAdmin) return fail("该操作仅限管理员", 403);
-      const { data, error } = await db.from("pan_accounts")
-        .select("user_id, username, status").eq("pan", "guangya").eq("credential_type", "oauth");
-      if (error) return fail(`查询失败：${error.message}`);
-      const rows = (data ?? []) as any[];
-      const userIds = Array.from(new Set(rows.map((r) => r.user_id)));
-      const { data: profs } = await db.from("profiles").select("id,username").in("id", userIds);
-      const profMap = new Map((profs ?? []).map((p: any) => [p.id, p.username]));
-      const out = rows.map((r) => ({
-        user_id: r.user_id,
-        username: profMap.get(r.user_id) || r.username || r.user_id,
-        status: r.status,
-      }));
-      return ok(out);
-    }
+    // （stagingListPanOwners 已移除：主账号改为独立绑定光鸭，凭证存 staging_accounts，不混用网盘绑定）
 
     // ===== 管理员：删除主账号 =====
     if (action === "stagingDeleteAccount") {

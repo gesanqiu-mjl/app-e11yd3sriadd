@@ -257,7 +257,7 @@ export default function StagingPage() {
                     </TableCell>
                     <TableCell>{fmtSize(f.size_bytes)}</TableCell>
                     <TableCell className="text-muted-foreground">
-                      {new Date(f.created_at).toLocaleString()}
+                      {f.created_at ? new Date(f.created_at).toLocaleString() : '—'}
                     </TableCell>
                     <TableCell>
                       <Badge variant={f.status === 'done' ? 'default' : 'destructive'}>{f.status}</Badge>
