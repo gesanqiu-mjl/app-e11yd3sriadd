@@ -307,12 +307,15 @@ export default function StagingTab() {
               </p>
             </div>
             <div className="space-y-1">
-              <Label>暂存目录 ID（可选）</Label>
+              <Label>暂存目录 ID（必填）</Label>
               <Input
                 value={form.root_dir_id}
                 onChange={(e) => setForm({ ...form, root_dir_id: e.target.value })}
-                placeholder="光鸭文件夹 fileId，留空=网盘根目录"
+                placeholder="光鸭文件夹 fileId（在光鸭网盘新建专用文件夹后复制）"
               />
+              <p className="text-xs text-muted-foreground">
+                转存文件会落入此目录；建议在光鸭网盘为该主账号建一个专用文件夹，复制其 fileId
+              </p>
             </div>
             <div className="space-y-1">
               <Label>总容量（GB）</Label>
