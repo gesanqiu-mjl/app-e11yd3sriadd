@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Users, Film, History, Shield, ShieldOff, Loader2, Search, Ticket, Copy, CheckCheck, RefreshCw, Clock, Crown, Settings, Megaphone, Download, Upload, Unlock, KeyRound, Layers, Link2, Trash2, BookOpen } from 'lucide-react';
+import { Users, Film, History, Shield, ShieldOff, Loader2, Search, Ticket, Copy, CheckCheck, RefreshCw, Clock, Crown, Settings, Megaphone, Download, Upload, Unlock, KeyRound, Layers, Link2, Trash2, BookOpen, HardDrive } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import AppLayout from '@/components/layouts/AppLayout';
@@ -81,6 +81,7 @@ import ApiKeysTab from '@/components/ApiKeysTab';
 import SubscriptionSourceTab from '@/components/SubscriptionSourceTab';
 import SourceOwnerTab from '@/components/SourceOwnerTab';
 import StagingTab from '@/components/StagingTab';
+import StagingAllocationDialog from '@/components/StagingAllocationDialog';
 
 const MEMBERSHIP_OPTIONS = [
   { value: '7', label: '7 天' },
@@ -196,6 +197,8 @@ export default function AdminPage() {
   const [accountTypeFilter, setAccountTypeFilter] = useState<'all' | 'special' | 'normal'>('all');
   /** 用户管理：搜索（用户名 / 邮箱 / 手机号 / 用户 ID） */
   const [userSearch, setUserSearch] = useState('');
+  /** 用户管理：正在调整暂存空间容量的账号（null 表示未打开对话框） */
+  const [stagingEditUserId, setStagingEditUserId] = useState<string | null>(null);
   /** 正在保存的功能权限：`<用户id>:<功能>` */
   const [featureSaving, setFeatureSaving] = useState<string | null>(null);
   /** 用户管理：勾选的账号 id（用于批量开通/关闭功能） */
@@ -1186,6 +1189,11 @@ export default function AdminPage() {
                                         <Crown className="h-3.5 w-3.5 mr-2" />额度设置（资源 / 订阅）
                                       </DropdownMenuItem>
                                     )}
+                                    <DropdownMenuItem
+                                      onClick={() => setStagingEditUserId(p.id)}
+                                    >
+                                      <HardDrive className="h-3.5 w-3.5 mr-2" />暂存空间容量
+                                    </DropdownMenuItem>
                                     <DropdownMenuSeparator className="bg-border" />
                                     <DropdownMenuItem
                                       disabled={p.id === profile?.id}
@@ -1225,6 +1233,11 @@ export default function AdminPage() {
                 </Table>
               </div>
             </div>
+            <StagingAllocationDialog
+              open={!!stagingEditUserId}
+              userId={stagingEditUserId}
+              onClose={() => setStagingEditUserId(null)}
+            />
           </TabsContent>
 
           {/* 邀请码管理 */}

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Loader2, Upload, Trash2, Clock, ShieldCheck, KeyRound, Eye, EyeOff, Crown } from 'lucide-react';
+import { Loader2, Upload, Trash2, Clock, ShieldCheck, KeyRound, Eye, EyeOff, Crown, HardDrive } from 'lucide-react';
 import { toast } from 'sonner';
 import AppLayout from '@/components/layouts/AppLayout';
 import PageMeta from '@/components/common/PageMeta';
@@ -12,6 +12,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { updateMyProfile, validateUsername, applySourceOwner, fetchMySourceOwnerStatus } from '@/services/api';
 import { uploadAvatar } from '@/lib/uploadAvatar';
 import type { MySourceOwnerStatus as OwnerStatus } from '@/types/index';
+import StagingPage from '@/pages/StagingPage';
 
 /** 「账号」只展示用户名部分：内建账号是 xxx@miaoda.com 形式，个人中心不展示邮箱域名 */
 function accountNameOf(email?: string | null): string {
@@ -528,6 +529,24 @@ export default function ProfilePage() {
               {changingPwd ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
               确认修改
             </Button>
+          </div>
+
+          {/* 暂存空间 */}
+          <div className="rounded-xl border border-border bg-card p-5 md:p-6">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                  <HardDrive className="h-4 w-4 text-primary" />
+                  暂存空间
+                </h2>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  把光鸭网盘分享链接里的资源转存到这里，按容量管理自己的暂存文件
+                </p>
+              </div>
+            </div>
+            <div className="mt-4 space-y-4">
+              <StagingPage />
+            </div>
           </div>
 
           <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
